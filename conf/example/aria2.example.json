@@ -1,0 +1,13 @@
+{
+  "aria2_host": "http://127.0.0.1:6800/jsonrpc",
+  "aria2_secret": "",
+  "aria2_download_dir": "/downloads",
+  "download_destination_dir": "/downloads_done",
+  "poll_interval": 60,
+  "download_timeout": 7200,
+  "request_timeout": 10,
+  "aria2_max_retries": 3,
+  "download_log_interval": 300,
+  "download_submit_max_retries": 10,
+  "download_submit_retry_interval": 30
+}
