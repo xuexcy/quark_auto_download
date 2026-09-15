@@ -1,7 +1,0 @@
-{
-  "openlist_host": "http://127.0.0.1:5255",
-  "openlist_token": "",
-  "openlist_quark_path": "/quark",
-  "request_timeout": 10,
-  "refresh_delay_after_transfer": 30
-}

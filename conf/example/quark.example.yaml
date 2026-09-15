@@ -1,0 +1,27 @@
+# 夸克网盘配置
+
+# 浏览器登录夸克网盘后，从请求头中复制 Cookie（需包含 kps / sign / vcode 等）
+quark_cookie: "kps=xxx; sign=xxx; vcode=xxx"
+
+# 分享链接：直接填浏览器地址栏完整 URL
+# - 分享根目录：https://pan.quark.cn/s/xxx#/list/share
+# - 子目录：https://pan.quark.cn/s/xxx#/list/share/<子目录fid>
+share_url: "https://pan.quark.cn/s/xxxxxxxxxxxx#/list/share"
+
+# 分享提取码（无则留空）
+share_pwd: ""
+
+# 按文件名过滤的正则，留空表示不过滤
+file_name_regex: ""
+
+# 转存目标目录（夸克网盘中的文件夹名）
+save_to_dir: "alist共享"
+
+# 请求超时（秒）
+request_timeout: 10
+
+# 转存任务轮询间隔（秒）
+task_poll_interval: 3
+
+# 转存任务超时（秒）
+task_timeout: 180

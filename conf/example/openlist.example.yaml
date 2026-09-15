@@ -1,0 +1,16 @@
+# OpenList / Alist 配置
+
+# OpenList 服务地址
+openlist_host: "http://127.0.0.1:5255"
+
+# OpenList Token（管理后台获取）
+openlist_token: ""
+
+# OpenList 中挂载的夸克网盘路径
+openlist_quark_path: "/quark"
+
+# 请求超时（秒）
+request_timeout: 10
+
+# 已废弃：转存后不再固定等待 OpenList。直链未就绪时由下载 Worker 指数退避探测。
+# refresh_delay_after_transfer: 30

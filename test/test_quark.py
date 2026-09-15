@@ -5,12 +5,13 @@
 
 import sys
 import os
-import json
 import logging
 
-# 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# 添加 src 到路径
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_ROOT, "src"))
 
+from config_loader import load_merged_configs
 from quark_api import QuarkClient
 
 
@@ -25,29 +26,7 @@ def setup_logger():
 
 def load_config():
     """加载配置文件"""
-    conf_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'conf')
-
-    config = {}
-
-    # 加载 aria2 配置
-    aria2_config_path = os.path.join(conf_dir, 'aria2.json')
-    if os.path.exists(aria2_config_path):
-        with open(aria2_config_path, 'r', encoding='utf-8') as f:
-            config.update(json.load(f))
-
-    # 加载 openlist 配置
-    openlist_config_path = os.path.join(conf_dir, 'openlist.json')
-    if os.path.exists(openlist_config_path):
-        with open(openlist_config_path, 'r', encoding='utf-8') as f:
-            config.update(json.load(f))
-
-    # 加载 quark 配置
-    quark_config_path = os.path.join(conf_dir, 'quark.json')
-    if os.path.exists(quark_config_path):
-        with open(quark_config_path, 'r', encoding='utf-8') as f:
-            config.update(json.load(f))
-
-    return config
+    return load_merged_configs()
 
 
 def format_file_size(size_bytes):

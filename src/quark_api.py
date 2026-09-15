@@ -1,9 +1,21 @@
+import html
 import time
 
 import requests
 
 
 QUARK_DRIVE_BASE_URL = "https://drive.quark.cn"
+
+
+def unescape_html_name(value: str) -> str:
+    """解码 Quark 列表里的 HTML 实体，例如 &#39; -> ' 。"""
+    text = str(value or "")
+    for _ in range(3):
+        nxt = html.unescape(text)
+        if nxt == text:
+            break
+        text = nxt
+    return text
 
 
 class QuarkClient:
@@ -132,8 +144,34 @@ class QuarkClient:
             # 出错时返回默认9GB
             return 9 * 1024 * 1024 * 1024
 
+    def parse_share_url(self) -> tuple[str, str]:
+        """解析分享链接，返回 (share_id, folder_fid)。
+
+        支持带锚点子目录的链接，例如：
+        https://pan.quark.cn/s/xxx#/list/share/<folder_fid>
+        folder_fid 为空表示分享根目录。
+        """
+        raw = str(self.share_url or "").strip()
+        if "/s/" not in raw:
+            raise RuntimeError(f"无效的分享链接: {raw}")
+
+        path_part, _, fragment = raw.partition("#")
+        share_id = path_part.split("/s/")[-1].split("?")[0].strip("/")
+        if not share_id:
+            raise RuntimeError(f"无法从分享链接解析 share_id: {raw}")
+
+        folder_fid = ""
+        # 兼容 #/list/share/<fid> 以及 #list/share/<fid>
+        marker = "/list/share"
+        frag = fragment.lstrip("/")
+        if marker in f"/{frag}":
+            after = f"/{frag}".split(marker, 1)[1].strip("/")
+            if after:
+                folder_fid = after.split("/")[0].split("?")[0].strip()
+        return share_id, folder_fid
+
     def get_share_token(self) -> tuple[str, str, str]:
-        share_id = self.share_url.split("/s/")[-1].split("#")[0].split("?")[0].strip("/")
+        share_id, _ = self.parse_share_url()
         data = self.quark_post_with_params(
             f"{QUARK_DRIVE_BASE_URL}/1/clouddrive/share/sharepage/token",
             params={"pr": "ucpro", "fr": "pc", "uc_param_str": ""},
@@ -168,55 +206,6 @@ class QuarkClient:
         root_fid = fid_list[0] if fid_list else "0"
         return stoken, share_id, root_fid
 
-    def list_share_dir_entries(self, share_id: str, stoken: str, pdir_fid: str) -> list[dict]:
-        entries = []
-        page = 1
-        while True:
-            data = self.quark_get(
-                f"{QUARK_DRIVE_BASE_URL}/1/clouddrive/share/sharepage/detail",
-                {
-                    "pr": "ucpro",
-                    "fr": "pc",
-                    "uc_param_str": "",
-                    "ver": "2",
-                    "pwd_id": share_id,
-                    "stoken": stoken,
-                    "pdir_fid": pdir_fid,
-                    "force": "0",
-                    "_page": str(page),
-                    "_size": "50",
-                    "_fetch_banner": "0",
-                    "_fetch_share": "0",
-                    "_fetch_total": "1",
-                    "_sort": "file_type:asc,file_name:asc",
-                },
-            )
-            items = data.get("data", {}).get("list", [])
-            if not items:
-                break
-            entries.extend(items)
-            if len(items) < 50:
-                break
-            page += 1
-        return entries
-
-    def resolve_sub_dir_fid(self, share_id: str, stoken: str, root_fid: str, sub_dir: str) -> str:
-        sub_dir = (sub_dir or "").strip().strip("/")
-        if not sub_dir:
-            return root_fid
-        current_fid = root_fid
-        for part in [p for p in sub_dir.split("/") if p]:
-            entries = self.list_share_dir_entries(share_id, stoken, current_fid)
-            next_dir = None
-            for entry in entries:
-                if entry.get("dir") and entry.get("file_name") == part:
-                    next_dir = entry
-                    break
-            if not next_dir:
-                raise RuntimeError(f"分享子目录不存在: {sub_dir}（缺少目录 `{part}`）")
-            current_fid = next_dir["fid"]
-        return current_fid
-
     def list_share_files(self, share_id: str, stoken: str, pdir_fid: str, relative_dir: str = "") -> list[dict]:
         files = []
         page = 1
@@ -245,6 +234,8 @@ class QuarkClient:
             if not items:
                 break
             for item in items:
+                if item.get("file_name"):
+                    item["file_name"] = unescape_html_name(item["file_name"])
                 if item.get("file"):
                     relative_path = "/".join(
                         part for part in (relative_dir, item.get("file_name", "")) if part
@@ -285,6 +276,9 @@ class QuarkClient:
             items = data.get("data", {}).get("list", [])
             if not items:
                 break
+            for item in items:
+                if item.get("file_name"):
+                    item["file_name"] = unescape_html_name(item["file_name"])
             entries.extend(items)
             if len(items) < 100:
                 break
@@ -429,4 +423,117 @@ class QuarkClient:
             if status == 3:
                 raise RuntimeError(f"转存任务失败: {data}")
         raise TimeoutError(f"等待转存任务超时（{self.task_timeout} 秒）")
+
+    def _wait_task_done(self, task_id: str) -> None:
+        """等待通用任务完成（删除等，不要求返回 fid）。"""
+        task_params = {"task_id": task_id, "retry_index": 0, "pr": "ucpro", "fr": "pc", "uc_param_str": "__dt"}
+        deadline = time.time() + max(self.task_timeout, 1)
+        while time.time() < deadline:
+            time.sleep(max(self.task_poll_interval, 1))
+            data = self.quark_get(f"{QUARK_DRIVE_BASE_URL}/1/clouddrive/task", task_params)
+            code = data.get("code")
+            if code not in (None, 0):
+                raise RuntimeError(f"查询任务状态返回异常: {data}")
+            data_node = data.get("data", {}) if isinstance(data, dict) else {}
+            if not isinstance(data_node, dict):
+                continue
+            status = data_node.get("status")
+            if status == 2:
+                return
+            if status == 3:
+                raise RuntimeError(f"任务失败: {data}")
+        raise TimeoutError(f"等待任务超时（{self.task_timeout} 秒）: {task_id}")
+
+    def delete_my_fids(self, fid_list: list[str]) -> None:
+        """删除自己网盘中的文件/文件夹（进回收站）。"""
+        fids = [self._normalize_my_fid(fid) for fid in fid_list if str(fid or "").strip()]
+        if not fids:
+            return
+        data = self.quark_post_with_params(
+            f"{QUARK_DRIVE_BASE_URL}/1/clouddrive/file/delete",
+            params={"pr": "ucpro", "fr": "pc", "uc_param_str": ""},
+            payload={"action_type": 2, "filelist": fids, "exclude_fids": []},
+        )
+        if data.get("code") not in (0, None) and data.get("status") != 200:
+            raise RuntimeError(f"删除网盘文件失败: {data}")
+        task_id = ""
+        data_node = data.get("data")
+        if isinstance(data_node, dict):
+            task_id = str(data_node.get("task_id") or "").strip()
+        if task_id:
+            self._wait_task_done(task_id)
+
+    def find_my_dir_fid(self, root_fid: str, relative_dir: str) -> str | None:
+        """解析已存在目录的 fid；任一层不存在则返回 None（不会创建目录）。"""
+        current_fid = self._normalize_my_fid(root_fid)
+        parts = [p for p in str(relative_dir or "").replace("\\", "/").strip("/").split("/") if p]
+        if not parts:
+            return current_fid
+        for part in parts:
+            entries = self.list_my_dir_entries(current_fid)
+            next_fid = None
+            for entry in entries:
+                if entry.get("dir") and entry.get("file_name") == part:
+                    next_fid = self._normalize_my_fid(entry.get("fid", ""))
+                    break
+            if not next_fid:
+                return None
+            current_fid = next_fid
+        return current_fid
+
+    def prune_empty_parent_dirs(self, relative_paths: list[str], root_fid: str | None = None) -> list[str]:
+        """针对已删文件路径，自底向上清理变空的父目录。"""
+        root_fid = self._normalize_my_fid(root_fid or self.save_to_fid)
+        parents: set[str] = set()
+        for path in relative_paths:
+            parts = [p for p in str(path or "").replace("\\", "/").strip("/").split("/") if p]
+            for depth in range(len(parts) - 1, 0, -1):
+                parents.add("/".join(parts[:depth]))
+        ordered = sorted(parents, key=lambda p: p.count("/"), reverse=True)
+        deleted: list[str] = []
+        for rel in ordered:
+            fid = self.find_my_dir_fid(root_fid, rel)
+            if not fid or fid == root_fid:
+                continue
+            try:
+                if self.list_my_dir_entries(fid):
+                    continue
+                self.delete_my_fids([fid])
+                deleted.append(rel)
+            except Exception as e:
+                self.log.warning(f"清理空父目录失败: /{rel} | {e}")
+        return deleted
+
+    def prune_empty_dirs(self, root_fid: str) -> list[str]:
+        """
+        自底向上删除 root_fid 下的空文件夹。
+        不删除 root_fid 本身；返回已删除目录的相对路径列表。
+        """
+        root_fid = self._normalize_my_fid(root_fid)
+        if not root_fid:
+            return []
+        deleted: list[str] = []
+
+        def _walk(fid: str, relative_dir: str) -> None:
+            entries = self.list_my_dir_entries(fid)
+            for entry in entries:
+                if not entry.get("dir"):
+                    continue
+                name = str(entry.get("file_name") or "").strip()
+                child_fid = str(entry.get("fid") or "").strip()
+                if not name or not child_fid:
+                    continue
+                child_rel = "/".join(part for part in (relative_dir, name) if part)
+                _walk(child_fid, child_rel)
+
+            if fid == root_fid:
+                return
+            # 子目录处理完后重新检查是否为空
+            if self.list_my_dir_entries(fid):
+                return
+            self.delete_my_fids([fid])
+            deleted.append(relative_dir)
+
+        _walk(root_fid, "")
+        return deleted
 

@@ -1,0 +1,48 @@
+# Aria2 下载配置
+
+# Aria2 JSON-RPC 地址
+aria2_host: "http://127.0.0.1:6800/jsonrpc"
+
+# Aria2 RPC Secret（未设置则留空）
+aria2_secret: ""
+
+# Aria2 下载临时目录
+aria2_download_dir: "/downloads"
+
+# 下载完成后移动到的目标目录
+download_destination_dir: "/downloads_done"
+
+# 主循环轮询间隔（秒）
+poll_interval: 60
+
+# 单个文件下载超时（秒）
+download_timeout: 7200
+
+# 请求超时（秒）
+request_timeout: 10
+
+# Aria2 任务失败最大重试次数
+aria2_max_retries: 3
+
+# 下载进度日志输出间隔（秒）
+download_log_interval: 300
+
+# 提交下载失败累计上限：达到后移出队列；单次失败不堵塞后续任务、不退避等待
+download_submit_max_retries: 10
+
+# 已废弃：提交失败不再固定间隔退避重试
+# download_submit_retry_interval: 30
+
+# 路径偏好有序：按完整路径优先处理；失败会跳过，不堵塞后续任务
+# false = 转存时更激进地跳过大文件以填满容量
+strict_download_order: true
+
+# Aria2 排队水位（waiting）：超过上限暂停转存/提交下载，低于下限恢复；清理不受影响
+aria2_queue_pause_threshold: 700
+aria2_queue_resume_threshold: 500
+
+# 全部任务结束后校验 completed 目录；失败报告路径（留空则用 <项目>/state/download_verify_report.yaml）
+# verify_report_file: ""
+
+# 流水线状态落盘文件（明文 YAML）。留空则使用 <项目>/state/pipeline_state.yaml
+# state_file: ""

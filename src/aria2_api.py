@@ -89,6 +89,19 @@ class Aria2Client:
         name = str(info.get("name", "")).strip()
         return name
 
+    def aria2_get_global_stat(self) -> dict:
+        """返回 aria2.getGlobalStat 结果（含 numActive/numWaiting/numStopped）。"""
+        result = self._aria2_call("aria2.getGlobalStat", [])
+        return result if isinstance(result, dict) else {}
+
+    def aria2_get_waiting_count(self) -> int:
+        """排队中（waiting）任务数量。"""
+        stat = self.aria2_get_global_stat()
+        try:
+            return int(stat.get("numWaiting", 0))
+        except (TypeError, ValueError):
+            return 0
+
     def aria2_get_existing_tasks_by_name(self) -> dict[str, str]:
         """
         返回 filename -> status 的映射。
