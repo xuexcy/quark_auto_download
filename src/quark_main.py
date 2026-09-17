@@ -19,6 +19,7 @@ from config_loader import (
     resolve_legacy_config_path,
 )
 from file_api import FileApi
+from log_util import configure_logging, dated_job_log_path
 from openlist_api import OpenListClient
 from pipeline import DownloadPipeline
 from quark_api import QuarkClient
@@ -74,6 +75,14 @@ def load_all_configs() -> tuple[dict, dict, dict]:
 
 QUARK_CONFIG, OPENLIST_CONFIG, ARIA2_CONFIG = load_all_configs()
 
+# 任务级覆盖（Web 多分享链接）
+JOB_ID = os.getenv("QUARK_AUTO_DL_JOB_ID", "").strip()
+if os.getenv("QUARK_AUTO_DL_SHARE_URL", "").strip():
+    QUARK_CONFIG = dict(QUARK_CONFIG)
+    QUARK_CONFIG["share_url"] = os.environ["QUARK_AUTO_DL_SHARE_URL"].strip()
+    if "QUARK_AUTO_DL_SHARE_PWD" in os.environ:
+        QUARK_CONFIG["share_pwd"] = os.environ.get("QUARK_AUTO_DL_SHARE_PWD", "")
+
 QUARK_COOKIE = _require(QUARK_CONFIG, "quark_cookie")
 SHARE_URL = _require(QUARK_CONFIG, "share_url")
 SHARE_PWD = QUARK_CONFIG.get("share_pwd", "")
@@ -100,11 +109,14 @@ STRICT_DOWNLOAD_ORDER = _as_bool(ARIA2_CONFIG.get("strict_download_order"), True
 ARIA2_QUEUE_PAUSE_THRESHOLD = int(ARIA2_CONFIG.get("aria2_queue_pause_threshold", 700))
 ARIA2_QUEUE_RESUME_THRESHOLD = int(ARIA2_CONFIG.get("aria2_queue_resume_threshold", 500))
 STATE_FILE = str(
-    ARIA2_CONFIG.get("state_file")
+    os.getenv("QUARK_AUTO_DL_STATE_FILE")
+    or ARIA2_CONFIG.get("state_file")
     or os.path.join(BASE_DIR, "state", "pipeline_state.yaml")
 ).strip()
+CONTROL_FILE = str(os.getenv("QUARK_AUTO_DL_CONTROL_FILE") or "").strip()
 VERIFY_REPORT_FILE = str(
-    ARIA2_CONFIG.get("verify_report_file")
+    os.getenv("QUARK_AUTO_DL_VERIFY_REPORT_FILE")
+    or ARIA2_CONFIG.get("verify_report_file")
     or os.path.join(BASE_DIR, "state", "download_verify_report.yaml")
 ).strip()
 QUARK_REQUEST_TIMEOUT = int(QUARK_CONFIG.get("request_timeout", 10))
@@ -119,18 +131,15 @@ if FILE_NAME_REGEX:
 
 RUN_DATE = time.strftime("%Y_%m_%d")
 RUN_TIME = time.strftime("%H_%M_%S")
-LOG_DIR = os.path.join(BASE_DIR, "log", RUN_DATE)
-LOG_PATH = os.path.join(LOG_DIR, f"quark_main.{RUN_TIME}.log")
-os.makedirs(LOG_DIR, exist_ok=True)
+JOB_LOG_FILE = os.getenv("QUARK_AUTO_DL_JOB_LOG_FILE", "").strip()
+if JOB_ID:
+    LOG_PATH = JOB_LOG_FILE or dated_job_log_path(JOB_ID)
+else:
+    LOG_PATH = dated_job_log_path("quark_main")
+LOG_DIR = os.path.dirname(LOG_PATH) or os.path.join(BASE_DIR, "log", RUN_DATE, "jobs")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_PATH, encoding="utf-8"),
-    ],
-    force=True,
-)
+# 统一将 print / traceback / warnings / logging 写入同一日志文件（行缓冲追加）
+configure_logging(LOG_PATH)
 log = logging.getLogger(__name__)
 
 
@@ -217,8 +226,11 @@ def main():
 
     log.info("═" * 60)
     log.info("夸克网盘自动批量下载脚本启动")
+    if JOB_ID:
+        log.info(f"任务 ID: {JOB_ID}")
     log.info("═" * 60)
     log.info(f"本次日志文件: {LOG_PATH}")
+    log.info(f"分享链接: {SHARE_URL}")
     log.info(f"下载临时目录: {ARIA2_DOWNLOAD_DIR}")
     log.info(f"下载完成目录: {DOWNLOAD_DESTINATION_DIR}")
 
@@ -229,6 +241,8 @@ def main():
     order_desc = "路径偏好有序（失败跳过）" if STRICT_DOWNLOAD_ORDER else "可插队填容量"
     log.info(f"▶ 调度器+Worker 启动，共 {len(all_files)} 个文件（{order_desc}）")
     log.info(f"状态文件: {STATE_FILE}")
+    if CONTROL_FILE:
+        log.info(f"控制文件: {CONTROL_FILE}")
     pipeline = DownloadPipeline(
         file_api=file_api,
         share_id=share_id,
@@ -239,9 +253,31 @@ def main():
         state_file=STATE_FILE,
         aria2_queue_pause_threshold=ARIA2_QUEUE_PAUSE_THRESHOLD,
         aria2_queue_resume_threshold=ARIA2_QUEUE_RESUME_THRESHOLD,
+        control_file=CONTROL_FILE,
+        job_id=JOB_ID,
     )
     pipeline.initialize(all_files)
     failed_files = pipeline.run()
+
+    # 若由用户暂停退出，更新 jobs 索引状态
+    if JOB_ID and pipeline._user_pause_mode:
+        try:
+            from jobs_manager import get_job, upsert_job
+
+            job = get_job(JOB_ID)
+            if job:
+                job["status"] = "paused"
+                job["message"] = (
+                    "软暂停完成" if pipeline._user_pause_mode == "soft" else "硬暂停完成"
+                )
+                job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                upsert_job(job)
+        except Exception as e:
+            log.warning(f"更新任务状态失败: {e}")
+
+    if pipeline._user_pause_mode:
+        log.info(f"流水线因用户暂停退出（mode={pipeline._user_pause_mode}）")
+        return
 
     log.info("\n" + "═" * 60)
     log.info("全部批次处理完毕！")
@@ -261,6 +297,19 @@ def main():
         )
     else:
         log.info("所有文件下载成功，completed 目录校验通过 🎉")
+
+    if JOB_ID:
+        try:
+            from jobs_manager import get_job, upsert_job
+
+            job = get_job(JOB_ID)
+            if job:
+                job["status"] = "paused"
+                job["message"] = "全部处理完毕（已回到暂停）"
+                job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                upsert_job(job)
+        except Exception as e:
+            log.warning(f"更新任务状态失败: {e}")
 
 
 if __name__ == "__main__":

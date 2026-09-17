@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quark Auto Download</title>
+  <style>
+    :root {
+      --bg: #0f1412;
+      --panel: #171e1b;
+      --panel-2: #1e2823;
+      --line: #2c3a33;
+      --text: #e7eee9;
+      --muted: #8fa196;
+      --accent: #3dba7a;
+      --accent-dim: #2a8f5c;
+      --danger: #d4534a;
+      --warn: #c9a227;
+      --radius: 10px;
+      --font: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Sarasa Mono SC", "Cascadia Code", "Consolas", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(1100px 520px at 8% -8%, #1a3328 0%, transparent 55%),
+        radial-gradient(800px 420px at 100% 0%, #1a2430 0%, transparent 50%),
+        var(--bg);
+    }
+    .wrap { width: min(980px, calc(100% - 2rem)); margin: 0 auto; padding: 2.2rem 0 4rem; }
+    .brand { font-family: var(--mono); font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 .45rem; }
+    h1 { margin: 0; font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 600; }
+    .sub { margin: .5rem 0 0; color: var(--muted); line-height: 1.5; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+      margin: 1rem 0;
+    }
+    .panel h2 { margin: 0 0 .9rem; font-size: 1rem; }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: .7rem 0 .3rem; }
+    input, textarea {
+      width: 100%; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+      border-radius: 8px; padding: .65rem .75rem; font: 500 .92rem/1.4 var(--mono); outline: none;
+    }
+    input:focus, textarea:focus { border-color: var(--accent-dim); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+    .row { display: grid; grid-template-columns: 1fr 140px auto; gap: .6rem; align-items: end; }
+    @media (max-width: 720px) { .row { grid-template-columns: 1fr; } }
+    button {
+      border: 0; border-radius: 8px; padding: .65rem 1rem; font: 600 .88rem/1 var(--font); cursor: pointer;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #062214; }
+    .btn-danger { background: color-mix(in srgb, var(--danger) 88%, #000); color: #fff; }
+    .btn-warn { background: color-mix(in srgb, var(--warn) 85%, #000); color: #1a1400; }
+    .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    .msg { margin-top: .7rem; min-height: 1.1rem; font-size: .86rem; color: var(--muted); }
+    .msg.ok { color: var(--accent); }
+    .msg.err { color: #ff8e86; }
+    .job {
+      border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2);
+      padding: .95rem 1rem; margin-bottom: .75rem;
+    }
+    .job-top { display: flex; gap: .75rem; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
+    .job-url { font-family: var(--mono); font-size: .82rem; word-break: break-all; line-height: 1.45; flex: 1; }
+    .job-meta { margin-top: .55rem; font-size: .78rem; color: var(--muted); font-family: var(--mono); }
+    .job-actions { display: flex; flex-wrap: wrap; gap: .45rem; }
+    .pill { display: inline-flex; align-items: center; gap: .35rem; font-family: var(--mono); font-size: .8rem; }
+    .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); }
+    .dot.on { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+    .dot.pause { background: var(--warn); }
+    .dot.off { background: var(--danger); }
+    details.advanced { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+    details.advanced > summary { cursor: pointer; padding: 1rem 1.15rem; font-weight: 600; list-style: none; }
+    details.advanced .body { padding: 0 1.15rem 1.15rem; border-top: 1px solid var(--line); }
+    .section-title { margin: 1rem 0 .35rem; font-size: .75rem; color: var(--accent); font-family: var(--mono); text-transform: uppercase; letter-spacing: .04em; }
+    .job-log {
+      margin-top: .75rem;
+      border-top: 1px dashed var(--line);
+      padding-top: .65rem;
+    }
+    .job-log summary {
+      cursor: pointer;
+      font-size: .82rem;
+      color: var(--accent);
+      font-family: var(--mono);
+      list-style: none;
+    }
+    .job-log-toolbar {
+      display: flex; gap: .5rem; flex-wrap: wrap; align-items: center;
+      margin: .45rem 0 .35rem; font-size: .72rem; color: var(--muted); font-family: var(--mono);
+    }
+    .job-log-toolbar button { padding: .35rem .65rem; font-size: .78rem; }
+    pre.log {
+      margin: 0; max-height: 280px; overflow: auto; background: #0b100e; border: 1px solid var(--line);
+      border-radius: 8px; padding: .75rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
+    }
+    .job.active-log { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+    .pause-menu {
+      position: absolute; right: 0; top: calc(100% + 4px); background: #121a16; border: 1px solid var(--line);
+      border-radius: 8px; padding: .35rem; min-width: 220px; z-index: 5; box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    }
+    .pause-menu button { display: block; width: 100%; text-align: left; margin: .2rem 0; }
+    .pause-wrap { position: relative; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="brand">Quark Auto Download</p>
+      <h1>多分享链接下载</h1>
+      <p class="sub">每个链接默认暂停。开始后会接续已有下载进度；暂停可选「软暂停」或「硬暂停」。</p>
+    </header>
+
+    <section class="panel">
+      <h2>新增分享链接</h2>
+      <div class="row">
+        <div>
+          <label for="new_url">分享链接</label>
+          <input id="new_url" placeholder="https://pan.quark.cn/s/xxxx#/list/share/..." />
+        </div>
+        <div>
+          <label for="new_pwd">提取码</label>
+          <input id="new_pwd" placeholder="可选" />
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <button class="btn-primary" id="btn-add" type="button">新增</button>
+        </div>
+      </div>
+      <div class="msg" id="add-msg"></div>
+    </section>
+
+    <section class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap;">
+        <h2 style="margin:0;">任务列表</h2>
+        <button class="btn-ghost" id="btn-refresh" type="button">刷新</button>
+      </div>
+      <p class="sub" style="margin:.4rem 0 0;">每个分享链接下方可展开查看独立下载日志（log/&lt;date&gt;/jobs/&lt;jobId&gt;_&lt;time&gt;.log）。</p>
+      <div id="jobs" style="margin-top:1rem;"></div>
+      <div class="msg" id="jobs-msg"></div>
+    </section>
+
+    <details class="advanced">
+      <summary>高级配置（Cookie / OpenList / Aria2）</summary>
+      <div class="body">
+        <div class="section-title">Quark</div>
+        <label>Cookie（掩码不改）</label>
+        <textarea id="quark_cookie" rows="2"></textarea>
+        <label>转存目录 save_to_dir</label>
+        <input id="save_to_dir" />
+        <label>文件过滤正则</label>
+        <input id="file_name_regex" />
+
+        <div class="section-title">OpenList</div>
+        <label>Host</label><input id="openlist_host" />
+        <label>Token</label><input id="openlist_token" />
+        <label>quark 挂载路径</label><input id="openlist_quark_path" />
+
+        <div class="section-title">Aria2</div>
+        <label>RPC Host</label><input id="aria2_host" />
+        <label>Secret</label><input id="aria2_secret" />
+        <label>下载临时目录</label><input id="aria2_download_dir" />
+        <label>完成后目录</label><input id="download_destination_dir" />
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.6rem;">
+          <div><label>排队暂停阈值</label><input id="aria2_queue_pause_threshold" type="number" /></div>
+          <div><label>排队恢复阈值</label><input id="aria2_queue_resume_threshold" type="number" /></div>
+        </div>
+        <div style="margin-top:1rem;">
+          <button class="btn-primary" id="btn-save-config" type="button">保存配置</button>
+        </div>
+        <div class="msg" id="cfg-msg"></div>
+      </div>
+    </details>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let openPauseMenuId = null;
+    const openLogIds = new Set();
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail || res.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return data;
+    }
+
+    function setMsg(el, text, kind = "") {
+      el.textContent = text || "";
+      el.className = "msg" + (kind ? " " + kind : "");
+    }
+
+    function statusView(job) {
+      if (job.status === "running" || job.running) return { text: "运行中", cls: "on" };
+      if (job.status === "soft_pausing") return { text: "软暂停中", cls: "pause" };
+      return { text: "已暂停", cls: "off" };
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    async function fillJobLog(jobId, { scrollBottom = false } = {}) {
+      const pre = document.querySelector(`pre.log[data-log-id="${jobId}"]`);
+      const pathEl = document.querySelector(`[data-log-path-id="${jobId}"]`);
+      if (!pre) return;
+      try {
+        const data = await api(`/api/jobs/${jobId}/logs?lines=250`);
+        if (pathEl) pathEl.textContent = data.path || "";
+        pre.textContent = data.content || "(暂无日志)";
+        if (scrollBottom) pre.scrollTop = pre.scrollHeight;
+      } catch (e) {
+        pre.textContent = `读取日志失败: ${e.message}`;
+      }
+    }
+
+    function renderJobs(jobs) {
+      const box = $("jobs");
+      if (!jobs.length) {
+        box.innerHTML = '<div class="msg">暂无任务，请先新增分享链接</div>';
+        return;
+      }
+      box.innerHTML = jobs.map((job) => {
+        const st = statusView(job);
+        const c = job.counts || {};
+        const running = !!(job.running || job.status === "running" || job.status === "soft_pausing");
+        const logOpen = openLogIds.has(job.id);
+        return `
+          <div class="job ${logOpen ? "active-log" : ""}" data-id="${job.id}">
+            <div class="job-top">
+              <div class="job-url">${escapeHtml(job.share_url || "")}</div>
+              <div class="job-actions">
+                <button class="btn-primary" data-act="start" data-id="${job.id}" ${running ? "disabled" : ""}>开始</button>
+                <span class="pause-wrap">
+                  <button class="btn-warn" data-act="pause-menu" data-id="${job.id}" ${running ? "" : "disabled"}>暂停 ▾</button>
+                  ${openPauseMenuId === job.id ? `
+                    <div class="pause-menu">
+                      <button class="btn-ghost" data-act="pause-soft" data-id="${job.id}">软暂停：保留下载中，清排队</button>
+                      <button class="btn-danger" data-act="pause-hard" data-id="${job.id}">硬暂停：暂停下载中+排队（可恢复）</button>
+                    </div>` : ""}
+                </span>
+                <button class="btn-ghost" data-act="toggle-log" data-id="${job.id}">${logOpen ? "收起日志" : "查看日志"}</button>
+                <button class="btn-danger" data-act="delete" data-id="${job.id}">删除</button>
+              </div>
+            </div>
+            <div class="job-meta">
+              <span class="pill"><span class="dot ${st.cls}"></span>${st.text}</span>
+              · id=${job.id}
+              · pid=${job.pid || "-"}
+              · pending=${c.pending ?? 0} downloading=${c.downloading ?? 0} done=${c.done ?? 0} failed=${c.failed ?? 0}
+              · ${escapeHtml(job.message || "")}
+            </div>
+            <details class="job-log" data-log-details="${job.id}" ${logOpen ? "open" : ""}>
+              <summary>本分享链接下载日志</summary>
+              <div class="job-log-toolbar">
+                <span data-log-path-id="${job.id}">${escapeHtml(job.log_path || "")}</span>
+                <button class="btn-ghost" data-act="refresh-log" data-id="${job.id}" type="button">刷新日志</button>
+              </div>
+              <pre class="log" data-log-id="${job.id}">加载中…</pre>
+            </details>
+          </div>`;
+      }).join("");
+
+      // 已展开的日志立即填充
+      openLogIds.forEach((id) => fillJobLog(id, { scrollBottom: true }));
+    }
+
+    async function refreshJobs() {
+      const data = await api("/api/jobs");
+      renderJobs(data.jobs || []);
+    }
+
+    function fillConfig(cfg) {
+      const q = cfg.quark || {}, o = cfg.openlist || {}, a = cfg.aria2 || {};
+      $("quark_cookie").value = q.quark_cookie || "";
+      $("save_to_dir").value = q.save_to_dir || "";
+      $("file_name_regex").value = q.file_name_regex || "";
+      $("openlist_host").value = o.openlist_host || "";
+      $("openlist_token").value = o.openlist_token || "";
+      $("openlist_quark_path").value = o.openlist_quark_path || "";
+      $("aria2_host").value = a.aria2_host || "";
+      $("aria2_secret").value = a.aria2_secret || "";
+      $("aria2_download_dir").value = a.aria2_download_dir || "";
+      $("download_destination_dir").value = a.download_destination_dir || "";
+      $("aria2_queue_pause_threshold").value = a.aria2_queue_pause_threshold ?? 700;
+      $("aria2_queue_resume_threshold").value = a.aria2_queue_resume_threshold ?? 500;
+    }
+
+    $("btn-add").onclick = async () => {
+      try {
+        await api("/api/jobs", {
+          method: "POST",
+          body: JSON.stringify({ share_url: $("new_url").value.trim(), share_pwd: $("new_pwd").value }),
+        });
+        $("new_url").value = "";
+        $("new_pwd").value = "";
+        setMsg($("add-msg"), "已新增（默认暂停）", "ok");
+        await refreshJobs();
+      } catch (e) {
+        setMsg($("add-msg"), e.message, "err");
+      }
+    };
+
+    $("btn-refresh").onclick = async () => {
+      try {
+        await refreshJobs();
+        setMsg($("jobs-msg"), "已刷新", "ok");
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+      }
+    };
+
+    $("jobs").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      const act = btn.dataset.act;
+      try {
+        if (act === "pause-menu") {
+          openPauseMenuId = openPauseMenuId === id ? null : id;
+          await refreshJobs();
+          return;
+        }
+        if (act === "toggle-log") {
+          if (openLogIds.has(id)) openLogIds.delete(id);
+          else openLogIds.add(id);
+          openPauseMenuId = null;
+          await refreshJobs();
+          return;
+        }
+        if (act === "refresh-log") {
+          await fillJobLog(id, { scrollBottom: true });
+          return;
+        }
+        openPauseMenuId = null;
+        if (act === "start") {
+          await api(`/api/jobs/${id}/start`, { method: "POST", body: "{}" });
+          openLogIds.add(id);
+          setMsg($("jobs-msg"), "已开始", "ok");
+        } else if (act === "pause-soft") {
+          await api(`/api/jobs/${id}/pause`, { method: "POST", body: JSON.stringify({ mode: "soft" }) });
+          setMsg($("jobs-msg"), "已下发软暂停", "ok");
+        } else if (act === "pause-hard") {
+          await api(`/api/jobs/${id}/pause`, { method: "POST", body: JSON.stringify({ mode: "hard" }) });
+          setMsg($("jobs-msg"), "已硬暂停", "ok");
+        } else if (act === "delete") {
+          if (!confirm("删除该分享任务？运行中的会被硬暂停。")) return;
+          await api(`/api/jobs/${id}`, { method: "DELETE" });
+          openLogIds.delete(id);
+          setMsg($("jobs-msg"), "已删除", "ok");
+        }
+        await refreshJobs();
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+        await refreshJobs();
+      }
+    });
+
+    $("jobs").addEventListener("toggle", (ev) => {
+      const details = ev.target.closest("details[data-log-details]");
+      if (!details || ev.target !== details) return;
+      const id = details.getAttribute("data-log-details");
+      if (details.open) {
+        openLogIds.add(id);
+        fillJobLog(id, { scrollBottom: true });
+      } else {
+        openLogIds.delete(id);
+      }
+    }, true);
+
+    $("btn-save-config").onclick = async () => {
+      try {
+        await api("/api/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            quark: {
+              quark_cookie: $("quark_cookie").value,
+              save_to_dir: $("save_to_dir").value,
+              file_name_regex: $("file_name_regex").value,
+            },
+            openlist: {
+              openlist_host: $("openlist_host").value.trim(),
+              openlist_token: $("openlist_token").value,
+              openlist_quark_path: $("openlist_quark_path").value.trim(),
+            },
+            aria2: {
+              aria2_host: $("aria2_host").value.trim(),
+              aria2_secret: $("aria2_secret").value,
+              aria2_download_dir: $("aria2_download_dir").value,
+              download_destination_dir: $("download_destination_dir").value,
+              aria2_queue_pause_threshold: Number($("aria2_queue_pause_threshold").value || 700),
+              aria2_queue_resume_threshold: Number($("aria2_queue_resume_threshold").value || 500),
+            },
+          }),
+        });
+        setMsg($("cfg-msg"), "配置已保存", "ok");
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    };
+
+    document.addEventListener("click", (ev) => {
+      if (!ev.target.closest(".pause-wrap") && openPauseMenuId) {
+        openPauseMenuId = null;
+        refreshJobs().catch(() => {});
+      }
+    });
+
+    (async () => {
+      fillConfig(await api("/api/config"));
+      await refreshJobs();
+      setInterval(() => {
+        refreshJobs().catch(() => {});
+      }, 5000);
+    })();
+  </script>
+</body>
+</html>

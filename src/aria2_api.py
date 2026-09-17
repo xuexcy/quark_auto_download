@@ -176,3 +176,122 @@ class Aria2Client:
             time.sleep(self.poll_interval)
         self.log.warning(f"  ⏰ 下载超时: {filename}")
         return False
+
+    def aria2_remove(self, gid: str, *, force: bool = True) -> None:
+        """移除 Aria2 任务。"""
+        method = "aria2.forceRemove" if force else "aria2.remove"
+        try:
+            self._aria2_call(method, [gid])
+        except Exception as e:
+            # 任务可能已结束
+            self.log.warning(f"  Aria2 移除任务失败 gid={gid}: {e}")
+
+    def aria2_pause(self, gid: str, *, force: bool = True) -> None:
+        method = "aria2.forcePause" if force else "aria2.pause"
+        self._aria2_call(method, [gid])
+
+    def aria2_unpause(self, gid: str) -> None:
+        self._aria2_call("aria2.unpause", [gid])
+
+    def aria2_find_task_by_path(self, relative_path: str) -> dict | None:
+        """按相对路径查找 active/waiting/paused 任务，返回 {gid, status}。"""
+        wanted = self._normalize_relative_path(relative_path)
+        if not wanted:
+            return None
+        infos = self.aria2_get_existing_task_infos_by_name()
+        info = infos.get(wanted)
+        if info:
+            return info
+        # 兼容仅 basename 的情况
+        base = wanted.rsplit("/", 1)[-1]
+        for name, task_info in infos.items():
+            if name == base or name.endswith("/" + base):
+                return task_info
+        return None
+
+    def aria2_list_tasks(self, *, include_stopped: bool = False) -> list[dict]:
+        tasks: list[dict] = []
+        methods = [
+            ("aria2.tellActive", []),
+            ("aria2.tellWaiting", [0, 5000]),
+        ]
+        if include_stopped:
+            methods.append(("aria2.tellStopped", [0, 5000]))
+        for method, params in methods:
+            result = self._aria2_call(method, params)
+            if isinstance(result, list):
+                tasks.extend(result)
+        return tasks
+
+    def aria2_remove_by_paths(
+        self,
+        paths: set[str],
+        *,
+        remove_active: bool,
+        remove_waiting: bool,
+    ) -> dict[str, list[str]]:
+        """
+        按相对路径移除 Aria2 任务。
+        返回 {"removed_waiting": [...], "removed_active": [...]}。
+        """
+        wanted = {self._normalize_relative_path(p) for p in paths if p}
+        removed_waiting: list[str] = []
+        removed_active: list[str] = []
+        if not wanted:
+            return {"removed_waiting": removed_waiting, "removed_active": removed_active}
+
+        for task in self.aria2_list_tasks(include_stopped=False):
+            status = str(task.get("status", "")).lower()
+            gid = str(task.get("gid", "")).strip()
+            name = self._extract_task_filename(task)
+            if not gid or not name:
+                continue
+            rel = self._normalize_relative_path(name)
+            if rel not in wanted:
+                continue
+            if status == "waiting" and remove_waiting:
+                self.aria2_remove(gid, force=True)
+                removed_waiting.append(rel)
+            elif status in ("active", "paused") and remove_active:
+                self.aria2_remove(gid, force=True)
+                removed_active.append(rel)
+        return {"removed_waiting": removed_waiting, "removed_active": removed_active}
+
+    def aria2_pause_by_paths(
+        self,
+        paths: set[str],
+        *,
+        pause_active: bool = True,
+        pause_waiting: bool = True,
+    ) -> dict[str, list[str]]:
+        """按相对路径暂停 Aria2 任务（保留进度，便于下次 unpause）。"""
+        wanted = {self._normalize_relative_path(p) for p in paths if p}
+        paused_waiting: list[str] = []
+        paused_active: list[str] = []
+        if not wanted:
+            return {"paused_waiting": paused_waiting, "paused_active": paused_active}
+
+        for task in self.aria2_list_tasks(include_stopped=False):
+            status = str(task.get("status", "")).lower()
+            gid = str(task.get("gid", "")).strip()
+            name = self._extract_task_filename(task)
+            if not gid or not name:
+                continue
+            rel = self._normalize_relative_path(name)
+            if rel not in wanted:
+                continue
+            if status == "paused":
+                if pause_waiting or pause_active:
+                    # 已是暂停，记入对应列表便于统计
+                    paused_active.append(rel)
+                continue
+            try:
+                if status == "waiting" and pause_waiting:
+                    self.aria2_pause(gid, force=True)
+                    paused_waiting.append(rel)
+                elif status == "active" and pause_active:
+                    self.aria2_pause(gid, force=True)
+                    paused_active.append(rel)
+            except Exception as e:
+                self.log.warning(f"  Aria2 暂停失败 {rel} gid={gid}: {e}")
+        return {"paused_waiting": paused_waiting, "paused_active": paused_active}

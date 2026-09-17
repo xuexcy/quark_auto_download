@@ -316,9 +316,30 @@ class FileApi:
         return min(cap, delay)
 
     def submit_download(self, file_item: dict) -> dict:
-        """单次获取直链并提交 Aria2，失败立即抛出，由调度器决定是否留队重试。"""
-        file_name = self.file_path(file_item)
-        self.log.info(f"  → 提交下载任务: {file_name}")
+        """
+        提交或恢复下载：
+        - Aria2 已有 paused → unpause 恢复
+        - Aria2 已有 active/waiting → 直接接管
+        - 否则取直链新建任务
+        """
+        self.log.info(f"  → 按路径序提交/恢复下载: {file_name}")
+        existing = self.aria2_client.aria2_find_task_by_path(file_name)
+        if existing:
+            gid = str(existing.get("gid") or "").strip()
+            status = str(existing.get("status") or "").lower()
+            if gid and status == "paused":
+                self.log.info(f"  → 当前文件存在 Aria2 暂停任务，恢复下载: {file_name} | gid={gid}")
+                self.aria2_client.aria2_unpause(gid)
+                task = self.build_download_task(file_item, gid)
+                self.log.info(f"    已恢复下载: {file_name} | gid={gid}")
+                return task
+            if gid and status in ("active", "waiting"):
+                self.log.info(
+                    f"  → 接管已有 Aria2 任务({status}): {file_name} | gid={gid}"
+                )
+                return self.build_download_task(file_item, gid)
+
+        self.log.info(f"  → 无已有下载任务，新建提交: {file_name}")
         self.log.info(f"    开始获取直链并提交 Aria2 下载任务: {file_name}")
         dl_url = self.openlist_client.openlist_get_download_url(self.openlist_path(file_name))
         gid = self.aria2_client.aria2_add_url(dl_url, file_name)

@@ -24,6 +24,8 @@ class DownloadPipeline:
         state_file: str = "",
         aria2_queue_pause_threshold: int = 700,
         aria2_queue_resume_threshold: int = 500,
+        control_file: str = "",
+        job_id: str = "",
     ):
         self.file_api = file_api
         self.share_id = share_id
@@ -31,6 +33,8 @@ class DownloadPipeline:
         self.poll_interval = max(poll_interval, 1)
         self.log = logger
         self.state_file = state_file
+        self.control_file = control_file
+        self.job_id = job_id
         self.lock = threading.RLock()
         self.scheduler = PipelineScheduler(file_api, prefer_path_order=strict_download_order)
 
@@ -43,8 +47,80 @@ class DownloadPipeline:
         self._aria2_ingest_paused = False
         self._last_aria2_waiting = 0
 
+        # none | soft | hard — 用户暂停
+        self._user_pause_mode: str | None = None
         self._stop = threading.Event()
         self._worker_errors: dict[str, BaseException] = {}
+
+    def _read_control_command(self) -> str:
+        if not self.control_file or not os.path.isfile(self.control_file):
+            return "none"
+        try:
+            with open(self.control_file, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if isinstance(data, dict):
+                return str(data.get("command") or "none").strip().lower()
+        except Exception:
+            return "none"
+        return "none"
+
+    def _apply_user_control(self) -> None:
+        """处理 Web 下发的 soft_pause / hard_pause。"""
+        cmd = self._read_control_command()
+        if cmd == "soft_pause" and self._user_pause_mode != "soft":
+            self._user_pause_mode = "soft"
+            self.log.warning("▶ 收到软暂停：停止转存/新提交，清除 Aria2 排队，继续跟踪活跃下载")
+            self._purge_aria2_for_job(mode="soft")
+        elif cmd == "hard_pause" and self._user_pause_mode != "hard":
+            self._user_pause_mode = "hard"
+            self.log.warning("▶ 收到硬暂停：暂停 Aria2 活跃+排队（保留进度），停止流水线")
+            self._purge_aria2_for_job(mode="hard")
+            self._stop.set()
+
+    def _purge_aria2_for_job(self, *, mode: str) -> None:
+        with self.lock:
+            paths = set(self.scheduler.ordered_paths)
+        try:
+            if mode == "soft":
+                # 软暂停：删除排队；活跃继续下载
+                result = self.file_api.aria2_client.aria2_remove_by_paths(
+                    paths,
+                    remove_active=False,
+                    remove_waiting=True,
+                )
+                removed = list(result.get("removed_waiting") or [])
+                if removed:
+                    with self.lock:
+                        self.scheduler.reset_download_to_ready(
+                            removed,
+                            note="软暂停：排队任务已删除，待下次重新提交/恢复",
+                        )
+                    self.log.info(f"  软暂停已删除排队任务 {len(removed)} 个")
+            else:
+                # 硬暂停：pause 活跃+排队，保留进度供下次 unpause
+                result = self.file_api.aria2_client.aria2_pause_by_paths(
+                    paths,
+                    pause_active=True,
+                    pause_waiting=True,
+                )
+                n_active = len(result.get("paused_active") or [])
+                n_waiting = len(result.get("paused_waiting") or [])
+                self.log.info(
+                    f"  硬暂停已暂停 Aria2 任务 active/paused={n_active} waiting={n_waiting}"
+                )
+        except Exception as e:
+            self.log.error(f"  处理本任务 Aria2 暂停/清理失败: {e}")
+
+    def _user_ingest_blocked(self) -> bool:
+        return self._user_pause_mode in ("soft", "hard")
+
+    def _soft_pause_should_exit(self) -> bool:
+        if self._user_pause_mode != "soft":
+            return False
+        with self.lock:
+            # 软暂停：活跃下载与清理都结束后退出，保留 pending/ready 供下次开始
+            busy = self.scheduler.jobs_in("downloading", "cleanup", "transferring")
+            return not busy
 
     def initialize(self, all_files: list[dict]) -> None:
         with self.lock:
@@ -143,9 +219,13 @@ class DownloadPipeline:
 
         try:
             while any(thread.is_alive() for thread in threads):
+                self._apply_user_control()
                 if self._worker_errors:
                     self._stop.set()
-                elif not self._has_pending_work():
+                elif self._soft_pause_should_exit():
+                    self.log.info("▶ 软暂停：活跃下载与清理已结束，停止流水线")
+                    self._stop.set()
+                elif not self._has_pending_work() and self._user_pause_mode is None:
                     time.sleep(2)
                     if not self._has_pending_work():
                         self._stop.set()
@@ -163,9 +243,10 @@ class DownloadPipeline:
         if self._worker_errors:
             name, err = next(iter(self._worker_errors.items()))
             raise RuntimeError(f"{name} 异常退出: {err}") from err
-        # 全部任务结束后再扫一遍空目录，避免残留多层空文件夹
-        self.log.info("▶ 最终清理网盘空文件夹")
-        self.file_api.cleanup_empty_dirs()
+        # 全部任务结束后再扫一遍空目录（硬/软暂停中途退出时跳过全量清理以免拖慢停止）
+        if self._user_pause_mode is None:
+            self.log.info("▶ 最终清理网盘空文件夹")
+            self.file_api.cleanup_empty_dirs()
         with self.lock:
             return list(self.scheduler.failed_files)
 
@@ -204,12 +285,16 @@ class DownloadPipeline:
             self.log.info("▶ 网盘 Worker 结束")
 
     def _cloud_worker_tick(self) -> None:
-        # 清理始终执行，不受 Aria2 排队水位影响
+        self._apply_user_control()
+        # 清理始终执行，不受 Aria2 排队水位 / 软暂停影响
         with self.lock:
             plan = self.scheduler.plan_cleanup()
             jobs = list(plan.jobs) if plan.kind == "cleanup" else []
         if plan.kind == "cleanup":
             self._execute_cleanup(jobs)
+            return
+
+        if self._user_ingest_blocked():
             return
 
         if self._refresh_aria2_backpressure():
@@ -349,6 +434,9 @@ class DownloadPipeline:
             self.scheduler.apply_download_started(job, task)
 
     def _download_submit_tick(self) -> None:
+        self._apply_user_control()
+        if self._user_ingest_blocked():
+            return
         if self._refresh_aria2_backpressure():
             return
         with self.lock:
@@ -366,6 +454,9 @@ class DownloadPipeline:
                     break
 
     def _retry_submit_tick(self) -> None:
+        self._apply_user_control()
+        if self._user_ingest_blocked():
+            return
         if self._refresh_aria2_backpressure():
             return
         with self.lock:
@@ -403,6 +494,13 @@ class DownloadPipeline:
             self.file_api.finish_downloaded_file(job.path)
             with self.lock:
                 self.scheduler.apply_download_to_cleanup(job, failed=False, note="下载完成，待清理")
+        elif state == "paused":
+            # 运行中不应长期停留 paused；尝试恢复
+            try:
+                self.file_api.aria2_client.aria2_unpause(gid)
+                self.log.info(f"  ↻ 检测到 Aria2 暂停，已恢复: {job.path} | gid={gid}")
+            except Exception as e:
+                self.log.warning(f"  恢复 Aria2 暂停任务失败: {job.path} | {e}")
         elif state == "error":
             retry_count = int(task.get("retry_count", 0))
             error_message = str(status.get("errorMessage") or "未知错误").strip()

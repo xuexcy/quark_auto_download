@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from error_classify import classify_error
-from file_api import ACTIVE_ARIA2_STATUSES, FileApi, full_path_sort_key
+from file_api import FileApi, full_path_sort_key
 
 
 JobState = Literal[
@@ -101,13 +101,27 @@ class PipelineScheduler:
                 job.note = "Aria2已完成"
                 continue
 
-            if aria2_status in ACTIVE_ARIA2_STATUSES and gid:
+            # 暂停任务：不在启动时恢复；放入 ready，等路径序轮到并提交时再 unpause
+            if aria2_status == "paused" and gid:
+                job.already_transferred = True
+                job.state = "ready"
+                job.gid = gid
+                job.note = "存在Aria2暂停任务，待路径序轮到提交时再恢复"
+                logger.info(
+                    f"  发现 Aria2 暂停任务，等待路径序轮到后再恢复: {path} | gid={gid}"
+                )
+                continue
+
+            # 仅接管正在跑/排队的任务（已在下载中，需要跟踪）
+            if aria2_status in ("active", "waiting") and gid:
                 job.download_task = self.file_api.build_download_task(file_item, gid)
                 job.state = "downloading"
                 job.already_transferred = True
                 job.gid = gid
                 job.note = "接管已有Aria2任务"
-                logger.info(f"  接管已有 Aria2 下载任务: {path} | gid={gid}")
+                logger.info(
+                    f"  接管已有 Aria2 下载任务: {path} | status={aria2_status} | gid={gid}"
+                )
                 continue
 
             already_ready = path in quark_files_by_name
@@ -303,8 +317,32 @@ class PipelineScheduler:
                 job.note = f"转存临时失败 {job.transfer_fail_count}/{max_transfer_failures}，旁路重试: {error}"
 
     def plan_main_download_candidates(self) -> list[Job]:
-        """主下载队列：全部 ready，按路径偏好排序；前面 pending 不堵塞。"""
-        return self.jobs_in("ready")
+        """
+        主下载队列（路径有序硬要求）：
+        - 按 ordered_paths 前进，跳过 done/failed/retry（失败旁路不堵主序）
+        - pending/转存中不堵塞后面已 ready 的文件
+        - 每次只返回「当前轮到」的 1 个 ready；若该序号已在 downloading 则先等它结束
+        - 真正提交时再判断：恢复 Aria2 暂停 vs 新建下载（不在启动时批量恢复）
+        """
+        if not self.prefer_path_order:
+            return self.jobs_in("ready")
+
+        for path in self.ordered_paths:
+            job = self.jobs[path]
+            state = job.state
+            if state in ("done", "failed", "retry"):
+                continue
+            if state in ("pending", "transfer_retry", "transferring", "cleanup"):
+                # 未进入/未完成下载的前置项不堵后面已 ready 的文件
+                continue
+            if state == "downloading":
+                # 轮到的文件正在下，不提前启动后续 ready
+                return []
+            if state == "ready":
+                return [job]
+            # 其他状态：不跳过，避免乱序
+            return []
+        return []
 
     def plan_retry_download_candidates(self) -> list[Job]:
         return self.jobs_in("retry")
@@ -344,6 +382,18 @@ class PipelineScheduler:
         job.state = "retry"
         job.note = f"下载提交临时失败，进入重试旁路 {job.submit_fail_count}/{max_failures}: {error}"
         return "retry"
+
+    def reset_download_to_ready(self, paths: list[str], *, note: str) -> None:
+        """Aria2 任务被移除后，将 downloading 任务退回 ready，便于下次继续。"""
+        for path in paths:
+            job = self.jobs.get(path)
+            if not job:
+                continue
+            if job.state == "downloading":
+                job.state = "ready"
+                job.gid = ""
+                job.download_task = None
+                job.note = note
 
     def apply_download_to_cleanup(self, job: Job, *, failed: bool, note: str) -> None:
         if failed:
