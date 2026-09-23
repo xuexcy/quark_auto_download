@@ -199,13 +199,17 @@ def delete_job(job_id: str, *, force_stop: bool = True) -> None:
     save_jobs_index(jobs)
 
 
-def _job_file_stats(state: dict) -> dict[str, int]:
+def _job_file_stats(state: dict) -> dict:
     """从 pipeline_state.files 汇总体积与完成数。
 
     - total_files / total_size: 分享内全部文件
     - done_files: 本地已有（state 为 done 或 cleanup；cleanup 表示已落盘待清网盘）
     - existing_or_done_size: 上述「本地已有」文件的 size 之和
       （含本次下载完成 + 启动时本地已存在跳过 + Aria2 已完成接管）
+    - existing_or_done_files_percent: done_files / total_files，0–100，一位小数；
+      total_files 为 0 时为 None（前端显示 —）
+    - existing_or_done_percent: existing_or_done_size / total_size，0–100，一位小数；
+      total_size 为 0 时为 None（前端显示 —）
     """
     files = state.get("files")
     if not isinstance(files, list):
@@ -243,11 +247,27 @@ def _job_file_stats(state: dict) -> dict[str, int]:
         total_files = sum(int(counts.get(k) or 0) for k in known)
         done_files = int(counts.get("done") or 0) + int(counts.get("cleanup") or 0)
 
+    if total_files > 0:
+        existing_or_done_files_percent = round(
+            100.0 * done_files / total_files, 1
+        )
+    else:
+        existing_or_done_files_percent = None
+
+    if total_size > 0:
+        existing_or_done_percent = round(
+            100.0 * existing_or_done_size / total_size, 1
+        )
+    else:
+        existing_or_done_percent = None
+
     return {
         "total_files": total_files,
         "total_size": total_size,
         "done_files": done_files,
         "existing_or_done_size": existing_or_done_size,
+        "existing_or_done_files_percent": existing_or_done_files_percent,
+        "existing_or_done_percent": existing_or_done_percent,
     }
 
 
@@ -282,6 +302,8 @@ def refresh_job_runtime(job: dict) -> dict:
         "total_size": stats["total_size"],
         "done_files": stats["done_files"],
         "existing_or_done_size": stats["existing_or_done_size"],
+        "existing_or_done_files_percent": stats["existing_or_done_files_percent"],
+        "existing_or_done_percent": stats["existing_or_done_percent"],
         "pipeline_updated_at": state.get("updated_at"),
         "failed_files": state.get("failed_files") or [],
         "aria2_backpressure": state.get("aria2_backpressure") or {},

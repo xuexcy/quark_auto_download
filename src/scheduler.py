@@ -1,4 +1,13 @@
-"""流水线调度器：有序仅为偏好；失败跳过，不堵塞后续任务。"""
+"""流水线调度器。
+
+权威有序范围（仅此）：
+  分享链接列举全部文件 →【有序：全部文件】→ 有序转存 →【有序进入待下载队列】
+其中「待下载队列」= 状态 ready。
+
+strict_download_order / prefer_path_order 只约束上述转存与进入 ready 的路径偏好；
+不限制下载 Worker 一次只下一个，也不因已有 downloading 而停止从 ready 取后续任务。
+下载并发交给 Aria2；失败跳过不堵后续。
+"""
 
 from __future__ import annotations
 
@@ -13,7 +22,7 @@ JobState = Literal[
     "pending",
     "transfer_retry",
     "transferring",
-    "ready",
+    "ready",  # 待下载队列：转存完成后有序进入；下载 Worker 从此取任务
     "retry",
     "downloading",
     "cleanup",
@@ -55,12 +64,12 @@ class CloudPlan:
 
 
 class PipelineScheduler:
-    """状态机。有序=按路径偏好处理；错误跳过，不挡后面。"""
+    """状态机。有序仅限转存→进入待下载队列(ready)；下载从 ready 取任务可并发。"""
 
     def __init__(self, file_api: FileApi, prefer_path_order: bool = True):
         self.file_api = file_api
         self.prefer_path_order = bool(prefer_path_order)
-        # 兼容旧字段名
+        # 兼容配置名 strict_download_order：语义=转存+进入待下载队列有序，非串行下载
         self.strict_download_order = self.prefer_path_order
         self.ordered_paths: list[str] = []
         self.jobs: dict[str, Job] = {}
@@ -101,18 +110,19 @@ class PipelineScheduler:
                 job.note = "Aria2已完成"
                 continue
 
-            # 暂停任务：不在启动时恢复；放入 ready，等路径序轮到并提交时再 unpause
+            # 暂停任务：不在启动时批量 unpause；放入待下载队列(ready)，由下载 Worker 取到后再 unpause
             if aria2_status == "paused" and gid:
                 job.already_transferred = True
                 job.state = "ready"
                 job.gid = gid
-                job.note = "存在Aria2暂停任务，待路径序轮到提交时再恢复"
+                job.note = "存在Aria2暂停任务，已入待下载队列，待 Worker 取到后恢复"
                 logger.info(
-                    f"  发现 Aria2 暂停任务，等待路径序轮到后再恢复: {path} | gid={gid}"
+                    f"  发现 Aria2 暂停任务，已入待下载队列(ready)，待下载 Worker 恢复: "
+                    f"{path} | gid={gid}"
                 )
                 continue
 
-            # 仅接管正在跑/排队的任务（已在下载中，需要跟踪）
+            # 已在 Aria2 下载中/排队：启动时直接接管跟踪（等价于 Worker 的 active/waiting 分支）
             if aria2_status in ("active", "waiting") and gid:
                 job.download_task = self.file_api.build_download_task(file_item, gid)
                 job.state = "downloading"
@@ -120,7 +130,7 @@ class PipelineScheduler:
                 job.gid = gid
                 job.note = "接管已有Aria2任务"
                 logger.info(
-                    f"  接管已有 Aria2 下载任务: {path} | status={aria2_status} | gid={gid}"
+                    f"  [Aria2分支=接管] 启动时接管已有任务({aria2_status}): {path} | gid={gid}"
                 )
                 continue
 
@@ -139,16 +149,22 @@ class PipelineScheduler:
                 job.file_item["_already_transferred"] = True
                 job.already_transferred = True
                 job.state = "pending"
-                job.note = "已转存，跳过重复转存，按偏好序等待下载"
-                logger.info(f"  发现已转存文件，跳过重复转存，按偏好序等待下载: {path}")
+                job.note = "已转存，跳过重复转存，按偏好序进入待下载队列"
+                logger.info(
+                    f"  发现已转存文件，跳过重复转存，按偏好序进入待下载队列: {path}"
+                )
             else:
                 job.state = "pending"
 
-        mode = "路径偏好有序（失败跳过）" if self.prefer_path_order else "可插队填容量"
+        mode = (
+            "转存+入待下载队列有序（失败跳过；下载可并发）"
+            if self.prefer_path_order
+            else "转存可插队填容量；下载可并发"
+        )
         counts = self.counts()
         logger.info(
             f"▶ 调度器初始化完成（{mode}）: "
-            f"pending={counts['pending']} ready={counts['ready']} "
+            f"pending={counts['pending']} ready(待下载队列)={counts['ready']} "
             f"retry={counts['retry']} transfer_retry={counts['transfer_retry']} "
             f"downloading={counts['downloading']} cleanup={counts['cleanup']} "
             f"done={counts['done']} 跳过={len(skipped)}"
@@ -203,7 +219,8 @@ class PipelineScheduler:
         if not pool:
             return CloudPlan(kind="idle")
         items = [job.file_item for job in pool]
-        # 有序仅为偏好：按路径尽量靠前装入；装不下队头时跳过填后面（避免大文件永久挡住）
+        # 有序仅为转存偏好：按路径尽量靠前装入；装不下队头时跳过填后面（避免大文件永久挡住）
+        # 进入待下载队列的有序由「按 path 规划的转存批次 + 成功即写 ready」保证；此处不限制下载并发
         if self.prefer_path_order:
             packed_items, deferred = FileApi.take_consecutive_by_capacity(items, available_size)
             if not packed_items:
@@ -236,6 +253,20 @@ class PipelineScheduler:
             job.note = "转存中" if not job.already_transferred else "确认已转存"
         return CloudPlan(kind="transfer", jobs=packed_jobs, available_size=available_size)
 
+    def plan_confirm_already_transferred(self) -> CloudPlan:
+        """已转存文件不占容量预算，无需等 get_available_space，避免全盘列举阻塞下载开工。"""
+        cleanup_jobs = self.jobs_in("cleanup")
+        if cleanup_jobs:
+            return CloudPlan(kind="cleanup", jobs=cleanup_jobs)
+        pool = [job for job in self.jobs_in("pending") if job.already_transferred]
+        if not pool:
+            return CloudPlan(kind="idle")
+        pool.sort(key=lambda job: full_path_sort_key(job.path))
+        for job in pool:
+            job.state = "transferring"
+            job.note = "确认已转存"
+        return CloudPlan(kind="transfer", jobs=pool, available_size=0, source="pending")
+
     def plan_transfer(self, available_size: int | None, *, source: str = "pending") -> CloudPlan:
         """有 cleanup 时不转存。source=pending 优先；transfer_retry 单独再跑，避免失败项挡主队列。"""
         cleanup_jobs = self.jobs_in("cleanup")
@@ -246,6 +277,9 @@ class PipelineScheduler:
 
         state: JobState = "pending" if source == "pending" else "transfer_retry"
         pool = self.jobs_in(state)
+        # 真正转存才走容量打包；已转存由 plan_confirm_already_transferred 先行处理
+        if source == "pending":
+            pool = [job for job in pool if not job.already_transferred]
         plan = self._pack_transfer_jobs(pool, available_size)
         plan.source = source
         return plan
@@ -287,9 +321,9 @@ class PipelineScheduler:
             job.file_item = item
             job.transfer_fail_count = 0
             job.note = (
-                "已转存，待偏好序下载"
+                "已转存，已进入待下载队列"
                 if job.path in preexisting_paths
-                else "转存完成，待下载"
+                else "转存完成，已进入待下载队列"
             )
             advanced += 1
         return advanced
@@ -332,31 +366,13 @@ class PipelineScheduler:
 
     def plan_main_download_candidates(self) -> list[Job]:
         """
-        主下载队列（路径有序硬要求）：
-        - 按 ordered_paths 前进，跳过 done/failed/retry（失败旁路不堵主序）
-        - pending/转存中不堵塞后面已 ready 的文件
-        - 每次只返回「当前轮到」的 1 个 ready；若该序号已在 downloading 则先等它结束
-        - 真正提交时再判断：恢复 Aria2 暂停 vs 新建下载（不在启动时批量恢复）
-        """
-        if not self.prefer_path_order:
-            return self.jobs_in("ready")
+        主下载候选：返回待下载队列(ready)全部任务（按 ordered_paths 序仅便于日志可读）。
 
-        for path in self.ordered_paths:
-            job = self.jobs[path]
-            state = job.state
-            if state in ("done", "failed", "retry"):
-                continue
-            if state in ("pending", "transfer_retry", "transferring", "cleanup"):
-                # 未进入/未完成下载的前置项不堵后面已 ready 的文件
-                continue
-            if state == "downloading":
-                # 轮到的文件正在下，不提前启动后续 ready
-                return []
-            if state == "ready":
-                return [job]
-            # 其他状态：不跳过，避免乱序
-            return []
-        return []
+        重要：不因已有 downloading 而截断或等待；Worker 应对本列表逐个取任务并提交/恢复/接管，
+        允许多个 downloading 并存。strict_download_order 不作用于此列表的「可否并发」。
+        retry 走重试旁路，不占本列表。
+        """
+        return self.jobs_in("ready")
 
     def plan_retry_download_candidates(self) -> list[Job]:
         return self.jobs_in("retry")
@@ -370,7 +386,15 @@ class PipelineScheduler:
         job.download_task = task
         job.gid = str(task.get("gid", "") or "")
         job.submit_fail_count = 0
-        job.note = "下载中"
+        action = str(task.get("submit_action") or "").strip()
+        if action == "unpause":
+            job.note = "已从待下载队列恢复(paused→unpause)"
+        elif action == "adopt":
+            job.note = "已从待下载队列接管(active/waiting)"
+        elif action == "add":
+            job.note = "已从待下载队列新建提交(addUri)"
+        else:
+            job.note = "下载中"
 
     def apply_submit_failure(self, job: Job, error: str, max_failures: int) -> str:
         """
@@ -398,7 +422,7 @@ class PipelineScheduler:
         return "retry"
 
     def reset_download_to_ready(self, paths: list[str], *, note: str) -> None:
-        """Aria2 任务被移除后，将 downloading 任务退回 ready，便于下次继续。"""
+        """Aria2 任务被移除后，将 downloading 退回待下载队列(ready)，便于下次再取。"""
         for path in paths:
             job = self.jobs.get(path)
             if not job:

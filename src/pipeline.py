@@ -1,4 +1,9 @@
-"""调度器 + Worker 流水线：调度器决策，Worker 执行转存/清理/下载。"""
+"""调度器 + Worker 流水线。
+
+有序仅限：列举全部文件 → 有序转存 → 有序进入待下载队列(ready)。
+下载主 Worker 从 ready 取任务：paused→unpause / active|waiting→接管 / 无→addUri；
+可与已有 downloading 并存，不因「已有下载中」而停止取后续任务。
+"""
 
 from __future__ import annotations
 
@@ -205,7 +210,7 @@ class DownloadPipeline:
         self.log.info(
             f"  [{worker}] pending={counts['pending']} transferring={transferring_n} "
             f"transfer_retry={transfer_retry_n} "
-            f"ready={counts['ready']} retry={counts['retry']} downloading={counts['downloading']} "
+            f"ready(待下载)={counts['ready']} retry={counts['retry']} downloading={counts['downloading']} "
             f"cleanup={counts['cleanup']} done={counts['done']} failed={counts['failed']} "
             f"| 主下载={main_n} 下载重试={retry_n} | Aria2排队={self._last_aria2_waiting}({pause_flag})"
         )
@@ -302,6 +307,16 @@ class DownloadPipeline:
         if self._refresh_aria2_backpressure():
             return
 
+        # 已转存确认不占容量，先推进 ready，避免被全盘容量扫描阻塞数分钟
+        with self.lock:
+            confirm_plan = self.scheduler.plan_confirm_already_transferred()
+        if confirm_plan.kind == "cleanup":
+            self._execute_cleanup(list(confirm_plan.jobs))
+            return
+        if confirm_plan.kind == "transfer":
+            self._execute_transfer(confirm_plan.jobs, confirm_plan.available_size)
+            return
+
         available = self.file_api.get_available_space()
         with self.lock:
             plan = self.scheduler.plan_transfer(available, source="pending")
@@ -333,6 +348,7 @@ class DownloadPipeline:
             if failed_jobs:
                 self.log.warning("  [调度] 存在清理未确认成功的文件，暂停转存")
         if deleted_names:
+            self.file_api.invalidate_available_space_cache()
             # 只清理刚删文件对应的空父目录，避免每轮全盘扫描
             self.file_api.cleanup_empty_dirs(deleted_names)
 
@@ -341,11 +357,13 @@ class DownloadPipeline:
         self.log.info(f"  [调度→转存Worker] 本批 {len(jobs)} 个文件")
 
         def _on_group_transferred(group_items: list[dict]) -> None:
-            # 每组转存成功即写回 ready，下载 Worker 可与后续目录转存并行
+            # 每组转存成功即有序写入待下载队列(ready)；下载 Worker 可与后续转存并行、可多 downloading
             with self.lock:
                 advanced = self.scheduler.apply_transfer_success(group_items, preexisting_paths)
             if advanced:
-                self.log.info(f"  [调度] 本组转存已推进 ready +{advanced}")
+                self.log.info(
+                    f"  [调度] 本组转存已有序进入待下载队列(ready) +{advanced}"
+                )
                 self._persist_state()
 
         transferred, failed, failure_errors = self.file_api.transfer_file_batch(
@@ -355,6 +373,9 @@ class DownloadPipeline:
             available_size,
             on_group_transferred=_on_group_transferred,
         )
+        # 仅真实转存会改变占用；全是已转存跳过则不必清缓存
+        if any(job.path not in preexisting_paths for job in jobs):
+            self.file_api.invalidate_available_space_cache()
         max_failures = max(self.file_api.download_submit_max_retries, 1)
         with self.lock:
             # 收尾：处理失败/未完成；成功项可能已在回调中变 ready（幂等）
@@ -367,7 +388,10 @@ class DownloadPipeline:
             )
 
     def _download_worker_loop(self) -> None:
-        self.log.info("▶ 下载主 Worker 启动（路径偏好有序；永久错误跳过，临时错误进重试旁路）")
+        self.log.info(
+            "▶ 下载主 Worker 启动（从待下载队列 ready 取任务，可并发 downloading；"
+            "永久错误跳过，临时错误进重试旁路）"
+        )
         try:
             while not self._stop.is_set():
                 self._download_submit_tick()
@@ -447,6 +471,7 @@ class DownloadPipeline:
             self.scheduler.apply_download_started(job, task)
 
     def _download_submit_tick(self) -> None:
+        """从待下载队列(ready)取全部候选并逐个处理；不因已有 downloading 而提前停止。"""
         self._apply_user_control()
         if self._user_ingest_blocked():
             return

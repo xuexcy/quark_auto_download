@@ -44,6 +44,9 @@ class QuarkClient:
             "Referer": "https://pan.quark.cn/",
             "Content-Type": "application/json",
         }
+        # get_available_space 需全盘递归，缓存避免每轮 poll 卡数分钟
+        self._available_space_cache: tuple[float, int] | None = None
+        self._available_space_cache_ttl = 45.0
 
     def quark_get(self, url: str, params: dict = None) -> dict:
         import time
@@ -125,24 +128,46 @@ class QuarkClient:
         self.log.info(f"转存目录: /{self.save_to_dir or ''}  fid={self.save_to_fid}")
         return self.save_to_fid
 
+    def invalidate_available_space_cache(self) -> None:
+        """转存/清理后容量变化，丢弃缓存。"""
+        self._available_space_cache = None
+
     def get_available_space(self) -> int:
-        """获取网盘可用空间（字节）。通过计算所有文件占用容量得到。"""
+        """获取网盘可用空间（字节）。通过计算所有文件占用容量得到。
+
+        注意：当前实现会递归列出整个网盘，文件多时可能耗时数分钟；
+        结果短时缓存，避免网盘 Worker 每轮都阻塞。
+        """
+        now = time.monotonic()
+        cached = self._available_space_cache
+        if cached is not None:
+            cached_at, cached_size = cached
+            if now - cached_at <= self._available_space_cache_ttl:
+                return cached_size
+
         try:
-            # 获取所有文件
+            self.log.info("  开始计算网盘可用空间（全盘递归列举，文件多时较慢）…")
+            started = time.monotonic()
             all_files = self.list_my_files_recursive("0")
-            # 累计占用容量
             used_size = sum(self._to_int(file.get("size", 0)) for file in all_files)
             # 总容量10G
             total_size = 10 * 1024 * 1024 * 1024
-            # 剩余容量
             available_size = total_size - used_size
             if available_size < 0:
                 available_size = 0
+            elapsed = time.monotonic() - started
+            self.log.info(
+                f"  网盘可用空间: {available_size // 1024 // 1024} MB "
+                f"（已用 {used_size // 1024 // 1024} MB / "
+                f"{len(all_files)} 个文件，耗时 {elapsed:.1f}s）"
+            )
+            self._available_space_cache = (time.monotonic(), available_size)
             return available_size
         except Exception as e:
             self.log.warning(f"计算可用空间失败，使用默认9GB: {e}")
-            # 出错时返回默认9GB
-            return 9 * 1024 * 1024 * 1024
+            fallback = 9 * 1024 * 1024 * 1024
+            self._available_space_cache = (time.monotonic(), fallback)
+            return fallback
 
     def parse_share_url(self) -> tuple[str, str]:
         """解析分享链接，返回 (share_id, folder_fid)。
@@ -206,11 +231,25 @@ class QuarkClient:
         root_fid = fid_list[0] if fid_list else "0"
         return stoken, share_id, root_fid
 
-    def list_share_files(self, share_id: str, stoken: str, pdir_fid: str, relative_dir: str = "") -> list[dict]:
+    def list_share_files(
+        self,
+        share_id: str,
+        stoken: str,
+        pdir_fid: str,
+        relative_dir: str = "",
+        _stats: dict | None = None,
+    ) -> list[dict]:
+        """递归分页列举分享目录。串行请求、无 sleep；深目录时主要耗时在 Quark API 往返。"""
         files = []
         page = 1
         relative_dir = relative_dir.strip("/")
+        root_call = _stats is None
+        if root_call:
+            _stats = {"requests": 0, "dirs": 0, "files": 0, "started": time.monotonic()}
+        _stats["dirs"] += 1
+        dir_label = relative_dir or "(根)"
         while True:
+            started = time.monotonic()
             data = self.quark_get(
                 f"{QUARK_DRIVE_BASE_URL}/1/clouddrive/share/sharepage/detail",
                 {
@@ -230,9 +269,14 @@ class QuarkClient:
                     "_sort": "file_type:asc,file_name:asc",
                 },
             )
+            req_elapsed = time.monotonic() - started
+            _stats["requests"] += 1
             items = data.get("data", {}).get("list", [])
             if not items:
                 break
+            page_files = 0
+            page_dirs = 0
+            child_dirs: list[tuple[str, str]] = []
             for item in items:
                 if item.get("file_name"):
                     item["file_name"] = unescape_html_name(item["file_name"])
@@ -242,14 +286,36 @@ class QuarkClient:
                     )
                     item["relative_path"] = relative_path
                     files.append(item)
+                    page_files += 1
+                    _stats["files"] += 1
                 elif item.get("dir"):
+                    page_dirs += 1
                     next_relative_dir = "/".join(
                         part for part in (relative_dir, item.get("file_name", "")) if part
                     )
-                    files.extend(self.list_share_files(share_id, stoken, item["fid"], next_relative_dir))
+                    child_dirs.append((item["fid"], next_relative_dir))
+            self.log.info(
+                f"  列举分享: {dir_label}  page={page}  "
+                f"本页文件={page_files} 本页子目录={page_dirs}  "
+                f"请求耗时 {req_elapsed:.1f}s  "
+                f"累计请求={_stats['requests']} 累计文件={_stats['files']}"
+            )
+            for child_fid, child_rel in child_dirs:
+                files.extend(
+                    self.list_share_files(
+                        share_id, stoken, child_fid, child_rel, _stats=_stats
+                    )
+                )
             if len(items) < 50:
                 break
             page += 1
+        if root_call:
+            total_elapsed = time.monotonic() - _stats["started"]
+            self.log.info(
+                f"  分享列表列举完成: 文件={len(files)} 目录数≈{_stats['dirs']} "
+                f"API请求={_stats['requests']} 总耗时 {total_elapsed:.1f}s "
+                f"（均约 {total_elapsed / max(_stats['requests'], 1):.1f}s/请求，串行无本地磁盘检测）"
+            )
         return files
 
     def list_my_dir_entries(self, pdir_fid: str) -> list[dict]:
@@ -285,23 +351,63 @@ class QuarkClient:
             page += 1
         return entries
 
-    def list_my_files_recursive(self, pdir_fid: str, relative_dir: str = "") -> list[dict]:
+    def list_my_files_recursive(
+        self,
+        pdir_fid: str,
+        relative_dir: str = "",
+        _stats: dict | None = None,
+    ) -> list[dict]:
         """递归列出自己网盘目录中的文件（不含目录）。"""
         files = []
         pdir_fid = self._normalize_my_fid(pdir_fid)
         relative_dir = relative_dir.strip("/")
-        for item in self.list_my_dir_entries(pdir_fid):
+        root_call = _stats is None
+        if root_call:
+            _stats = {"dirs": 0, "files": 0, "started": time.monotonic()}
+        _stats["dirs"] += 1
+        dir_label = relative_dir or "(根)"
+        started = time.monotonic()
+        entries = self.list_my_dir_entries(pdir_fid)
+        req_elapsed = time.monotonic() - started
+        page_files = 0
+        page_dirs = 0
+        child_dirs: list[tuple[str, str]] = []
+        for item in entries:
             if item.get("file"):
                 relative_path = "/".join(
                     part for part in (relative_dir, item.get("file_name", "")) if part
                 )
                 item["relative_path"] = relative_path
                 files.append(item)
+                page_files += 1
+                _stats["files"] += 1
             elif item.get("dir"):
+                page_dirs += 1
                 next_relative_dir = "/".join(
                     part for part in (relative_dir, item.get("file_name", "")) if part
                 )
-                files.extend(self.list_my_files_recursive(item.get("fid", ""), next_relative_dir))
+                child_dirs.append((item.get("fid", ""), next_relative_dir))
+        # 全盘算容量时避免每层刷 INFO；慢请求 / 前两层 / 每 10 个目录仍可见
+        if (
+            root_call
+            or req_elapsed >= 1.0
+            or _stats["dirs"] <= 2
+            or _stats["dirs"] % 10 == 0
+        ):
+            self.log.info(
+                f"  列举网盘: {dir_label}  "
+                f"本层文件={page_files} 本层子目录={page_dirs}  "
+                f"列举耗时 {req_elapsed:.1f}s  "
+                f"累计目录={_stats['dirs']} 累计文件={_stats['files']}"
+            )
+        for child_fid, child_rel in child_dirs:
+            files.extend(self.list_my_files_recursive(child_fid, child_rel, _stats=_stats))
+        if root_call:
+            total_elapsed = time.monotonic() - _stats["started"]
+            self.log.info(
+                f"  网盘递归列举完成: 文件={len(files)} 目录数≈{_stats['dirs']} "
+                f"总耗时 {total_elapsed:.1f}s"
+            )
         return files
 
     def create_my_dir(self, pdir_fid: str, dir_name: str) -> str:

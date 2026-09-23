@@ -139,24 +139,41 @@ class FileApi:
         return self.get_local_downloaded_file_names(self.download_destination_dir)
 
     def refresh_runtime_state(self) -> tuple[dict[str, list[dict]], set[str], dict[str, dict]]:
+        self.log.info("▶ 刷新运行时状态：列举转存目录 / 本地已完成 / Aria2 任务…")
+        started = time.monotonic()
         try:
             quark_files_by_name = self.get_quark_files_by_name()
+            self.log.info(
+                f"  转存目录已有文件: {sum(len(v) for v in quark_files_by_name.values())} "
+                f"（耗时 {time.monotonic() - started:.1f}s）"
+            )
         except Exception as e:
             self.log.error(f"读取 Quark 已转存文件列表失败: {e}")
             quark_files_by_name = {}
 
         try:
+            local_started = time.monotonic()
             local_downloaded_names = self.get_local_downloaded_file_names_from_dirs()
+            self.log.info(
+                f"  本地已完成文件: {len(local_downloaded_names)} "
+                f"（耗时 {time.monotonic() - local_started:.1f}s）"
+            )
         except Exception as e:
             self.log.error(f"读取本地下载目录失败: {e}")
             local_downloaded_names = set()
 
         try:
+            aria2_started = time.monotonic()
             aria2_tasks_by_name = self.aria2_client.aria2_get_existing_task_infos_by_name()
+            self.log.info(
+                f"  Aria2 现有任务: {len(aria2_tasks_by_name)} "
+                f"（耗时 {time.monotonic() - aria2_started:.1f}s）"
+            )
         except Exception as e:
             self.log.error(f"读取 Aria2 任务列表失败: {e}")
             aria2_tasks_by_name = {}
 
+        self.log.info(f"  运行时状态刷新完成，总耗时 {time.monotonic() - started:.1f}s")
         return quark_files_by_name, local_downloaded_names, aria2_tasks_by_name
 
     def get_available_space(self) -> int | None:
@@ -165,6 +182,9 @@ class FileApi:
         except Exception as e:
             self.log.error(f"查询网盘剩余容量失败: {e}")
             return None
+
+    def invalidate_available_space_cache(self) -> None:
+        self.quark_client.invalidate_available_space_cache()
 
     def move_file_to_destination(self, relative_path: str) -> bool:
         relative_path = normalize_relative_path(relative_path)
@@ -334,35 +354,41 @@ class FileApi:
 
     def submit_download(self, file_item: dict) -> dict:
         """
-        提交或恢复下载：
-        - Aria2 已有 paused → unpause 恢复
-        - Aria2 已有 active/waiting → 直接接管
-        - 否则取直链新建任务
+        下载 Worker 从待下载队列取到任务后调用。三种 Aria2 分支（互斥）：
+        a. paused → unpause 恢复，记录状态
+        b. active/waiting（含人为在 Aria2 里恢复）→ 只接管并记录状态
+        c. 无已有任务 → addUri 新建提交，记录状态
         """
         file_name = self.file_path(file_item)
-        self.log.info(f"  → 按路径序提交/恢复下载: {file_name}")
+        self.log.info(f"  → 从待下载队列取任务，处理: {file_name}")
         existing = self.aria2_client.aria2_find_task_by_path(file_name)
         if existing:
             gid = str(existing.get("gid") or "").strip()
             status = str(existing.get("status") or "").lower()
             if gid and status == "paused":
-                self.log.info(f"  → 当前文件存在 Aria2 暂停任务，恢复下载: {file_name} | gid={gid}")
+                self.log.info(
+                    f"  [Aria2分支=恢复] paused→unpause: {file_name} | gid={gid}"
+                )
                 self.aria2_client.aria2_unpause(gid)
                 task = self.build_download_task(file_item, gid)
+                task["submit_action"] = "unpause"
                 self.log.info(f"    已恢复下载: {file_name} | gid={gid}")
                 return task
             if gid and status in ("active", "waiting"):
                 self.log.info(
-                    f"  → 接管已有 Aria2 任务({status}): {file_name} | gid={gid}"
+                    f"  [Aria2分支=接管] {status}→接管记录: {file_name} | gid={gid}"
                 )
-                return self.build_download_task(file_item, gid)
+                task = self.build_download_task(file_item, gid)
+                task["submit_action"] = "adopt"
+                return task
 
-        self.log.info(f"  → 无已有下载任务，新建提交: {file_name}")
+        self.log.info(f"  [Aria2分支=新建] 无已有任务→addUri: {file_name}")
         self.log.info(f"    开始获取直链并提交 Aria2 下载任务: {file_name}")
         dl_url = self.openlist_client.openlist_get_download_url(self.openlist_path(file_name))
         gid = self.aria2_client.aria2_add_url(dl_url, file_name)
         task = self.build_download_task(file_item, gid)
-        self.log.info(f"    下载任务提交成功，已开始下载: {file_name} | gid={gid}")
+        task["submit_action"] = "add"
+        self.log.info(f"    下载任务提交成功: {file_name} | gid={gid}")
         return task
 
     def cleanup_files_batch(self, tasks: list[dict], action: str = "已删除 Quark 转存文件") -> tuple[list[str], list[dict]]:

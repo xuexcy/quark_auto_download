@@ -9,7 +9,7 @@
 - **软暂停**：清除 Aria2 **排队**任务；**下载中**继续跑并跟踪到完成，然后停止该任务进程
 - **硬暂停**：Aria2 **暂停**下载中 + 排队（保留进度），尽快停止该任务进程；再次开始时 unpause 恢复
 - **断点续跑**：再次「开始」会识别 completed 已有文件，并接管 Aria2 中仍在进行 / 已暂停的任务
-- **调度器 + Worker**：转存/清理/下载并行；失败跳过不堵队列
+- **调度器 + Worker**：转存有序入待下载队列；下载从队列取任务可并发；失败跳过不堵队列
 - **Aria2 排队水位**：全局 waiting 过高时暂停转存与新提交（清理不停）
 - **完成后校验 + 空目录清理 + 0 字节跳过**
 - **按日分目录日志**：Web / 任务日志分离；stdout 与 stderr 均写入对应日志文件
@@ -19,7 +19,6 @@
 ```
 code/
 ├── bin/           # Web 服务脚本：start.sh / stop.sh / restart.sh
-├── bin_bak/       # 旧版非 Web CLI 脚本备份（run/stop/restart/web）
 ├── src/           # 业务代码（quark_main / pipeline / web_app / jobs_manager / log_util …）
 ├── web/static/    # 前端：index.html（任务）/ settings.html（配置）
 ├── conf/          # Cookie / OpenList / Aria2 等全局配置
@@ -54,7 +53,9 @@ cp conf/example/aria2.example.yaml conf/aria2.yaml
 
 ## 使用方法
 
-### 启动 Web（NAS 局域网）
+日常使用 **仅通过 Web + `bin/` 脚本**：`./bin/start.sh` 启动 Web，在浏览器里管理多分享任务；下载由 Web 拉起的 `quark_main.py` 子进程执行。
+
+### 启动 / 停止 Web（NAS 局域网）
 
 ```bash
 ./bin/start.sh      # 后台启动；终端只打印 PID/LOG，运行日志不刷屏
@@ -85,11 +86,9 @@ QUARK_AUTO_DL_WEB_HOST=0.0.0.0 QUARK_AUTO_DL_WEB_PORT=8787 ./bin/start.sh
 7. **日志**：展开详情中的日志区可查看该次运行下载日志
 8. **设置**：配置 Quark Cookie / OpenList / Aria2；页底「重启服务」会调用 `POST /api/web/restart` 调度 `bin/restart.sh`（仅内网自用）
 
-### 旧版 CLI
+### 调试任务子进程（可选）
 
-仍可在 `bin_bak/` 找到旧的 `run.sh` / `stop.sh` 等；推荐改用 Web。
-
-单任务前台调试：
+`src/quark_main.py` 是 Web 启动的下载任务入口；需要单独前台调试时可：
 
 ```bash
 QUARK_AUTO_DL_SHARE_URL='https://pan.quark.cn/s/xxx' \
@@ -144,9 +143,13 @@ log/2026_09_17/jobs/jabc123def0_18_17_05.log
 文件状态处理：
 
 1. 本地 completed 已有 → 跳过（必要时清理网盘）
-2. 转存成功 → 进入待下载
-3. **按 path 排序有序推进**：主队列每次只轮到 1 个 `ready` 文件；轮到时再判断——有 Aria2 `paused` 则恢复，否则新建  
-   （启动时发现暂停任务只放入待下载，不会批量恢复）
+2. **有序范围（仅此）**：分享链接获取全部文件 →【有序】→ 有序转存 →【有序进入待下载队列】  
+   （状态名 `ready` = 待下载队列；`strict_download_order` 只约束这一段）
+3. **下载 Worker**（无序/可并发）：从待下载队列取任务；已有 `downloading` 不阻止继续取后续任务  
+   - Aria2 已有 **paused** → unpause 恢复并记录  
+   - Aria2 已有 **active/waiting**（含人为恢复）→ 只接管并记录  
+   - 无已有任务 → addUri 新建并记录  
+   （启动时发现暂停任务只放入待下载队列，不批量恢复；active/waiting 启动时直接接管）
 
 ## 注意事项
 

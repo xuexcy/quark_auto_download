@@ -194,7 +194,7 @@ class Aria2Client:
         self._aria2_call("aria2.unpause", [gid])
 
     def aria2_find_task_by_path(self, relative_path: str) -> dict | None:
-        """按相对路径查找 active/waiting/paused 任务，返回 {gid, status}。"""
+        """按相对路径查找 active/waiting/paused 任务，供下载 Worker 三分支（恢复/接管/新建）判断。"""
         wanted = self._normalize_relative_path(relative_path)
         if not wanted:
             return None

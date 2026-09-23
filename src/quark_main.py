@@ -238,7 +238,11 @@ def main():
     if not all_files:
         return
 
-    order_desc = "路径偏好有序（失败跳过）" if STRICT_DOWNLOAD_ORDER else "可插队填容量"
+    order_desc = (
+        "转存+入待下载队列有序（失败跳过；下载可并发）"
+        if STRICT_DOWNLOAD_ORDER
+        else "转存可插队填容量；下载可并发"
+    )
     log.info(f"▶ 调度器+Worker 启动，共 {len(all_files)} 个文件（{order_desc}）")
     log.info(f"状态文件: {STATE_FILE}")
     if CONTROL_FILE:

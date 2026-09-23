@@ -145,7 +145,7 @@
     .dot.pause { background: var(--warn); }
     .dot.off { background: var(--danger); }
     .stats {
-      display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .65rem; margin: 1rem 0;
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; margin: 1rem 0;
     }
     .stat {
       border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
@@ -153,6 +153,7 @@
     }
     .stat-label { font-size: .72rem; color: var(--muted); margin: 0 0 .35rem; }
     .stat-value { font-family: var(--mono); font-size: .95rem; font-weight: 600; margin: 0; word-break: break-all; }
+    .stat-pct { color: var(--muted); font-weight: 500; }
     .job-log {
       margin-top: .75rem;
       border-top: 1px dashed var(--line);
@@ -339,12 +340,51 @@
 
     function jobStats(job) {
       const s = job.stats || {};
+      const total_files = Number(s.total_files ?? job.total_files ?? 0) || 0;
+      const done_files = Number(s.done_files ?? job.done_files ?? 0) || 0;
+      const total_size = Number(s.total_size ?? job.total_size ?? 0) || 0;
+      const existing_or_done_size =
+        Number(s.existing_or_done_size ?? job.existing_or_done_size ?? 0) || 0;
+
+      let filesPct =
+        s.existing_or_done_files_percent ?? job.existing_or_done_files_percent;
+      if (filesPct == null || filesPct === "") {
+        filesPct = total_files > 0 ? (100 * done_files) / total_files : null;
+      } else {
+        filesPct = Number(filesPct);
+        if (!Number.isFinite(filesPct)) filesPct = null;
+      }
+
+      let sizePct = s.existing_or_done_percent ?? job.existing_or_done_percent;
+      if (sizePct == null || sizePct === "") {
+        sizePct = total_size > 0 ? (100 * existing_or_done_size) / total_size : null;
+      } else {
+        sizePct = Number(sizePct);
+        if (!Number.isFinite(sizePct)) sizePct = null;
+      }
+
       return {
-        total_files: Number(s.total_files ?? job.total_files ?? 0) || 0,
-        total_size: Number(s.total_size ?? job.total_size ?? 0) || 0,
-        done_files: Number(s.done_files ?? job.done_files ?? 0) || 0,
-        existing_or_done_size: Number(s.existing_or_done_size ?? job.existing_or_done_size ?? 0) || 0,
+        total_files,
+        total_size,
+        done_files,
+        existing_or_done_size,
+        existing_or_done_files_percent: filesPct,
+        existing_or_done_percent: sizePct,
       };
+    }
+
+    function formatExistingPercent(pct) {
+      if (pct == null || !Number.isFinite(pct)) return "—";
+      const v = Math.round(pct * 10) / 10;
+      return `${Number.isInteger(v) ? v : v.toFixed(1)}%`;
+    }
+
+    function formatFilesProgress(done, total, pct) {
+      return `${done} / ${total} (${formatExistingPercent(pct)})`;
+    }
+
+    function formatSizeProgress(existing, total, pct) {
+      return `${formatSize(existing)} / ${formatSize(total)} (${formatExistingPercent(pct)})`;
     }
 
     function shortUrl(url) {
@@ -407,20 +447,12 @@
       const s = jobStats(job);
       return `
         <div class="stat">
-          <p class="stat-label">文件总数</p>
-          <p class="stat-value">${s.total_files}</p>
+          <p class="stat-label">已有文件数 / 总文件数</p>
+          <p class="stat-value">${escapeHtml(formatFilesProgress(s.done_files, s.total_files, s.existing_or_done_files_percent))}</p>
         </div>
         <div class="stat">
-          <p class="stat-label">总计大小</p>
-          <p class="stat-value">${escapeHtml(formatSize(s.total_size))}</p>
-        </div>
-        <div class="stat">
-          <p class="stat-label">已下载文件</p>
-          <p class="stat-value">${s.done_files}</p>
-        </div>
-        <div class="stat">
-          <p class="stat-label">当前已有大小</p>
-          <p class="stat-value">${escapeHtml(formatSize(s.existing_or_done_size))}</p>
+          <p class="stat-label">已有文件大小 / 总文件大小</p>
+          <p class="stat-value">${escapeHtml(formatSizeProgress(s.existing_or_done_size, s.total_size, s.existing_or_done_percent))}</p>
         </div>`;
     }
 

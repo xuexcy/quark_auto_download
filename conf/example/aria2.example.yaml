@@ -33,8 +33,13 @@ download_submit_max_retries: 10
 # 已废弃：提交失败不再固定间隔退避重试
 # download_submit_retry_interval: 30
 
-# 路径偏好有序：按完整路径优先处理；失败会跳过，不堵塞后续任务
-# false = 转存时更激进地跳过大文件以填满容量
+# 路径偏好有序（strict_download_order）：只约束「转存 + 进入待下载队列(ready)」
+# 权威流程有序范围：
+#   分享链接获取全部文件 →【有序：全部文件】→ 有序转存 →【有序进入待下载队列】
+# 下载 Worker 从待下载队列取任务，不受本开关限制为串行：
+#   paused→unpause / active|waiting→接管 / 无→addUri；已有 downloading 不停止继续取后续任务
+# true（默认）= 转存优先按 path 连续装入；转存成功后有序进入 ready（待下载队列）
+# false = 转存可跳过装不下的队头填后面；进入 ready 仍按完成批次写入
 strict_download_order: true
 
 # Aria2 排队水位（waiting）：超过上限暂停转存/提交下载，低于下限恢复；清理不受影响
