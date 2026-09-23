@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -18,6 +19,7 @@ from log_util import configure_logging, dated_web_log_path
 
 WEB_DIR = os.path.join(BASE_DIR, "web")
 STATIC_DIR = os.path.join(WEB_DIR, "static")
+RESTART_SCRIPT = os.path.join(BASE_DIR, "bin", "restart.sh")
 WEB_LOG_PATH = (
     os.getenv("QUARK_AUTO_DL_WEB_LOG_FILE", "").strip() or dated_web_log_path()
 )
@@ -137,12 +139,40 @@ def api_job_report(job_id: str):
     return {"report": data}
 
 
+@app.post("/api/web/restart")
+def api_web_restart():
+    """后台调度 bin/restart.sh（先 sleep 再 stop+start），避免当前进程自杀导致响应发不出去。"""
+    if not os.path.isfile(RESTART_SCRIPT):
+        raise HTTPException(status_code=500, detail=f"找不到重启脚本: {RESTART_SCRIPT}")
+    try:
+        # 独立会话 + 短暂延迟：先把本请求响应写回客户端，再由脚本杀旧 PID 并拉起新进程
+        subprocess.Popen(
+            ["/bin/sh", "-c", f"sleep 1; exec '{RESTART_SCRIPT}'"],
+            cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"无法调度重启: {e}") from e
+    return {"ok": True, "message": "正在重启…请稍后刷新"}
+
+
 @app.get("/")
 def index():
     index_path = os.path.join(STATIC_DIR, "index.html")
     if not os.path.isfile(index_path):
         raise HTTPException(status_code=404, detail="前端页面不存在")
     return FileResponse(index_path)
+
+
+@app.get("/settings")
+def settings_page():
+    settings_path = os.path.join(STATIC_DIR, "settings.html")
+    if not os.path.isfile(settings_path):
+        raise HTTPException(status_code=404, detail="设置页面不存在")
+    return FileResponse(settings_path)
 
 
 if os.path.isdir(STATIC_DIR):

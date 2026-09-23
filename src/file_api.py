@@ -3,6 +3,7 @@ import os
 import posixpath
 import time
 from collections import defaultdict
+from collections.abc import Callable
 
 from aria2_api import Aria2Client
 from openlist_api import OpenListClient
@@ -90,13 +91,15 @@ class FileApi:
 
     @staticmethod
     def format_size(size: int) -> str:
-        """小于 1MB 用 K；不足 1K 用 B。"""
+        """人类可读大小：B / KB / MB / GB。"""
         n = max(int(size or 0), 0)
         if n < 1024:
             return f"{n} B"
         if n < 1024 * 1024:
-            return f"{n // 1024} K"
-        return f"{n // (1024 * 1024)} MB"
+            return f"{n / 1024:.1f} KB".replace(".0 ", " ")
+        if n < 1024 * 1024 * 1024:
+            return f"{n / (1024 * 1024):.1f} MB".replace(".0 ", " ")
+        return f"{n / (1024 * 1024 * 1024):.2f} GB".replace(".00 ", " ")
 
     @staticmethod
     def relative_dir(file_name: str) -> str:
@@ -246,8 +249,12 @@ class FileApi:
         share_id: str,
         stoken: str,
         quark_available_size: int,
+        on_group_transferred: Callable[[list[dict]], None] | None = None,
     ) -> tuple[list[dict], list[dict], dict[str, str]]:
-        """按目录批量转存。已转存文件跳过 API，仍按输入顺序计入成功列表。"""
+        """按目录批量转存。已转存文件跳过 API，仍按输入顺序计入成功列表。
+
+        on_group_transferred: 每成功一组（或启动时已转存跳过）即回调，便于流水线提前 ready→下载。
+        """
         if not files:
             return [], [], {}
 
@@ -259,6 +266,16 @@ class FileApi:
         transferred_names: set[str] = {self.file_path(item) for item in already_ready}
         failed: list[dict] = []
         failure_errors: dict[str, str] = {}
+
+        def _mark_and_notify(group_items: list[dict]) -> None:
+            for item in group_items:
+                item["_already_transferred"] = True
+                transferred_names.add(self.file_path(item))
+            if on_group_transferred and group_items:
+                on_group_transferred(list(group_items))
+
+        if already_ready:
+            _mark_and_notify(already_ready)
 
         if need_transfer:
             batch_size = sum(int(item.get("size", 0)) for item in need_transfer)
@@ -296,7 +313,7 @@ class FileApi:
                     )
                     for file_name in group_names:
                         self.log.info(f"    - {file_name}")
-                        transferred_names.add(file_name)
+                    _mark_and_notify(group_files)
                 except Exception as e:
                     self.log.error(f"  转存失败: {', '.join(group_names)} | {e}")
                     failed.extend(group_files)
@@ -322,6 +339,7 @@ class FileApi:
         - Aria2 已有 active/waiting → 直接接管
         - 否则取直链新建任务
         """
+        file_name = self.file_path(file_item)
         self.log.info(f"  → 按路径序提交/恢复下载: {file_name}")
         existing = self.aria2_client.aria2_find_task_by_path(file_name)
         if existing:

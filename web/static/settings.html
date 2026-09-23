@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>设置 · Quark Auto Download</title>
+  <style>
+    :root {
+      --bg: #0f1412;
+      --panel: #171e1b;
+      --panel-2: #1e2823;
+      --line: #2c3a33;
+      --text: #e7eee9;
+      --muted: #8fa196;
+      --accent: #3dba7a;
+      --accent-dim: #2a8f5c;
+      --radius: 10px;
+      --font: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Sarasa Mono SC", "Cascadia Code", "Consolas", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(1100px 520px at 8% -8%, #1a3328 0%, transparent 55%),
+        radial-gradient(800px 420px at 100% 0%, #1a2430 0%, transparent 50%),
+        var(--bg);
+    }
+    .wrap { width: min(720px, calc(100% - 2rem)); margin: 0 auto; padding: 2.2rem 0 4rem; }
+    .header-top {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 1rem; flex-wrap: wrap; margin-bottom: .15rem;
+    }
+    .brand { font-family: var(--mono); font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 .45rem; }
+    h1 { margin: 0; font-size: clamp(1.4rem, 3vw, 1.85rem); font-weight: 600; }
+    .sub { margin: .5rem 0 0; color: var(--muted); line-height: 1.5; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+      margin: 1rem 0;
+    }
+    .panel-head {
+      display: flex; flex-direction: column; gap: .25rem;
+      margin: 0 0 .85rem; padding-bottom: .75rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel h2 {
+      margin: 0; font-size: 1rem; font-weight: 600;
+    }
+    .panel-desc {
+      margin: 0; font-size: .78rem; color: var(--muted); line-height: 1.45;
+      font-family: var(--mono);
+    }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: .7rem 0 .3rem; }
+    .panel > label:first-of-type { margin-top: 0; }
+    input, textarea {
+      width: 100%; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+      border-radius: 8px; padding: .65rem .75rem; font: 500 .92rem/1.4 var(--mono); outline: none;
+    }
+    input:focus, textarea:focus { border-color: var(--accent-dim); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+    button, a.btn-ghost {
+      border: 0; border-radius: 8px; padding: .65rem 1rem; font: 600 .88rem/1 var(--font); cursor: pointer;
+    }
+    .btn-primary { background: var(--accent); color: #062214; }
+    .btn-restart {
+      background: color-mix(in srgb, #c47a3a 88%, #1a1008);
+      color: #1a1008;
+    }
+    .btn-restart:disabled { opacity: .55; cursor: wait; }
+    a.btn-ghost, button.btn-ghost {
+      display: inline-flex; align-items: center; text-decoration: none;
+      background: transparent; color: var(--text); border: 1px solid var(--line);
+    }
+    a.btn-ghost:hover, button.btn-ghost:hover { border-color: var(--accent-dim); color: var(--accent); }
+    .msg { margin-top: .7rem; min-height: 1.1rem; font-size: .86rem; color: var(--muted); }
+    .msg.ok { color: var(--accent); }
+    .msg.err { color: #ff8e86; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+    @media (max-width: 560px) { .grid-2 { grid-template-columns: 1fr; } }
+    .actions-bar {
+      margin-top: 1.25rem; padding-top: .25rem;
+      display: flex; gap: .6rem; flex-wrap: wrap; align-items: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="header-top">
+        <div>
+          <p class="brand">Quark Auto Download</p>
+          <h1>设置</h1>
+        </div>
+        <a class="btn-ghost" href="/">返回任务</a>
+      </div>
+      <p class="sub">配置 Quark / OpenList / Aria2。敏感字段以掩码显示，未修改则保留原值。</p>
+    </header>
+
+    <section class="panel" aria-labelledby="cfg-quark">
+      <div class="panel-head">
+        <h2 id="cfg-quark">Quark</h2>
+        <p class="panel-desc">网盘 Cookie、转存目录与文件过滤</p>
+      </div>
+      <label for="quark_cookie">Cookie（掩码不改）</label>
+      <textarea id="quark_cookie" rows="2"></textarea>
+      <label for="save_to_dir">转存目录 save_to_dir</label>
+      <input id="save_to_dir" />
+      <label for="file_name_regex">文件过滤正则</label>
+      <input id="file_name_regex" />
+    </section>
+
+    <section class="panel" aria-labelledby="cfg-openlist">
+      <div class="panel-head">
+        <h2 id="cfg-openlist">OpenList</h2>
+        <p class="panel-desc">挂载服务 Host / Token / 路径</p>
+      </div>
+      <label for="openlist_host">Host</label>
+      <input id="openlist_host" />
+      <label for="openlist_token">Token</label>
+      <input id="openlist_token" />
+      <label for="openlist_quark_path">quark 挂载路径</label>
+      <input id="openlist_quark_path" />
+    </section>
+
+    <section class="panel" aria-labelledby="cfg-aria2">
+      <div class="panel-head">
+        <h2 id="cfg-aria2">Aria2</h2>
+        <p class="panel-desc">RPC、下载目录与排队阈值</p>
+      </div>
+      <label for="aria2_host">RPC Host</label>
+      <input id="aria2_host" />
+      <label for="aria2_secret">Secret</label>
+      <input id="aria2_secret" />
+      <label for="aria2_download_dir">下载临时目录</label>
+      <input id="aria2_download_dir" />
+      <label for="download_destination_dir">完成后目录</label>
+      <input id="download_destination_dir" />
+      <div class="grid-2">
+        <div>
+          <label for="aria2_queue_pause_threshold">排队暂停阈值</label>
+          <input id="aria2_queue_pause_threshold" type="number" />
+        </div>
+        <div>
+          <label for="aria2_queue_resume_threshold">排队恢复阈值</label>
+          <input id="aria2_queue_resume_threshold" type="number" />
+        </div>
+      </div>
+    </section>
+
+    <div class="actions-bar">
+      <button class="btn-primary" id="btn-save-config" type="button">保存配置</button>
+      <button class="btn-restart" id="btn-restart" type="button">重启服务</button>
+      <a class="btn-ghost" href="/">返回任务</a>
+    </div>
+    <div class="msg" id="cfg-msg"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail || res.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return data;
+    }
+
+    function setMsg(el, text, kind = "") {
+      el.textContent = text || "";
+      el.className = "msg" + (kind ? " " + kind : "");
+    }
+
+    function fillConfig(cfg) {
+      const q = cfg.quark || {}, o = cfg.openlist || {}, a = cfg.aria2 || {};
+      $("quark_cookie").value = q.quark_cookie || "";
+      $("save_to_dir").value = q.save_to_dir || "";
+      $("file_name_regex").value = q.file_name_regex || "";
+      $("openlist_host").value = o.openlist_host || "";
+      $("openlist_token").value = o.openlist_token || "";
+      $("openlist_quark_path").value = o.openlist_quark_path || "";
+      $("aria2_host").value = a.aria2_host || "";
+      $("aria2_secret").value = a.aria2_secret || "";
+      $("aria2_download_dir").value = a.aria2_download_dir || "";
+      $("download_destination_dir").value = a.download_destination_dir || "";
+      $("aria2_queue_pause_threshold").value = a.aria2_queue_pause_threshold ?? 700;
+      $("aria2_queue_resume_threshold").value = a.aria2_queue_resume_threshold ?? 500;
+    }
+
+    $("btn-save-config").onclick = async () => {
+      try {
+        await api("/api/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            quark: {
+              quark_cookie: $("quark_cookie").value,
+              save_to_dir: $("save_to_dir").value,
+              file_name_regex: $("file_name_regex").value,
+            },
+            openlist: {
+              openlist_host: $("openlist_host").value.trim(),
+              openlist_token: $("openlist_token").value,
+              openlist_quark_path: $("openlist_quark_path").value.trim(),
+            },
+            aria2: {
+              aria2_host: $("aria2_host").value.trim(),
+              aria2_secret: $("aria2_secret").value,
+              aria2_download_dir: $("aria2_download_dir").value,
+              download_destination_dir: $("download_destination_dir").value,
+              aria2_queue_pause_threshold: Number($("aria2_queue_pause_threshold").value || 700),
+              aria2_queue_resume_threshold: Number($("aria2_queue_resume_threshold").value || 500),
+            },
+          }),
+        });
+        setMsg($("cfg-msg"), "配置已保存", "ok");
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    };
+
+    $("btn-restart").onclick = async () => {
+      if (!confirm("确认重启 Web 服务？页面将短暂不可用，请稍后刷新。")) return;
+      const btn = $("btn-restart");
+      btn.disabled = true;
+      try {
+        await api("/api/web/restart", { method: "POST", body: "{}" });
+        setMsg($("cfg-msg"), "正在重启…请稍后刷新", "ok");
+      } catch (e) {
+        btn.disabled = false;
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    };
+
+    (async () => {
+      try {
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    })();
+  </script>
+</body>
+</html>

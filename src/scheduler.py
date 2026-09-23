@@ -268,6 +268,32 @@ class PipelineScheduler:
                 stored.state = "cleanup"
                 stored.note = "清理未确认成功"
 
+    def apply_transfer_success(
+        self,
+        transferred: list[dict],
+        preexisting_paths: set[str],
+    ) -> int:
+        """将已成功转存的 transferring 任务推进为 ready（不碰其余仍在转存中的任务）。"""
+        if not transferred:
+            return 0
+        transferred_map = {self.file_api.file_path(item): item for item in transferred}
+        advanced = 0
+        for job in list(self.jobs_in("transferring")):
+            item = transferred_map.get(job.path)
+            if item is None:
+                continue
+            job.state = "ready"
+            job.already_transferred = True
+            job.file_item = item
+            job.transfer_fail_count = 0
+            job.note = (
+                "已转存，待偏好序下载"
+                if job.path in preexisting_paths
+                else "转存完成，待下载"
+            )
+            advanced += 1
+        return advanced
+
     def apply_transfer_result(
         self,
         transferred: list[dict],
@@ -276,25 +302,13 @@ class PipelineScheduler:
         max_transfer_failures: int,
         failure_errors: dict[str, str] | None = None,
     ) -> None:
-        transferred_map = {self.file_api.file_path(item): item for item in transferred}
+        """收尾：成功→ready；明确失败按规则出局/旁路；其余仍 transferring 的视为未完成旁路。"""
+        self.apply_transfer_success(transferred, preexisting_paths)
         failed_paths = {self.file_api.file_path(item) for item in failed}
         failure_errors = failure_errors or {}
         max_transfer_failures = max(max_transfer_failures, 1)
 
         for job in list(self.jobs_in("transferring")):
-            item = transferred_map.get(job.path)
-            if item is not None:
-                job.state = "ready"
-                job.already_transferred = True
-                job.file_item = item
-                job.transfer_fail_count = 0
-                job.note = (
-                    "已转存，待偏好序下载"
-                    if job.path in preexisting_paths
-                    else "转存完成，待下载"
-                )
-                continue
-
             if job.path not in failed_paths:
                 job.state = "transfer_retry"
                 job.note = "转存未完成，进入转存重试旁路"

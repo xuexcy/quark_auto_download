@@ -200,9 +200,11 @@ class DownloadPipeline:
             main_n = len(self.scheduler.plan_main_download_candidates())
             retry_n = len(self.scheduler.plan_retry_download_candidates())
             transfer_retry_n = counts.get("transfer_retry", 0)
+            transferring_n = counts.get("transferring", 0)
         pause_flag = "暂停中" if self._aria2_ingest_paused else "正常"
         self.log.info(
-            f"  [{worker}] pending={counts['pending']} transfer_retry={transfer_retry_n} "
+            f"  [{worker}] pending={counts['pending']} transferring={transferring_n} "
+            f"transfer_retry={transfer_retry_n} "
             f"ready={counts['ready']} retry={counts['retry']} downloading={counts['downloading']} "
             f"cleanup={counts['cleanup']} done={counts['done']} failed={counts['failed']} "
             f"| 主下载={main_n} 下载重试={retry_n} | Aria2排队={self._last_aria2_waiting}({pause_flag})"
@@ -337,14 +339,25 @@ class DownloadPipeline:
     def _execute_transfer(self, jobs: list[Job], available_size: int) -> None:
         preexisting_paths = {job.path for job in jobs if job.already_transferred}
         self.log.info(f"  [调度→转存Worker] 本批 {len(jobs)} 个文件")
+
+        def _on_group_transferred(group_items: list[dict]) -> None:
+            # 每组转存成功即写回 ready，下载 Worker 可与后续目录转存并行
+            with self.lock:
+                advanced = self.scheduler.apply_transfer_success(group_items, preexisting_paths)
+            if advanced:
+                self.log.info(f"  [调度] 本组转存已推进 ready +{advanced}")
+                self._persist_state()
+
         transferred, failed, failure_errors = self.file_api.transfer_file_batch(
             [job.file_item for job in jobs],
             self.share_id,
             self.stoken,
             available_size,
+            on_group_transferred=_on_group_transferred,
         )
         max_failures = max(self.file_api.download_submit_max_retries, 1)
         with self.lock:
+            # 收尾：处理失败/未完成；成功项可能已在回调中变 ready（幂等）
             self.scheduler.apply_transfer_result(
                 transferred,
                 failed,

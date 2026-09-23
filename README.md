@@ -21,7 +21,7 @@ code/
 ├── bin/           # Web 服务脚本：start.sh / stop.sh / restart.sh
 ├── bin_bak/       # 旧版非 Web CLI 脚本备份（run/stop/restart/web）
 ├── src/           # 业务代码（quark_main / pipeline / web_app / jobs_manager / log_util …）
-├── web/static/    # 前端页面
+├── web/static/    # 前端：index.html（任务）/ settings.html（配置）
 ├── conf/          # Cookie / OpenList / Aria2 等全局配置
 ├── state/
 │   ├── web.pid
@@ -72,13 +72,18 @@ QUARK_AUTO_DL_WEB_HOST=0.0.0.0 QUARK_AUTO_DL_WEB_PORT=8787 ./bin/start.sh
 
 ### 页面操作
 
-1. **新增**：填写分享链接（可填提取码）→ 新增（默认**暂停**）
-2. **开始**：启动该链接的下载进程；会接续本地已完成 / Aria2 进行中或已暂停任务
-3. **暂停**
+主页 `/` 为 **左侧任务栏 + 右侧详情**；全局配置在 **设置** 页 `/settings`（侧栏底部入口）。
+
+1. **新增**：侧栏右上角 **+** 弹出简表单，填写分享链接（可填提取码）→ 新增（默认**暂停**）
+2. **选择任务**：点击侧栏中的任务，右侧显示详情（开始 / 暂停 / 删除 / 日志与统计）
+3. **开始**：启动该链接的下载进程；会接续本地已完成 / Aria2 进行中或已暂停任务
+4. **暂停**
    - **软暂停**：删排队；下载中继续，跟踪完成后再停进程
    - **硬暂停**：暂停下载中 + 排队，立即停进程
-4. **高级配置**：Cookie / OpenList / Aria2
-5. **日志**：展开任务可查看该次运行的下载日志（路径保存在任务的 `log_path`）
+5. **统计**：详情页展示文件总数、总计大小、已下载文件数、当前已有大小（本次下载完成 + 启动时本地已存在跳过）
+6. **分享链接**：详情中的链接可点击在新标签打开；列表定时刷新为原地更新，不整页闪烁
+7. **日志**：展开详情中的日志区可查看该次运行下载日志
+8. **设置**：配置 Quark Cookie / OpenList / Aria2；页底「重启服务」会调用 `POST /api/web/restart` 调度 `bin/restart.sh`（仅内网自用）
 
 ### 旧版 CLI
 

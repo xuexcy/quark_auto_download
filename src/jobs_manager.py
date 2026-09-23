@@ -199,6 +199,58 @@ def delete_job(job_id: str, *, force_stop: bool = True) -> None:
     save_jobs_index(jobs)
 
 
+def _job_file_stats(state: dict) -> dict[str, int]:
+    """从 pipeline_state.files 汇总体积与完成数。
+
+    - total_files / total_size: 分享内全部文件
+    - done_files: 本地已有（state 为 done 或 cleanup；cleanup 表示已落盘待清网盘）
+    - existing_or_done_size: 上述「本地已有」文件的 size 之和
+      （含本次下载完成 + 启动时本地已存在跳过 + Aria2 已完成接管）
+    """
+    files = state.get("files")
+    if not isinstance(files, list):
+        files = []
+
+    total_files = 0
+    total_size = 0
+    done_files = 0
+    existing_or_done_size = 0
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        total_files += 1
+        size = max(int(item.get("size") or 0), 0)
+        total_size += size
+        st = str(item.get("state") or "").strip()
+        if st in ("done", "cleanup"):
+            done_files += 1
+            existing_or_done_size += size
+
+    if total_files == 0:
+        # 尚未写出 files 时，用 counts 凑总数 / 已完成数（体积仍为 0）
+        counts = state.get("counts") if isinstance(state.get("counts"), dict) else {}
+        known = (
+            "pending",
+            "transfer_retry",
+            "transferring",
+            "ready",
+            "retry",
+            "downloading",
+            "cleanup",
+            "done",
+            "failed",
+        )
+        total_files = sum(int(counts.get(k) or 0) for k in known)
+        done_files = int(counts.get("done") or 0) + int(counts.get("cleanup") or 0)
+
+    return {
+        "total_files": total_files,
+        "total_size": total_size,
+        "done_files": done_files,
+        "existing_or_done_size": existing_or_done_size,
+    }
+
+
 def refresh_job_runtime(job: dict) -> dict:
     """根据 PID / 控制文件刷新运行态。"""
     job_id = str(job.get("id"))
@@ -218,12 +270,18 @@ def refresh_job_runtime(job: dict) -> dict:
 
     control = _read_yaml(job_control_file(job_id))
     state = _read_yaml(job_state_file(job_id))
+    stats = _job_file_stats(state)
     return {
         **job,
         "pid": pid,
         "running": alive,
         "control": control.get("command") or "none",
         "counts": state.get("counts") or {},
+        "stats": stats,
+        "total_files": stats["total_files"],
+        "total_size": stats["total_size"],
+        "done_files": stats["done_files"],
+        "existing_or_done_size": stats["existing_or_done_size"],
         "pipeline_updated_at": state.get("updated_at"),
         "failed_files": state.get("failed_files") or [],
         "aria2_backpressure": state.get("aria2_backpressure") or {},
