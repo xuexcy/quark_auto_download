@@ -186,6 +186,9 @@ class FileApi:
     def invalidate_available_space_cache(self) -> None:
         self.quark_client.invalidate_available_space_cache()
 
+    def adjust_available_space_cache(self, delta_bytes: int) -> None:
+        self.quark_client.adjust_available_space_cache(delta_bytes)
+
     def move_file_to_destination(self, relative_path: str) -> bool:
         relative_path = normalize_relative_path(relative_path)
         src_path = os.path.join(self.aria2_download_dir, relative_path)

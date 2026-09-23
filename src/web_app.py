@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -40,7 +41,18 @@ def _setup_web_logging() -> None:
 
 _setup_web_logging()
 
-app = FastAPI(title="Quark Auto Download", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # 启动时对账：清掉 stop.sh / 进程死后残留的 running 状态，避免页面闪「运行中」
+    try:
+        jm.list_jobs()
+    except Exception:
+        logging.getLogger(__name__).exception("启动时任务状态对账失败")
+    yield
+
+
+app = FastAPI(title="Quark Auto Download", version="2.0.0", lifespan=lifespan)
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -50,12 +62,17 @@ class ConfigUpdateRequest(BaseModel):
 
 
 class JobCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="任务显示名，必填且不可与已有任务重复")
     share_url: str = Field(..., min_length=1)
     share_pwd: str = ""
 
 
 class JobPauseRequest(BaseModel):
     mode: str = Field("soft", description="soft | hard")
+
+
+class JobRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="新任务显示名，trim 后非空且不可与其它任务重复")
 
 
 @app.get("/api/health")
@@ -85,7 +102,16 @@ def api_list_jobs():
 @app.post("/api/jobs")
 def api_create_job(body: JobCreateRequest):
     try:
-        job = jm.add_job(body.share_url, body.share_pwd)
+        job = jm.add_job(body.share_url, body.share_pwd, name=body.name)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"job": jm.refresh_job_runtime(job)}
+
+
+@app.patch("/api/jobs/{job_id}")
+def api_rename_job(job_id: str, body: JobRenameRequest):
+    try:
+        job = jm.rename_job(job_id, body.name)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"job": jm.refresh_job_runtime(job)}

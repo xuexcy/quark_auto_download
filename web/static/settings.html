@@ -72,6 +72,10 @@
       color: #1a1008;
     }
     .btn-restart:disabled { opacity: .55; cursor: wait; }
+    .restart-hint {
+      margin: 0; font-size: .78rem; color: var(--muted); line-height: 1.4;
+      flex: 1 1 12rem;
+    }
     a.btn-ghost, button.btn-ghost {
       display: inline-flex; align-items: center; text-decoration: none;
       background: transparent; color: var(--text); border: 1px solid var(--line);
@@ -156,6 +160,7 @@
       <button class="btn-primary" id="btn-save-config" type="button">保存配置</button>
       <button class="btn-restart" id="btn-restart" type="button">重启服务</button>
       <a class="btn-ghost" href="/">返回任务</a>
+      <p class="restart-hint">重启将停止 Web 及所有下载任务</p>
     </div>
     <div class="msg" id="cfg-msg"></div>
   </div>
@@ -230,7 +235,7 @@
     };
 
     $("btn-restart").onclick = async () => {
-      if (!confirm("确认重启 Web 服务？页面将短暂不可用，请稍后刷新。")) return;
+      if (!confirm("确认重启 Web 服务？将停止 Web 及所有下载任务，页面将短暂不可用，请稍后刷新。")) return;
       const btn = $("btn-restart");
       btn.disabled = true;
       try {

@@ -293,13 +293,17 @@ class DownloadPipeline:
 
     def _cloud_worker_tick(self) -> None:
         self._apply_user_control()
-        # 清理始终执行，不受 Aria2 排队水位 / 软暂停影响
+        # 清理始终执行，不受 Aria2 排队水位 / 软暂停影响。
+        # 清理后同 tick 继续转存：下载高峰时几乎每轮都有 cleanup，若此处 return
+        # 会饿死 pending（再叠加全盘容量扫描 ~2min，扫描结束又被新 cleanup 抢走）。
         with self.lock:
             plan = self.scheduler.plan_cleanup()
             jobs = list(plan.jobs) if plan.kind == "cleanup" else []
         if plan.kind == "cleanup":
             self._execute_cleanup(jobs)
-            return
+            with self.lock:
+                if self.scheduler.jobs_in("cleanup"):
+                    return
 
         if self._user_ingest_blocked():
             return
@@ -312,8 +316,10 @@ class DownloadPipeline:
             confirm_plan = self.scheduler.plan_confirm_already_transferred()
         if confirm_plan.kind == "cleanup":
             self._execute_cleanup(list(confirm_plan.jobs))
-            return
-        if confirm_plan.kind == "transfer":
+            with self.lock:
+                if self.scheduler.jobs_in("cleanup"):
+                    return
+        elif confirm_plan.kind == "transfer":
             self._execute_transfer(confirm_plan.jobs, confirm_plan.available_size)
             return
 
@@ -323,9 +329,21 @@ class DownloadPipeline:
             if plan.kind == "idle":
                 plan = self.scheduler.plan_transfer(available, source="transfer_retry")
 
+        # 容量扫描期间下载完成会涌入 cleanup：先清再复用刚算/刚修正的容量，勿丢弃重扫
         if plan.kind == "cleanup":
             self._execute_cleanup(list(plan.jobs))
-            return
+            with self.lock:
+                if self.scheduler.jobs_in("cleanup"):
+                    return
+            available = self.file_api.get_available_space()
+            with self.lock:
+                plan = self.scheduler.plan_transfer(available, source="pending")
+                if plan.kind == "idle":
+                    plan = self.scheduler.plan_transfer(available, source="transfer_retry")
+            if plan.kind == "cleanup":
+                self._execute_cleanup(list(plan.jobs))
+                return
+
         if plan.kind == "wait_capacity":
             self.log.info(
                 f"  [调度] 容量不足，等待腾出空间: {plan.blocked_path} "
@@ -340,6 +358,7 @@ class DownloadPipeline:
     def _execute_cleanup(self, jobs: list[Job]) -> None:
         self.log.info(f"  [调度→清理Worker] 批量清理 {len(jobs)} 个文件")
         tasks = [job.cleanup_payload(self.file_api) for job in jobs]
+        size_by_path = {task["file_name"]: int(task.get("size") or 0) for task in tasks}
         deleted_names, failed_tasks = self.file_api.cleanup_files_batch(tasks, "已删除 Quark 转存文件")
         failed_paths = {task["file_name"] for task in failed_tasks}
         with self.lock:
@@ -348,7 +367,9 @@ class DownloadPipeline:
             if failed_jobs:
                 self.log.warning("  [调度] 存在清理未确认成功的文件，暂停转存")
         if deleted_names:
-            self.file_api.invalidate_available_space_cache()
+            freed = sum(size_by_path.get(path, 0) for path in deleted_names)
+            # 增量回补可用容量；无缓存时 no-op，下次 get_available_space 再全盘算
+            self.file_api.adjust_available_space_cache(freed)
             # 只清理刚删文件对应的空父目录，避免每轮全盘扫描
             self.file_api.cleanup_empty_dirs(deleted_names)
 
@@ -373,9 +394,14 @@ class DownloadPipeline:
             available_size,
             on_group_transferred=_on_group_transferred,
         )
-        # 仅真实转存会改变占用；全是已转存跳过则不必清缓存
-        if any(job.path not in preexisting_paths for job in jobs):
-            self.file_api.invalidate_available_space_cache()
+        # 真实转存占用容量：增量扣减缓存，避免紧接着又全盘列举数分钟
+        transferred_cost = sum(
+            FileApi.transfer_cost(item)
+            for item in transferred
+            if self.file_api.file_path(item) not in preexisting_paths
+        )
+        if transferred_cost:
+            self.file_api.adjust_available_space_cache(-transferred_cost)
         max_failures = max(self.file_api.download_submit_max_retries, 1)
         with self.lock:
             # 收尾：处理失败/未完成；成功项可能已在回调中变 ready（幂等）

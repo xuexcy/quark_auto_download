@@ -153,17 +153,33 @@ def upsert_job(job: dict) -> dict:
     return job
 
 
-def add_job(share_url: str, share_pwd: str = "") -> dict:
+def add_job(share_url: str, share_pwd: str = "", name: str = "") -> dict:
     share_url = str(share_url or "").strip()
+    name = str(name or "").strip()
     if not share_url:
         raise ValueError("分享链接不能为空")
+    if not name:
+        raise ValueError("任务名不能为空")
     if not re.search(r"pan\.quark\.cn/s/", share_url):
         # 宽松校验，仍允许
         pass
-    # 同一链接复用已有任务
-    for existing in load_jobs_index():
+
+    jobs = load_jobs_index()
+    for existing in jobs:
+        if str(existing.get("name") or "").strip() == name:
+            # 同一链接且同名：更新提取码后复用；否则视为重名冲突
+            if str(existing.get("share_url", "")).strip() == share_url:
+                existing["share_pwd"] = str(share_pwd or "")
+                existing["name"] = name
+                existing["updated_at"] = _now()
+                return upsert_job(existing)
+            raise ValueError(f"任务名已存在: {name}")
+
+    # 同一链接复用已有任务（需带上新任务名，且新名不得与其它任务冲突）
+    for existing in jobs:
         if str(existing.get("share_url", "")).strip() == share_url:
             existing["share_pwd"] = str(share_pwd or "")
+            existing["name"] = name
             existing["updated_at"] = _now()
             return upsert_job(existing)
 
@@ -175,6 +191,7 @@ def add_job(share_url: str, share_pwd: str = "") -> dict:
     os.makedirs(job_dir(job_id), exist_ok=True)
     job = {
         "id": job_id,
+        "name": name,
         "share_url": share_url,
         "share_pwd": str(share_pwd or ""),
         "status": "paused",  # paused | running | soft_pausing
@@ -183,6 +200,27 @@ def add_job(share_url: str, share_pwd: str = "") -> dict:
         "message": "默认暂停",
     }
     _atomic_yaml_write(job_control_file(job_id), {"command": "none", "updated_at": _now()})
+    return upsert_job(job)
+
+
+def rename_job(job_id: str, name: str) -> dict:
+    """修改任务显示名：trim、非空、与其它任务不重名，并写回 jobs.yaml。"""
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("任务名不能为空")
+    job = get_job(job_id)
+    if not job:
+        raise ValueError(f"任务不存在: {job_id}")
+    current = str(job.get("name") or "").strip()
+    if name == current:
+        return job
+    for existing in load_jobs_index():
+        if existing.get("id") == job_id:
+            continue
+        if str(existing.get("name") or "").strip() == name:
+            raise ValueError(f"任务名已存在: {name}")
+    job["name"] = name
+    job["updated_at"] = _now()
     return upsert_job(job)
 
 
@@ -272,7 +310,11 @@ def _job_file_stats(state: dict) -> dict:
 
 
 def refresh_job_runtime(job: dict) -> dict:
-    """根据 PID / 控制文件刷新运行态。"""
+    """根据 PID / 控制文件刷新运行态。
+
+    以进程是否存活为准：无 pid 或 pid 已死时不得视为运行中，
+    并将 jobs.yaml 中过期的 running/soft_pausing 写回 paused。
+    """
     job_id = str(job.get("id"))
     pid = _read_pid(job_pid_file(job_id))
     alive = bool(pid and _pid_alive(pid))
@@ -282,11 +324,14 @@ def refresh_job_runtime(job: dict) -> dict:
         except OSError:
             pass
         pid = None
-        if job.get("status") in ("running", "soft_pausing"):
-            job["status"] = "paused"
-            job["message"] = "进程已退出"
-            job["updated_at"] = _now()
-            upsert_job(job)
+
+    # 无 pid / 进程已死：不得继续显示运行中（含 stop.sh 杀进程后 pid 文件已删）
+    if not alive and job.get("status") in ("running", "soft_pausing"):
+        prev = job.get("status")
+        job["status"] = "paused"
+        job["message"] = "软暂停完成" if prev == "soft_pausing" else "进程已退出"
+        job["updated_at"] = _now()
+        upsert_job(job)
 
     control = _read_yaml(job_control_file(job_id))
     state = _read_yaml(job_state_file(job_id))
@@ -313,6 +358,11 @@ def refresh_job_runtime(job: dict) -> dict:
 
 def list_jobs() -> list[dict]:
     return [refresh_job_runtime(dict(j)) for j in load_jobs_index()]
+
+
+def reconcile_all_jobs() -> list[dict]:
+    """启动时对账：按进程存活情况纠正过期 running 状态。"""
+    return list_jobs()
 
 
 def write_control(job_id: str, command: str) -> None:
@@ -369,7 +419,7 @@ def start_job(job_id: str) -> dict:
         f.write(str(proc.pid))
 
     job["status"] = "running"
-    job["message"] = f"已启动 PID={proc.pid}"
+    job["message"] = "运行中"
     job["updated_at"] = _now()
     upsert_job(job)
     return refresh_job_runtime(job)

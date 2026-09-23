@@ -58,10 +58,13 @@ cp conf/example/aria2.example.yaml conf/aria2.yaml
 ### 启动 / 停止 Web（NAS 局域网）
 
 ```bash
-./bin/start.sh      # 后台启动；终端只打印 PID/LOG，运行日志不刷屏
-./bin/stop.sh
-./bin/restart.sh
+./bin/start.sh      # 仅后台启动 Web；终端只打印 PID/LOG，运行日志不刷屏
+./bin/stop.sh       # 停止 Web **以及所有分享任务** 的 quark_main 子进程，并清理 pid 文件
+./bin/restart.sh    # 等价于 stop.sh + start.sh
 ```
+
+- **`stop.sh`**：按 `state/web.pid` 与 `state/jobs/*/job.pid` 精确杀进程，再用 `pkill` 兜底；会停掉所有下载任务。
+- **`start.sh` / `restart.sh` 后**：只拉起 Web，**不会**自动恢复各分享任务；需在页面上重新点「开始」。
 
 浏览器：`http://<NAS局域网IP>:8787/`
 
@@ -84,7 +87,7 @@ QUARK_AUTO_DL_WEB_HOST=0.0.0.0 QUARK_AUTO_DL_WEB_PORT=8787 ./bin/start.sh
 5. **统计**：详情页展示文件总数、总计大小、已下载文件数、当前已有大小（本次下载完成 + 启动时本地已存在跳过）
 6. **分享链接**：详情中的链接可点击在新标签打开；列表定时刷新为原地更新，不整页闪烁
 7. **日志**：展开详情中的日志区可查看该次运行下载日志
-8. **设置**：配置 Quark Cookie / OpenList / Aria2；页底「重启服务」会调用 `POST /api/web/restart` 调度 `bin/restart.sh`（仅内网自用）
+8. **设置**：配置 Quark Cookie / OpenList / Aria2（保存后即时生效；服务启停请用 `bin/stop.sh` / `start.sh` / `restart.sh`）
 
 ### 调试任务子进程（可选）
 

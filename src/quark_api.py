@@ -44,9 +44,10 @@ class QuarkClient:
             "Referer": "https://pan.quark.cn/",
             "Content-Type": "application/json",
         }
-        # get_available_space 需全盘递归，缓存避免每轮 poll 卡数分钟
+        # get_available_space 需全盘递归（常 >2min），缓存避免每轮 poll 卡死；
+        # 清理/转存用 adjust 增量修正，TTL 需覆盖数轮 poll + 一次慢扫描窗口
         self._available_space_cache: tuple[float, int] | None = None
-        self._available_space_cache_ttl = 45.0
+        self._available_space_cache_ttl = 180.0
 
     def quark_get(self, url: str, params: dict = None) -> dict:
         import time
@@ -131,6 +132,16 @@ class QuarkClient:
     def invalidate_available_space_cache(self) -> None:
         """转存/清理后容量变化，丢弃缓存。"""
         self._available_space_cache = None
+
+    def adjust_available_space_cache(self, delta_bytes: int) -> None:
+        """按已知增减增量更新缓存（清理释放 / 转存占用），避免再次全盘列举。"""
+        cached = self._available_space_cache
+        if cached is None:
+            return
+        _cached_at, cached_size = cached
+        new_size = max(0, int(cached_size) + int(delta_bytes))
+        # 刷新时间戳，让刚修正过的容量在 TTL 内可复用
+        self._available_space_cache = (time.monotonic(), new_size)
 
     def get_available_space(self) -> int:
         """获取网盘可用空间（字节）。通过计算所有文件占用容量得到。
