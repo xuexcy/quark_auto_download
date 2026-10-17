@@ -254,6 +254,8 @@ class DownloadPipeline:
         if self._user_pause_mode is None:
             self.log.info("▶ 最终清理网盘空文件夹")
             self.file_api.cleanup_empty_dirs()
+            self.log.info("▶ 最终清理下载临时目录中的空文件夹")
+            self.file_api.cleanup_empty_download_dirs()
         with self.lock:
             return list(self.scheduler.failed_files)
 

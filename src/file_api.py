@@ -24,6 +24,37 @@ def unescape_html_name(value: str) -> str:
     return text
 
 
+def _is_path_under(path: str, root: str) -> bool:
+    """判断 path 是否位于 root 之下（不含 root 自身）。"""
+    try:
+        abs_path = os.path.abspath(path)
+        abs_root = os.path.abspath(root)
+    except (OSError, ValueError):
+        return False
+    if abs_path == abs_root:
+        return False
+    try:
+        return os.path.commonpath([abs_path, abs_root]) == abs_root
+    except ValueError:
+        return False
+
+
+def prune_empty_local_dirs(root_dir: str) -> list[str]:
+    """自底向上删除 root_dir 下的空文件夹，不删除 root_dir 本身。"""
+    if not root_dir or not os.path.isdir(root_dir):
+        return []
+    deleted: list[str] = []
+    for current, _dirnames, _filenames in os.walk(root_dir, topdown=False):
+        if not _is_path_under(current, root_dir):
+            continue
+        try:
+            os.rmdir(current)
+        except OSError:
+            continue
+        deleted.append(normalize_relative_path(os.path.relpath(current, root_dir)))
+    return deleted
+
+
 def normalize_relative_path(path: str) -> str:
     raw = str(path).replace("\\", "/").strip("/")
     parts = [unescape_html_name(part) for part in raw.split("/") if part not in ("", ".")]
@@ -217,6 +248,32 @@ class FileApi:
         except Exception as e:
             self.log.error(f"  移动下载完成文件失败: {filename} | {e}")
             return False
+
+    def _should_prune_download_dir(self) -> bool:
+        download_dir = str(self.aria2_download_dir or "").rstrip("/")
+        dest_dir = str(self.download_destination_dir or "").rstrip("/")
+        if not download_dir:
+            return False
+        if dest_dir and os.path.abspath(download_dir) == os.path.abspath(dest_dir):
+            return False
+        return True
+
+    def cleanup_empty_download_dirs(self) -> list[str]:
+        """全部任务结束后，清理下载临时目录中残留的空文件夹。"""
+        if not self._should_prune_download_dir():
+            return []
+        try:
+            deleted = prune_empty_local_dirs(self.aria2_download_dir)
+        except Exception as e:
+            self.log.error(f"  清理下载临时空文件夹失败: {e}")
+            return []
+        if deleted:
+            self.log.info(f"  已清理下载临时空文件夹 {len(deleted)} 个")
+            for path in deleted[:20]:
+                self.log.info(f"    - {path}")
+            if len(deleted) > 20:
+                self.log.info(f"    ... 另有 {len(deleted) - 20} 个")
+        return deleted
 
     def build_download_task(self, file_item: dict, gid: str) -> dict:
         relative_path = self.file_path(file_item)
