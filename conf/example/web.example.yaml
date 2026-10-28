@@ -1,0 +1,19 @@
+# Web 服务配置（可选）
+# 不创建本文件时，Web 以「无登录 + 仅允许各数据卷路径」的默认方式启动。
+# 建议至少在不可信网络里设置 web_password。
+
+# HTTP Basic 认证用户名
+web_username: "admin"
+
+# 登录密码：留空 = 不启用登录（任何人都能管理任务）
+# 也可用环境变量覆盖：QUARK_AUTO_DL_WEB_USER / QUARK_AUTO_DL_WEB_PASSWORD
+web_password: ""
+
+# 允许通过「设置」页写入的目录根。
+# aria2_download_dir / download_destination_dir / state_file / verify_report_file
+# 必须落在这些目录下，防止把下载目录改到 ~/.ssh、/etc 一类位置。
+allowed_roots:
+  - "/vol1"
+  - "/vol2"
+  - "/vol3"
+  - "/vol4"

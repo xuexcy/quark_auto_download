@@ -1,6 +1,7 @@
 import html
 import os
 import posixpath
+import shutil
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -92,6 +93,7 @@ class FileApi:
         logger,
         download_submit_max_retries: int = 10,
         download_submit_retry_interval: int = 30,
+        job_id: str = "",
     ):
         self.quark_client = quark_client
         self.openlist_client = openlist_client
@@ -104,7 +106,16 @@ class FileApi:
         self.download_log_interval = download_log_interval
         self.download_submit_max_retries = download_submit_max_retries
         self.download_submit_retry_interval = download_submit_retry_interval
+        # 每个任务独立的下载子目录，避免多任务同名文件互相覆盖/互相认领
+        self.job_id = str(job_id or "").strip()
         self.log = logger
+
+    @property
+    def download_root(self) -> str:
+        """本任务实际的下载目录（临时目录 / <job_id>）。"""
+        if self.job_id:
+            return os.path.join(self.aria2_download_dir, self.job_id)
+        return self.aria2_download_dir
 
     @staticmethod
     def file_path(file_item: dict) -> str:
@@ -222,7 +233,7 @@ class FileApi:
 
     def move_file_to_destination(self, relative_path: str) -> bool:
         relative_path = normalize_relative_path(relative_path)
-        src_path = os.path.join(self.aria2_download_dir, relative_path)
+        src_path = os.path.join(self.download_root, relative_path)
         if not os.path.isfile(src_path):
             return os.path.isfile(os.path.join(self.download_destination_dir, relative_path))
         dst_path = os.path.join(self.download_destination_dir, relative_path)
@@ -234,10 +245,12 @@ class FileApi:
             suffix = time.strftime("%Y%m%d_%H%M%S")
             relative_dir = self.relative_dir(relative_path)
             dst_path = os.path.join(self.download_destination_dir, relative_dir, f"{base}_{suffix}{ext}")
-        os.replace(src_path, dst_path)
+        # 下载临时目录与目标目录可能跨挂载点：os.replace 会抛 EXDEV，shutil.move 自动退化为复制+删除
+        shutil.move(src_path, dst_path)
         return True
 
     def finish_downloaded_file(self, filename: str) -> bool:
+        """移动已下载完成的文件；返回 False 表示文件没有真正落到目标目录。"""
         try:
             moved = self.move_file_to_destination(filename)
             if moved:
@@ -250,7 +263,7 @@ class FileApi:
             return False
 
     def _should_prune_download_dir(self) -> bool:
-        download_dir = str(self.aria2_download_dir or "").rstrip("/")
+        download_dir = str(self.download_root or "").rstrip("/")
         dest_dir = str(self.download_destination_dir or "").rstrip("/")
         if not download_dir:
             return False
@@ -259,11 +272,11 @@ class FileApi:
         return True
 
     def cleanup_empty_download_dirs(self) -> list[str]:
-        """全部任务结束后，清理下载临时目录中残留的空文件夹。"""
+        """全部任务结束后，清理本任务下载临时目录中残留的空文件夹。"""
         if not self._should_prune_download_dir():
             return []
         try:
-            deleted = prune_empty_local_dirs(self.aria2_download_dir)
+            deleted = prune_empty_local_dirs(self.download_root)
         except Exception as e:
             self.log.error(f"  清理下载临时空文件夹失败: {e}")
             return []

@@ -17,6 +17,9 @@ file_name_regex: ""
 # 转存目标目录（夸克网盘中的文件夹名）
 save_to_dir: "alist共享"
 
+# 网盘总容量（GB）：仅用于估算剩余空间。请按账号实际容量填写（默认 10）
+total_space_gb: 10
+
 # 请求超时（秒）
 request_timeout: 10
 

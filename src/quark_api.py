@@ -29,10 +29,13 @@ class QuarkClient:
         logger,
         task_poll_interval: int = 3,
         task_timeout: int = 180,
+        total_space_bytes: int | None = None,
     ):
         self.request_timeout = request_timeout
         self.task_poll_interval = task_poll_interval
         self.task_timeout = task_timeout
+        # 网盘总容量：由配置传入（默认 10GB），用于估算剩余可用空间
+        self.total_space_bytes = int(total_space_bytes or 10 * 1024 * 1024 * 1024)
         self.save_to_dir = str(save_to_dir or "").replace("\\", "/").strip("/")
         self.save_to_fid = ""
         self.share_url = share_url
@@ -161,8 +164,7 @@ class QuarkClient:
             started = time.monotonic()
             all_files = self.list_my_files_recursive("0")
             used_size = sum(self._to_int(file.get("size", 0)) for file in all_files)
-            # 总容量10G
-            total_size = 10 * 1024 * 1024 * 1024
+            total_size = max(int(self.total_space_bytes), 0)
             available_size = total_size - used_size
             if available_size < 0:
                 available_size = 0

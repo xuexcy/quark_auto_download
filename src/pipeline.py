@@ -18,6 +18,11 @@ from scheduler import Job, PipelineScheduler
 
 
 class DownloadPipeline:
+    # 连续查询 aria2 状态失败的上限：超过即认为任务已丢失（不能无限等）
+    STATUS_FAIL_LIMIT = 5
+    # 同一文件自动 unpause 的次数上限，避免与外部暂停互相拉扯
+    UNPAUSE_LIMIT = 10
+
     def __init__(
         self,
         file_api: FileApi,
@@ -538,33 +543,116 @@ class DownloadPipeline:
                     break
 
     def _download_poll_tick(self) -> None:
+        # 硬暂停 / 已停止时不要再轮询：否则会把刚被 pause 掉的任务重新 unpause 回来，
+        # 变成「页面显示已暂停，aria2 还在继续下载」。
+        if self._stop.is_set() or self._user_pause_mode == "hard":
+            return
         with self.lock:
             jobs = self.scheduler.jobs_in("downloading")
         for job in jobs:
+            if self._stop.is_set():
+                break
             self._poll_one_download(job)
+
+    def _download_timeout(self) -> int:
+        try:
+            return max(int(self.file_api.aria2_client.download_timeout or 0), 0)
+        except (TypeError, ValueError):
+            return 0
 
     def _poll_one_download(self, job: Job) -> None:
         task = job.download_task or {}
         gid = job.gid or str(task.get("gid", "")).strip()
         if not gid:
             return
+        if self._stop.is_set() or self._user_pause_mode == "hard":
+            return
         try:
             status = self.file_api.aria2_client.aria2_get_status(gid)
         except Exception as e:
-            self.log.error(f"  查询下载状态失败: {job.path} | {e}")
+            fails = int(task.get("status_fail_count", 0) or 0) + 1
+            task["status_fail_count"] = fails
+            job.download_task = task
+            self.log.error(
+                f"  查询下载状态失败({fails}/{self.STATUS_FAIL_LIMIT}): {job.path} | {e}"
+            )
+            if fails >= self.STATUS_FAIL_LIMIT:
+                # aria2 重启 / 任务被清空后 gid 会失联：不能无限等，也不能删云端副本
+                with self.lock:
+                    self.scheduler.apply_download_to_cleanup(
+                        job,
+                        failed=True,
+                        keep_cloud=True,
+                        note=(
+                            f"Aria2 任务状态连续 {fails} 次查询失败（gid={gid}），"
+                            "任务可能已被移除；已保留网盘副本，可再次开始"
+                        ),
+                    )
             return
+        task["status_fail_count"] = 0
 
         state = status.get("status")
+
+        # 下载超时：download_timeout 内没完成就收手，保留网盘副本供下次续传
+        timeout = self._download_timeout()
+        started_at = float(task.get("start_at") or 0.0)
+        if timeout and started_at and state not in ("complete", "error", "removed"):
+            if time.time() - started_at > timeout:
+                self.log.error(f"  ⏰ 下载超时（>{timeout} 秒）: {job.path} | state={state}")
+                with self.lock:
+                    self.scheduler.apply_download_to_cleanup(
+                        job,
+                        failed=True,
+                        keep_cloud=True,
+                        note=(
+                            f"下载超时（>{timeout} 秒未完成，state={state}）；"
+                            "已保留网盘副本，再次开始可续传"
+                        ),
+                    )
+                return
+
         if state == "complete":
+            moved = self.file_api.finish_downloaded_file(job.path)
+            if not moved:
+                # 关键：没真正落盘就绝不能进 cleanup，否则云端副本会被删掉
+                self.log.error(
+                    f"  ✗ 下载完成但未能移动到目标目录，已保留网盘副本: {job.path}"
+                )
+                with self.lock:
+                    self.scheduler.apply_download_to_cleanup(
+                        job,
+                        failed=True,
+                        keep_cloud=True,
+                        note=(
+                            "下载完成但移动到目标目录失败（未删除网盘副本）；"
+                            "请检查目标目录磁盘空间/权限后再次开始"
+                        ),
+                    )
+                return
             self.log.info(f"  ✓ 下载完成: {job.path}")
-            self.file_api.finish_downloaded_file(job.path)
             with self.lock:
                 self.scheduler.apply_download_to_cleanup(job, failed=False, note="下载完成，待清理")
         elif state == "paused":
-            # 运行中不应长期停留 paused；尝试恢复
+            attempts = int(task.get("unpause_count", 0) or 0) + 1
+            if attempts > self.UNPAUSE_LIMIT:
+                self.log.error(
+                    f"  ✗ 任务反复被暂停，放弃本次下载（已恢复 {attempts - 1} 次）: {job.path}"
+                )
+                with self.lock:
+                    self.scheduler.apply_download_to_cleanup(
+                        job,
+                        failed=True,
+                        keep_cloud=True,
+                        note=f"任务反复被暂停（已自动恢复 {attempts - 1} 次），已保留网盘副本",
+                    )
+                return
+            task["unpause_count"] = attempts
+            job.download_task = task
             try:
                 self.file_api.aria2_client.aria2_unpause(gid)
-                self.log.info(f"  ↻ 检测到 Aria2 暂停，已恢复: {job.path} | gid={gid}")
+                self.log.info(
+                    f"  ↻ 检测到 Aria2 暂停，已恢复（第 {attempts} 次）: {job.path} | gid={gid}"
+                )
             except Exception as e:
                 self.log.warning(f"  恢复 Aria2 暂停任务失败: {job.path} | {e}")
         elif state == "error":
@@ -611,9 +699,14 @@ class DownloadPipeline:
                         ),
                     )
         elif state == "removed":
-            self.log.warning(f"  ✗ 下载任务已被移除，转入待清理: {job.path}")
+            self.log.warning(f"  ✗ 下载任务已被移除，已保留网盘副本: {job.path}")
             with self.lock:
-                self.scheduler.apply_download_to_cleanup(job, failed=True, note="Aria2任务被移除")
+                self.scheduler.apply_download_to_cleanup(
+                    job,
+                    failed=True,
+                    keep_cloud=True,
+                    note="Aria2 任务被移除（网盘副本保留，再次开始会重新提交）",
+                )
         elif state in ACTIVE_ARIA2_STATUSES:
             completed = int(status.get("completedLength", 0))
             total = int(status.get("totalLength", 1))

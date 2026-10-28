@@ -45,6 +45,34 @@ def load_config(config_path: str) -> dict:
     return data
 
 
+WEB_CONFIG_ENV = "QUARK_AUTO_DL_WEB_CONFIG"
+# Web 允许配置写入的根目录（防止把下载目录改到 /etc、~/.ssh 等位置）
+DEFAULT_ALLOWED_ROOTS = ("/vol1", "/vol2", "/vol3", "/vol4")
+
+
+def load_web_settings(conf_dir: str = CONF_DIR) -> dict:
+    """读取 conf/web.yaml（Web 认证、允许的目录根）。不存在时返回空字典。"""
+    path = resolve_config_path(WEB_CONFIG_ENV, "web", conf_dir=conf_dir)
+    if not os.path.exists(path):
+        return {}
+    return load_config(path)
+
+
+def allowed_roots(settings: dict | None = None) -> list[str]:
+    """配置写入白名单根目录：conf/web.yaml 的 allowed_roots，缺省为各数据卷。"""
+    settings = settings or {}
+    raw = settings.get("allowed_roots")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raw = DEFAULT_ALLOWED_ROOTS
+    roots: list[str] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        roots.append(os.path.abspath(text))
+    return roots
+
+
 def load_merged_configs(conf_dir: str = CONF_DIR) -> dict:
     """合并 quark / openlist / aria2 配置（测试用）。"""
     config = {}

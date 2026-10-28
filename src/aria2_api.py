@@ -16,16 +16,25 @@ class Aria2Client:
         poll_interval: int,
         download_timeout: int,
         logger,
+        job_id: str = "",
     ):
         self.host = host
         self.secret = secret
-        self.download_dir = download_dir
-        self.request_timeout = request_timeout
+        # 下载根目录；若指定 job_id，则该任务独占 <root>/<job_id>，避免多任务同名文件互相覆盖
+        self._base_download_dir = str(download_dir or "").rstrip("/")
+        self.job_id = str(job_id or "").strip()
         self.openlist_token = openlist_token
+        self.request_timeout = request_timeout
         self.poll_interval = poll_interval
         self.download_timeout = download_timeout
         self.log = logger
         self._id = 0
+
+    @property
+    def download_dir(self) -> str:
+        if self.job_id:
+            return f"{self._base_download_dir}/{self.job_id}" if self._base_download_dir else self.job_id
+        return self._base_download_dir
 
     def _aria2_call(self, method: str, params: list):
         import time
@@ -70,6 +79,7 @@ class Aria2Client:
         return self._aria2_call("aria2.tellStatus", [gid])
 
     def _extract_task_filename(self, task: dict) -> str:
+        """把 aria2 任务的文件绝对路径还原为相对路径；不属于本任务下载目录的返回空串。"""
         if not isinstance(task, dict):
             return ""
         files = task.get("files", [])
@@ -83,7 +93,8 @@ class Aria2Client:
                     return ""
                 if normalized_path.startswith(f"{normalized_download_dir}/"):
                     return normalized_path[len(normalized_download_dir) + 1 :]
-                return normalized_path.split("/")[-1]
+                # 不在本任务下载目录下的任务（例如别的任务/别的下载器）一律忽略，避免同名串味
+                return ""
         bittorrent = task.get("bittorrent", {})
         info = bittorrent.get("info", {}) if isinstance(bittorrent, dict) else {}
         name = str(info.get("name", "")).strip()
@@ -194,20 +205,15 @@ class Aria2Client:
         self._aria2_call("aria2.unpause", [gid])
 
     def aria2_find_task_by_path(self, relative_path: str) -> dict | None:
-        """按相对路径查找 active/waiting/paused 任务，供下载 Worker 三分支（恢复/接管/新建）判断。"""
+        """按相对路径查找本任务下载目录下的 active/waiting/paused 任务。
+
+        只做完整相对路径精确匹配：不同目录下的同名文件（如 cover.jpg）不会被误认领。
+        """
         wanted = self._normalize_relative_path(relative_path)
         if not wanted:
             return None
         infos = self.aria2_get_existing_task_infos_by_name()
-        info = infos.get(wanted)
-        if info:
-            return info
-        # 兼容仅 basename 的情况
-        base = wanted.rsplit("/", 1)[-1]
-        for name, task_info in infos.items():
-            if name == base or name.endswith("/" + base):
-                return task_info
-        return None
+        return infos.get(wanted)
 
     def aria2_list_tasks(self, *, include_stopped: bool = False) -> list[dict]:
         tasks: list[dict] = []

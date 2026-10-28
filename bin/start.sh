@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PYTHON_BIN="$(cd "$PROJECT_ROOT/.." && pwd)/bin/python3"
+PYTHON_BIN="${PROJECT_ROOT}/py_venv/bin/python3"
 HOST="${QUARK_AUTO_DL_WEB_HOST:-0.0.0.0}"
 PORT="${QUARK_AUTO_DL_WEB_PORT:-8787}"
 PID_FILE="${PROJECT_ROOT}/state/web.pid"
@@ -32,11 +32,14 @@ fi
 export PYTHONPATH="${PROJECT_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export QUARK_AUTO_DL_WEB_LOG_FILE="$LOG_FILE"
+# 让 jobs_manager 用同一个 venv 拉起下载任务子进程
+export QUARK_AUTO_DL_PYTHON="$PYTHON_BIN"
 
 {
   echo "===== web start $(date '+%Y-%m-%d %H:%M:%S') ====="
   echo "listen=http://${HOST}:${PORT}/"
   echo "log=${LOG_FILE}"
+  echo "python=${PYTHON_BIN}"
 } >>"$LOG_FILE"
 
 # 标准输出/错误全部进 web 日志，终端不再刷日志

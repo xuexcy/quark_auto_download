@@ -5,3 +5,6 @@ conf/*.yml
 !conf/example/
 log/
 state/
+py_venv/
+conf/*.yaml.bak
+*.tmp

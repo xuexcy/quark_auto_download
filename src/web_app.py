@@ -1,20 +1,31 @@
 # -*- coding: utf-8 -*-
-"""Quark Auto Download Web 服务（多分享链接）。"""
+"""Quark Auto Download Web 服务（多分享链接）。
+
+安全约定：
+- 默认不需要登录；在 conf/web.yaml 配置 web_password（或设置环境变量
+  QUARK_AUTO_DL_WEB_PASSWORD）后，所有接口/页面都要求 HTTP Basic 认证。
+- 非 GET 请求校验 Origin/Referer 与 Host 同源，避免跨站请求触发启停/重启。
+- 不暴露 /docs、/redoc、/openapi.json。
+- /api/jobs 不下发 share_pwd（提取码），只下发 share_pwd_set。
+"""
 
 from __future__ import annotations
 
+import base64
+import hmac
 import logging
 import os
 import subprocess
 from contextlib import asynccontextmanager
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from config_loader import BASE_DIR
+from config_loader import BASE_DIR, load_web_settings
 import jobs_manager as jm
 from log_util import configure_logging, dated_web_log_path
 
@@ -24,6 +35,19 @@ RESTART_SCRIPT = os.path.join(BASE_DIR, "bin", "restart.sh")
 WEB_LOG_PATH = (
     os.getenv("QUARK_AUTO_DL_WEB_LOG_FILE", "").strip() or dated_web_log_path()
 )
+
+WEB_SETTINGS = load_web_settings()
+WEB_USERNAME = (
+    os.getenv("QUARK_AUTO_DL_WEB_USER", "").strip()
+    or str(WEB_SETTINGS.get("web_username") or "").strip()
+    or "admin"
+)
+WEB_PASSWORD = (
+    os.getenv("QUARK_AUTO_DL_WEB_PASSWORD", "").strip()
+    or str(WEB_SETTINGS.get("web_password") or "").strip()
+)
+AUTH_ENABLED = bool(WEB_PASSWORD)
+AUTH_EXEMPT_PATHS = {"/api/health"}
 
 
 def _setup_web_logging() -> None:
@@ -42,17 +66,79 @@ def _setup_web_logging() -> None:
 _setup_web_logging()
 
 
+def _check_basic_auth(request: Request) -> bool:
+    header = request.headers.get("authorization", "")
+    scheme, _, param = header.partition(" ")
+    if scheme.lower() != "basic" or not param:
+        return False
+    try:
+        decoded = base64.b64decode(param).decode("utf-8", "replace")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    username, _, password = decoded.partition(":")
+    return hmac.compare_digest(username, WEB_USERNAME) and hmac.compare_digest(
+        password, WEB_PASSWORD
+    )
+
+
+def _request_is_same_origin(request: Request) -> bool:
+    """浏览器跨站请求一定带 Origin（或 Referer）；非浏览器工具两者都没有。"""
+    host = request.headers.get("host", "").lower()
+    if not host:
+        return True
+    for header_name in ("origin", "referer"):
+        value = request.headers.get(header_name)
+        if not value:
+            continue
+        netloc = urlsplit(value).netloc
+        if not netloc:
+            return False
+        return netloc.lower() == host
+    return True
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    log = logging.getLogger(__name__)
+    if not AUTH_ENABLED:
+        log.warning(
+            "Web 未启用登录（conf/web.yaml 的 web_password 为空 / 环境变量 "
+            "QUARK_AUTO_DL_WEB_PASSWORD 未设置）：任何能访问本端口的人都可以管理下载任务、"
+            "查看/修改 Cookie 等配置。公网或不可信内网请务必设置密码。"
+        )
+    else:
+        log.info("Web 已启用 HTTP Basic 认证，用户名: %s", WEB_USERNAME)
     # 启动时对账：清掉 stop.sh / 进程死后残留的 running 状态，避免页面闪「运行中」
     try:
         jm.list_jobs()
     except Exception:
-        logging.getLogger(__name__).exception("启动时任务状态对账失败")
+        log.exception("启动时任务状态对账失败")
     yield
 
 
-app = FastAPI(title="Quark Auto Download", version="2.0.0", lifespan=lifespan)
+app = FastAPI(
+    title="Quark Auto Download",
+    version="2.1.0",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+
+
+@app.middleware("http")
+async def _security_guard(request: Request, call_next):
+    path = request.url.path
+    if AUTH_ENABLED and path not in AUTH_EXEMPT_PATHS and not _check_basic_auth(request):
+        return Response(
+            content="需要登录",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Quark Auto Download"'},
+            media_type="text/plain; charset=utf-8",
+        )
+    if request.method not in ("GET", "HEAD", "OPTIONS") and not _request_is_same_origin(request):
+        return JSONResponse({"detail": "跨站请求已被拒绝"}, status_code=403)
+    return await call_next(request)
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -160,6 +246,8 @@ def api_job_logs(job_id: str, lines: int = 200):
 
 @app.get("/api/jobs/{job_id}/report")
 def api_job_report(job_id: str):
+    if not jm.get_job(job_id):
+        raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
     path = jm.job_verify_file(job_id)
     data = jm._read_yaml(path) if os.path.isfile(path) else None
     return {"report": data}

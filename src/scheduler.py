@@ -198,10 +198,16 @@ class PipelineScheduler:
     def jobs_in(self, *states: JobState) -> list[Job]:
         return [self.jobs[path] for path in self.ordered_paths if self.jobs[path].state in states]
 
-    def mark_failed(self, job: Job, note: str) -> None:
+    def mark_failed(self, job: Job, note: str, *, keep_cloud: bool = False) -> None:
+        """标记失败。
+
+        keep_cloud=True：保留网盘转存副本（下载超时 / 落盘失败等可重试场景），
+        不进入 cleanup，避免"云端已删、本地也没有"。
+        keep_cloud=False：保持原行为——已转存的失败文件进入 cleanup 释放网盘容量。
+        """
         if job.path not in self.failed_files:
             self.failed_files.append(job.path)
-        if job.already_transferred:
+        if job.already_transferred and not keep_cloud:
             job.state = "cleanup"
             job.note = note
         else:
@@ -433,9 +439,11 @@ class PipelineScheduler:
                 job.download_task = None
                 job.note = note
 
-    def apply_download_to_cleanup(self, job: Job, *, failed: bool, note: str) -> None:
+    def apply_download_to_cleanup(
+        self, job: Job, *, failed: bool, note: str, keep_cloud: bool = False
+    ) -> None:
         if failed:
-            self.mark_failed(job, note=note)
+            self.mark_failed(job, note=note, keep_cloud=keep_cloud)
         else:
             job.state = "cleanup"
             job.note = note

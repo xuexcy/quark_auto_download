@@ -70,9 +70,16 @@ if [ -d "$JOBS_DIR" ]; then
 fi
 
 echo "=== 兜底清理残留进程 ==="
-# 先尽量精确 PID，再按命令行兜底（无匹配时 pkill 非 0，忽略）
-pkill -f 'uvicorn web_app:app' 2>/dev/null || true
-pkill -f 'quark_main.py' 2>/dev/null || true
+# 只杀命令行里带本项目绝对路径的进程：不再用宽泛的 pkill -f，避免误杀
+# 其它部署实例、编辑器（vim/tail）或同机其他用户的同名脚本。
+for pid in $(ps -eo pid=,args= 2>/dev/null | awk -v root="$PROJECT_ROOT" '
+  index($0, root) && (index($0, "uvicorn web_app:app") || index($0, "src/quark_main.py")) { print $1 }
+'); do
+  case "$pid" in
+    "$$"|"") continue ;;
+  esac
+  kill -TERM "$pid" 2>/dev/null || true
+done
 
 # 再扫一遍，清理可能残留的空/过期 pid 文件
 rm -f "$WEB_PID_FILE"

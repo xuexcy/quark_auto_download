@@ -6,7 +6,8 @@ aria2_host: "http://127.0.0.1:6800/jsonrpc"
 # Aria2 RPC Secret（未设置则留空）
 aria2_secret: ""
 
-# Aria2 下载临时目录
+# Aria2 下载临时目录（实际落盘为 <aria2_download_dir>/<job_id>/<相对路径>，
+# 每个任务独占子目录，避免多任务同名文件互相覆盖）
 aria2_download_dir: "/downloads"
 
 # 下载完成后移动到的目标目录
@@ -15,7 +16,7 @@ download_destination_dir: "/downloads_done"
 # 主循环轮询间隔（秒）
 poll_interval: 60
 
-# 单个文件下载超时（秒）
+# 单个文件下载超时（秒）：超时后放弃该文件但保留网盘副本，日志会提示
 download_timeout: 7200
 
 # 请求超时（秒）

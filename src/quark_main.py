@@ -122,6 +122,8 @@ VERIFY_REPORT_FILE = str(
 QUARK_REQUEST_TIMEOUT = int(QUARK_CONFIG.get("request_timeout", 10))
 QUARK_TASK_POLL_INTERVAL = int(QUARK_CONFIG.get("task_poll_interval", 3))
 QUARK_TASK_TIMEOUT = int(QUARK_CONFIG.get("task_timeout", 180))
+# 网盘总容量（GB）：用于估算剩余空间。按实际账号容量配置，之前是硬编码 10GB。
+QUARK_TOTAL_SPACE_GB = float(QUARK_CONFIG.get("total_space_gb", 10))
 FILE_NAME_PATTERN = None
 if FILE_NAME_REGEX:
     try:
@@ -154,6 +156,7 @@ def init_clients():
         logger=log,
         task_poll_interval=QUARK_TASK_POLL_INTERVAL,
         task_timeout=QUARK_TASK_TIMEOUT,
+        total_space_bytes=int(QUARK_TOTAL_SPACE_GB * 1024 * 1024 * 1024),
     )
     quark_client.resolve_save_to_dir()
     openlist_client = OpenListClient(
@@ -170,6 +173,7 @@ def init_clients():
         poll_interval=POLL_INTERVAL,
         download_timeout=DOWNLOAD_TIMEOUT,
         logger=log,
+        job_id=JOB_ID,
     )
     return quark_client, openlist_client, aria2_client
 
@@ -222,6 +226,7 @@ def main():
         logger=log,
         download_submit_max_retries=DOWNLOAD_SUBMIT_MAX_RETRIES,
         download_submit_retry_interval=DOWNLOAD_SUBMIT_RETRY_INTERVAL,
+        job_id=JOB_ID,
     )
 
     log.info("═" * 60)
@@ -231,8 +236,9 @@ def main():
     log.info("═" * 60)
     log.info(f"本次日志文件: {LOG_PATH}")
     log.info(f"分享链接: {SHARE_URL}")
-    log.info(f"下载临时目录: {ARIA2_DOWNLOAD_DIR}")
+    log.info(f"下载临时目录: {file_api.download_root}")
     log.info(f"下载完成目录: {DOWNLOAD_DESTINATION_DIR}")
+    log.info(f"网盘配额(用于估算剩余空间): {QUARK_TOTAL_SPACE_GB:g} GB")
 
     stoken, share_id, target_fid, all_files = load_share_files(quark_client)
     if not all_files:
