@@ -254,6 +254,11 @@ def job_selection_file(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "selection.json")
 
 
+def job_override_file(job_id: str) -> str:
+    """逐文件控制文件（暂停/删除/重试）：Web 进程写，下载子进程读。"""
+    return os.path.join(job_dir(job_id), "file_override.yaml")
+
+
 def job_verify_file(job_id: str) -> str:
     return os.path.join(job_dir(job_id), "download_verify_report.yaml")
 
@@ -506,6 +511,11 @@ def add_job_selection(job_id: str, selection: dict | None, force: bool = False) 
         job["selection_mode"] = "explicit"
         job["updated_at"] = _now()
         saved = upsert_job(job)
+        # 运行中的子进程只认这个文件：写完它才会把新勾选的文件排进队列
+        try:
+            write_selection_file(job_id, merged)
+        except OSError as e:
+            raise ValueError(f"勾选已记入任务，但写入勾选文件失败: {e}") from e
         return {
             "job": saved,
             "added": {"files": len(added["file_fids"]), "dirs": len(added["dir_fids"])},
@@ -603,6 +613,210 @@ def remove_job_selection(job_id: str, selection: dict | None) -> dict:
     }
 
 
+# ---------- 逐文件控制：暂停 / 开始 / 删除 ----------
+
+# 允许「暂停」的状态（done/cleanup/failed 不在其列：已完成的不需要管）
+FILE_PAUSABLE_STATES = ("pending", "transfer_retry", "transferring", "ready", "retry", "downloading")
+# 允许「开始」的状态：paused=用户暂停过，failed=失败后重新排队
+FILE_RESUMABLE_STATES = ("paused", "failed")
+_FILE_OP_ALIASES = {
+    "pause": "pause",
+    "suspend": "pause",
+    "resume": "resume",
+    "start": "resume",
+    "delete": "delete",
+    "remove": "delete",
+}
+
+
+def read_file_override(job_id: str) -> dict[str, set[str]]:
+    """读逐文件控制文件，返回 {"paused","deleted","retry"} 三个集合（读不出来按空处理）。"""
+    result: dict[str, set[str]] = {"paused": set(), "deleted": set(), "retry": set()}
+    try:
+        data = _read_yaml(job_override_file(job_id))
+    except Exception:
+        return result
+    if not isinstance(data, dict):
+        return result
+    for key in result:
+        raw = data.get(key)
+        if isinstance(raw, list):
+            result[key] = {str(v).strip() for v in raw if str(v).strip()}
+    return result
+
+
+def write_file_override(job_id: str, override: dict[str, set[str]]) -> None:
+    payload = {
+        key: sorted(str(v) for v in (override.get(key) or set()) if str(v).strip())
+        for key in ("paused", "deleted", "retry")
+    }
+    _atomic_yaml_write(job_override_file(job_id), payload)
+
+
+def _recount_state_files(state: dict) -> None:
+    counts: dict[str, int] = {}
+    for item in state.get("files") or []:
+        if not isinstance(item, dict):
+            continue
+        st = str(item.get("state") or "pending").strip() or "pending"
+        counts[st] = counts.get(st, 0) + 1
+    state["counts"] = counts
+    state["updated_at"] = _now()
+
+
+def _drop_state_paths(job_id: str, paths: list[str]) -> int:
+    """按路径从 pipeline_state 删记录（fid 缺失时用；fid 已知时优先 _drop_state_files）。"""
+    targets = {str(p).strip() for p in paths if str(p).strip()}
+    if not targets:
+        return 0
+    path = job_state_file(job_id)
+    state = _read_yaml(path)
+    files = state.get("files")
+    if not isinstance(files, list) or not files:
+        return 0
+    keep = [
+        item
+        for item in files
+        if not (isinstance(item, dict) and str(item.get("path") or "").strip() in targets)
+    ]
+    removed = len(files) - len(keep)
+    if removed <= 0:
+        return 0
+    state["files"] = keep
+    failed = state.get("failed_files")
+    if isinstance(failed, list):
+        state["failed_files"] = [p for p in failed if str(p) not in targets]
+    _recount_state_files(state)
+    _atomic_yaml_write(path, state)
+    return removed
+
+
+def _reset_state_paths(job_id: str, paths: list[str]) -> int:
+    """任务未运行时「开始」这些文件：状态改回 ready/pending，并清掉失败记录。"""
+    targets = {str(p).strip() for p in paths if str(p).strip()}
+    if not targets:
+        return 0
+    path = job_state_file(job_id)
+    state = _read_yaml(path)
+    files = state.get("files")
+    if not isinstance(files, list) or not files:
+        return 0
+    changed = 0
+    for item in files:
+        if not isinstance(item, dict) or str(item.get("path") or "").strip() not in targets:
+            continue
+        if str(item.get("state") or "").strip() in ("done", "cleanup"):
+            continue
+        item["state"] = "ready" if item.get("already_transferred") else "pending"
+        item["note"] = "已恢复（用户）"
+        item["speed"] = 0
+        changed += 1
+    if not changed:
+        return 0
+    failed = state.get("failed_files")
+    if isinstance(failed, list):
+        state["failed_files"] = [p for p in failed if str(p) not in targets]
+    _recount_state_files(state)
+    _atomic_yaml_write(path, state)
+    return changed
+
+
+def _remove_fids_from_selection(job_id: str, fids: list[str]) -> int:
+    """把 fid 从任务勾选里摘掉并同步 selection.json（不要求任务暂停，供逐文件删除用）。
+
+    selection_mode 保持 explicit：全删空时子进程读到空勾选 = 本次不下载任何文件。
+    """
+    targets = {str(f).strip() for f in fids if str(f).strip()}
+    if not targets:
+        return 0
+    with _index_lock():
+        job = get_job(job_id)
+        if not job:
+            return 0
+        current = normalize_selection(job.get("selection"))
+        removed = 0
+        for key in ("file_fids", "dir_fids"):
+            kept = [fid for fid in (current.get(key) or []) if fid not in targets]
+            removed += len(current.get(key) or []) - len(kept)
+            if kept:
+                current[key] = kept
+            else:
+                current.pop(key, None)
+        if not removed:
+            return 0
+        job["selection"] = current
+        job["selection_mode"] = "explicit"
+        job["updated_at"] = _now()
+        upsert_job(job)
+    try:
+        write_selection_file(job_id, current)
+    except Exception:
+        pass
+    return removed
+
+
+def apply_file_control(
+    job_id: str,
+    op: str,
+    paths: list[str] | None = None,
+    fids: list[str] | None = None,
+) -> dict:
+    """单文件 暂停 / 开始 / 删除。
+
+    真源是 file_override.yaml（paused 声明式、retry 一次性、deleted 持久），
+    运行中由下载子进程在 ≤1s 内应用；未运行时这里直接改 pipeline_state。
+    """
+    action = _FILE_OP_ALIASES.get(str(op or "").strip().lower())
+    if not action:
+        raise ValueError(f"不支持的操作: {op}（只支持 pause / resume / delete）")
+    wanted_paths = [str(x).strip() for x in (paths or []) if str(x).strip()]
+    wanted_fids = [str(x).strip() for x in (fids or []) if str(x).strip()]
+    if not wanted_paths and not wanted_fids:
+        raise ValueError("没有指定要操作的文件")
+
+    job = get_job(job_id)
+    if not job:
+        raise ValueError(f"任务不存在: {job_id}")
+    runtime = refresh_job_runtime(job, persist=False)
+    running = bool(runtime.get("running"))
+
+    override = read_file_override(job_id)
+    if action == "pause":
+        override["paused"] |= set(wanted_paths)
+        override["deleted"] -= set(wanted_paths)
+        override["retry"] -= set(wanted_paths)
+    elif action == "resume":
+        override["paused"] -= set(wanted_paths)
+        override["deleted"] -= set(wanted_paths)
+        override["retry"] |= set(wanted_paths)
+    else:
+        override["paused"] -= set(wanted_paths)
+        override["retry"] -= set(wanted_paths)
+        if wanted_paths:
+            override["deleted"] |= set(wanted_paths)
+    write_file_override(job_id, override)
+
+    result = {
+        "job_id": job_id,
+        "op": action,
+        "paths": wanted_paths,
+        "fids": wanted_fids,
+        "applied": "pipeline" if running else "immediate",
+        "running": running,
+    }
+    if action == "delete":
+        # 勾选里摘掉，前端目录树可以重新勾选（运行中也允许：子进程靠 deleted 集合过滤）
+        removed = _remove_fids_from_selection(job_id, wanted_fids)
+        result["selection_removed"] = removed
+        if not running:
+            dropped = _drop_state_files(job_id, wanted_fids)
+            dropped += _drop_state_paths(job_id, wanted_paths)
+            result["state_files_removed"] = dropped
+    elif action == "resume" and not running:
+        result["state_files_reset"] = _reset_state_paths(job_id, wanted_paths)
+    return result
+
+
 def rename_job(job_id: str, name: str) -> dict:
     """修改任务显示名：trim、非空、与其它任务不重名，并写回 jobs.yaml。"""
     name = str(name or "").strip()
@@ -678,6 +892,7 @@ def _job_file_stats(state: dict) -> dict:
             "ready",
             "retry",
             "downloading",
+            "paused",
             "cleanup",
             "done",
             "failed",
@@ -713,22 +928,37 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
     if not isinstance(raw_files, list):
         raw_files = []
 
+    # 逐文件控制存在 file_override.yaml 里：删除的过滤掉，暂停的在展示层覆盖成 paused
+    override = read_file_override(job_id)
+    paused_paths = override["paused"]
+    deleted_paths = override["deleted"]
+    shown = [
+        item
+        for item in raw_files
+        if isinstance(item, dict) and str(item.get("path") or "").strip() not in deleted_paths
+    ]
+
     files = []
-    for item in raw_files:
-        if not isinstance(item, dict):
-            continue
+    counts: dict[str, int] = {}
+    for item in shown:
+        path = str(item.get("path") or "")
         size = max(_safe_int(item.get("size"), 0), 0)
         total = max(_safe_int(item.get("total"), 0), size)
         downloaded = max(_safe_int(item.get("downloaded"), 0), 0)
         st = str(item.get("state") or "").strip()
+        note = str(item.get("note") or "")
+        if path and path in paused_paths and st not in ("done", "cleanup", "failed", "paused"):
+            st = "paused"
+            note = note or "已暂停（用户）"
         if total > 0:
             downloaded = min(downloaded, total)
         if st in ("done", "cleanup") and total > 0:
             # 已落盘/待清理按 100% 展示，避免前端停在 99%
             downloaded = total
+        counts[st] = counts.get(st, 0) + 1
         files.append(
             {
-                "path": str(item.get("path") or ""),
+                "path": path,
                 "fid": str(item.get("fid") or ""),
                 "size": size,
                 "state": st,
@@ -736,21 +966,28 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
                 "total": total,
                 "speed": max(_safe_int(item.get("speed"), 0), 0),
                 "progress": round(100.0 * downloaded / total, 1) if total > 0 else 0.0,
-                "note": str(item.get("note") or ""),
+                "note": note,
+                # 逐文件操作按钮的可用性（前端不再重复判断状态机）
+                "paused": st == "paused",
+                "can_pause": st in FILE_PAUSABLE_STATES,
+                "can_resume": st in FILE_RESUMABLE_STATES,
+                "can_delete": st not in ("done", "cleanup"),
             }
         )
 
     file_total = len(files)
     offset = max(_safe_int(offset, 0), 0)
     limit = min(max(_safe_int(limit, 2000), 1), 5000)
+    stats_source = dict(state)
+    stats_source["files"] = shown
     return {
         "job_id": job_id,
         "files": files[offset : offset + limit],
         "offset": offset,
         "limit": limit,
         "file_total": file_total,
-        "counts": state.get("counts") or {},
-        "stats": _job_file_stats(state),
+        "counts": counts if files else (state.get("counts") or {}),
+        "stats": _job_file_stats(stats_source),
         "updated_at": state.get("updated_at"),
     }
 
@@ -828,6 +1065,27 @@ def list_jobs() -> list[dict]:
     return runtimes
 
 
+def write_selection_file(job_id: str, selection: dict | None) -> None:
+    """把勾选范围写进子进程读取的 selection.json。
+
+    用「临时文件 + os.replace」原子替换：子进程可能同时在读（运行中追加勾选），
+    读到半截 JSON 会被当成「未限定范围」→ 误下载整个分享。
+    """
+    normalized = normalize_selection(selection)
+    payload = {
+        "file_fids": list(normalized.get("file_fids") or []),
+        "dir_fids": list(normalized.get("dir_fids") or []),
+    }
+    path = job_selection_file(job_id)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        _write_private_text(tmp, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        os.replace(tmp, path)
+    finally:
+        _remove_quietly(tmp)
+
+
 def write_control(job_id: str, command: str) -> None:
     _atomic_yaml_write(
         job_control_file(job_id),
@@ -861,14 +1119,7 @@ def start_job(job_id: str) -> dict:
         explicit = str(job.get("selection_mode") or "") == "explicit"
         selection_file = job_selection_file(job_id)
         if selection or explicit:
-            payload = {
-                "file_fids": list(selection.get("file_fids") or []),
-                "dir_fids": list(selection.get("dir_fids") or []),
-            }
-            _write_private_text(
-                selection_file,
-                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            )
+            write_selection_file(job_id, selection)
         elif os.path.isfile(selection_file):
             _remove_quietly(selection_file)
 
@@ -884,6 +1135,7 @@ def start_job(job_id: str) -> dict:
         env["QUARK_AUTO_DL_VERIFY_REPORT_FILE"] = job_verify_file(job_id)
         env["QUARK_AUTO_DL_JOB_LOG_FILE"] = log_path
         env["QUARK_AUTO_DL_SELECTION_FILE"] = selection_file
+        env["QUARK_AUTO_DL_FILE_OVERRIDE_FILE"] = job_override_file(job_id)
 
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         out = open(log_path, "a", encoding="utf-8")

@@ -332,19 +332,30 @@
     }
     .job-files-filter:focus { border-color: var(--accent-dim); }
     .file-list { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-    .file-row { padding: .3rem .1rem; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+    /* 一行 = 左「文件名 + 进度条」（两行）+ 右「暂停/开始/删除」按钮列（同样两行高） */
+    .file-row {
+      display: flex; align-items: stretch; gap: .4rem;
+      padding: .3rem .1rem; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+    }
     .file-row:last-child { border-bottom: 0; }
+    .file-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; justify-content: center; }
     .file-row-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
     .file-row-name {
       flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font: .78rem/1.4 var(--mono);
     }
     .file-row-meta { flex: 0 0 auto; font: .72rem/1.4 var(--mono); color: var(--muted); white-space: nowrap; }
-    .file-row-del {
-      flex: 0 0 auto; align-self: center;
+    .file-actions { flex: 0 0 auto; display: flex; flex-direction: column; justify-content: center; gap: .18rem; }
+    .file-btn, .file-row-del {
       border: 1px solid var(--line); background: transparent; color: var(--muted);
-      border-radius: 6px; padding: 0 .35rem; font: .72rem/1.4 var(--mono); cursor: pointer;
+      border-radius: 6px; padding: 0 .4rem; min-width: 1.8rem;
+      font: .72rem/1.4 var(--mono); cursor: pointer; text-align: center;
     }
+    .file-btn:hover {
+      color: var(--accent);
+      border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+    }
+    .file-btn[hidden], .file-row-del[hidden] { display: none; }
     .file-row-del:hover {
       color: var(--danger);
       border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
@@ -356,6 +367,9 @@
     .file-row[data-state="cleanup"] .file-bar > i { background: color-mix(in srgb, var(--accent) 55%, transparent); }
     .file-row[data-state="failed"] .file-bar > i { background: var(--danger); }
     .file-row[data-state="failed"] .file-row-meta { color: #ff8e86; }
+    .file-row[data-state="paused"] .file-bar > i { background: color-mix(in srgb, #ffcf6b 70%, transparent); }
+    .file-row[data-state="paused"] .file-row-meta { color: #ffcf6b; }
+    .file-row[data-state="paused"] .file-row-name { color: var(--muted); }
     .file-row[data-state="done"] .file-row-name,
     .file-row[data-state="cleanup"] .file-row-name { color: var(--muted); }
     .pause-menu {
@@ -901,6 +915,7 @@
       ready: "待下载",
       retry: "重试中",
       downloading: "下载中",
+      paused: "已暂停",
       cleanup: "待清理",
       done: "已完成",
       failed: "失败",
@@ -933,6 +948,11 @@
         const pctText = total > 0 ? `${pct.toFixed(1)}%` : "—";
         return `${label} · ${pctText} · ${formatSize(done)}/${formatSize(total)}${speed ? " · " + speed : ""}`;
       }
+      if (file.state === "paused") {
+        // 暂停保留进度，把停下来时的百分比/下载量也显示出来
+        const pctText = total > 0 ? `${pct.toFixed(1)}%` : "—";
+        return `${label} · ${pctText} · ${formatSize(done)}/${formatSize(total)}`;
+      }
       if (file.state === "failed") {
         return `${label} · ${file.note || "见任务日志"}`;
       }
@@ -944,23 +964,42 @@
       if (!row) {
         row = document.createElement("div");
         row.className = "file-row";
+        const main = document.createElement("div");
+        main.className = "file-main";
         const head = document.createElement("div");
         head.className = "file-row-head";
         const name = document.createElement("span");
         name.className = "file-row-name";
         const meta = document.createElement("span");
         meta.className = "file-row-meta";
+        head.append(name, meta);
+        const bar = document.createElement("div");
+        bar.className = "file-bar";
+        bar.appendChild(document.createElement("i"));
+        main.append(head, bar);
+        // 右侧按钮列：暂停 / 开始 / 删除，与左侧两行等高
+        const actions = document.createElement("div");
+        actions.className = "file-actions";
+        const pause = document.createElement("button");
+        pause.type = "button";
+        pause.className = "file-btn";
+        pause.dataset.role = "file-pause";
+        pause.textContent = "⏸";
+        pause.title = "暂停这个文件（正在下载的会连 aria2 一起暂停，进度保留）";
+        const resume = document.createElement("button");
+        resume.type = "button";
+        resume.className = "file-btn";
+        resume.dataset.role = "file-resume";
+        resume.textContent = "▶";
+        resume.title = "开始这个文件（暂停或失败的重新排队）";
         const del = document.createElement("button");
         del.type = "button";
         del.className = "file-row-del";
         del.dataset.role = "file-del";
         del.textContent = "✕";
         del.title = "从任务里删除这个文件（删除后可重新勾选）";
-        head.append(name, meta, del);
-        const bar = document.createElement("div");
-        bar.className = "file-bar";
-        bar.appendChild(document.createElement("i"));
-        row.append(head, bar);
+        actions.append(pause, resume, del);
+        row.append(main, actions);
         fileState.rows.set(key, row);
       }
       const path = String(file.path || "(未知)");
@@ -978,6 +1017,10 @@
       if (barEl.style.width !== width) barEl.style.width = width;
       const state = String(file.state || "");
       if (row.dataset.state !== state) row.dataset.state = state;
+      // 按钮可用性由后端算好（can_pause / can_resume / can_delete），前端不重复判断状态机
+      row.querySelector('[data-role="file-pause"]').hidden = !file.can_pause;
+      row.querySelector('[data-role="file-resume"]').hidden = !file.can_resume;
+      row.querySelector('[data-role="file-del"]').hidden = file.can_delete === false;
       return row;
     }
 
@@ -1013,14 +1056,16 @@
         else ref = ref.nextSibling;
       }
 
-      let done = 0, running = 0, failed = 0;
+      let done = 0, running = 0, failed = 0, paused = 0;
       for (const f of files) {
         if (f.state === "done" || f.state === "cleanup") done += 1;
         else if (f.state === "failed") failed += 1;
+        else if (f.state === "paused") paused += 1;
         else if (f.state !== "pending" && f.state !== "transfer_retry") running += 1;
       }
       let text = `完成 ${done}/${files.length}`;
       if (running) text += ` · 进行中 ${running}`;
+      if (paused) text += ` · 已暂停 ${paused}`;
       if (failed) text += ` · 失败 ${failed}`;
       if (keyword && matched.length !== files.length) text += ` · 匹配 ${matched.length}`;
       if (matched.length > shown.length) text += ` · 仅显示前 ${FILE_RENDER_LIMIT}（可过滤）`;
@@ -1275,9 +1320,10 @@
       const btn = panel.querySelector('button[data-act="tree-download"]');
       if (btn) {
         const running = jobIsActive(job);
-        btn.disabled = running || (!selFiles && !selDirs);
+        // 运行中也能追加：新勾选排队，当前批次下完自动接着下（受网盘容量限制仍是串行转存）
+        btn.disabled = !selFiles && !selDirs;
         btn.title = running
-          ? "任务运行中：暂停后再勾选，重新「开始」才会生效"
+          ? "把勾选项追加到正在运行的任务（当前批次下完自动接着下）"
           : "把勾选项追加到任务并开始下载";
       }
       const clearBtn = panel.querySelector('button[data-act="tree-clear"]');
@@ -1582,10 +1628,7 @@
         setTreeMsg("先勾选要下载的文件或文件夹", "err");
         return;
       }
-      if (jobIsActive(job)) {
-        setTreeMsg("任务正在运行：先暂停，再勾选并重新「开始」才会生效", "err");
-        return;
-      }
+      const wasRunning = jobIsActive(job);
       const panel = treePanelEl();
       const btn = panel ? panel.querySelector('button[data-act="tree-download"]') : null;
       if (btn) btn.disabled = true;
@@ -1658,7 +1701,11 @@
               "（普通账号下载常被 23018 拒绝，可能失败）"
           );
         }
-        if (addedCount) {
+        if (addedCount && wasRunning) {
+          // 运行中的任务会自己捡起新勾选（子进程监听 selection.json），不用再点开始
+          parts.push("已加入队列，当前批次下完接着下");
+        }
+        if (addedCount && !wasRunning) {
           try {
             await api("/api/jobs/" + job.id + "/start", { method: "POST", body: "{}" });
             parts.push("已开始下载");
@@ -1710,26 +1757,30 @@
       }
     }
 
-    async function removeJobFile(fid, label) {
-      const job = selectedId ? jobCache.get(selectedId) : null;
-      if (!job || !fid) return;
-      if (jobIsActive(job)) {
-        setMsg($("jobs-msg"), "任务正在运行：先暂停任务，再删除文件", "err");
-        return;
-      }
+    // 逐文件操作：暂停 / 开始 / 删除（后端写 file_override.yaml，运行中约 1 秒内生效）
+    async function fileAction(op, path, fid) {
+      const jobId = selectedId;
+      if (!jobId || !path) return;
+      const verb = op === "pause" ? "暂停" : op === "resume" ? "开始" : "删除";
       try {
-        await api("/api/jobs/" + job.id + "/selection/remove", {
+        const res = await api(`/api/jobs/${jobId}/files/action`, {
           method: "POST",
-          body: JSON.stringify({ file_fids: [fid] }),
+          body: JSON.stringify({ op, paths: [path], fids: fid ? [fid] : [] }),
         });
-        // 本地先摘掉，避免等下一次轮询才消失
-        fileState.files = fileState.files.filter((f) => String(f.fid || "") !== fid);
+        if (op === "delete") {
+          // 本地先摘掉，避免等下一次轮询才消失
+          fileState.files = fileState.files.filter((f) => String(f.path || "") !== path);
+          if (fid) treeState.taken.delete(fid);
+          renderFileList();
+          treeRefreshAll();
+          setMsg($("jobs-msg"), "已删除：" + path + "（可在目录树里重新勾选）", "ok");
+        } else {
+          const when = res && res.applied === "immediate" ? "" : "（运行中，约 1 秒内生效）";
+          setMsg($("jobs-msg"), `已${verb}：${path}${when}`, "ok");
+        }
         fileState.sig = "";
-        renderFileList();
-        treeState.taken.delete(fid);
-        treeRefreshAll();
-        setMsg($("jobs-msg"), "已删除：" + label + "（可在目录树里重新勾选）", "ok");
         await refreshJobs();
+        await fillJobFiles();
       } catch (e) {
         setMsg($("jobs-msg"), e.message, "err");
       }
@@ -1756,12 +1807,16 @@
         }
       });
       $("detail").addEventListener("click", (ev) => {
-        const btn = ev.target.closest('[data-role="file-del"]');
+        const btn = ev.target.closest("[data-role]");
         if (!btn) return;
+        const role = btn.dataset.role;
+        const ops = { "file-pause": "pause", "file-resume": "resume", "file-del": "delete" };
+        const op = ops[role];
+        if (!op) return;
         const fileRow = btn.closest(".file-row");
         if (!fileRow) return;
         ev.stopPropagation();
-        removeJobFile(fileRow.dataset.fid, fileRow.dataset.path || "(未知)");
+        fileAction(op, fileRow.dataset.path || "", fileRow.dataset.fid || "");
       });
       $("detail").addEventListener("change", (ev) => {
         const check = ev.target.closest(".tree-check");

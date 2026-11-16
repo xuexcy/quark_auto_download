@@ -177,7 +177,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.3"
 CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROCESS_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
 PROCESS_START_TS = time.time()
@@ -330,6 +330,16 @@ class JobSelectionAddRequest(JobSelectionRequest):
 
 class JobSelectionRemoveRequest(JobSelectionRequest):
     """取消勾选：这些 fid 会从任务勾选里移除，对应的单文件状态也一并清掉。"""
+
+
+class JobFileActionRequest(BaseModel):
+    """逐文件操作：op=pause 暂停（进行中的同时暂停 aria2）、resume 开始、delete 从任务里删除。"""
+
+    op: str = Field(..., description="pause | resume | delete")
+    # 相对路径（与 pipeline_state.files[].path / aria2 out 一致）
+    paths: list[str] = Field(default_factory=list)
+    # 文件 fid：删除时一并从任务勾选里摘掉，前端目录树可以重新勾选
+    fids: list[str] = Field(default_factory=list)
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -602,6 +612,18 @@ def api_job_files(job_id: str, offset: int = 0, limit: int = 2000):
     if not jm.get_job(job_id):
         raise HTTPException(status_code=404, detail="任务不存在")
     return jm.job_files(job_id, offset=offset, limit=limit)
+
+
+@app.post("/api/jobs/{job_id}/files/action")
+def api_job_file_action(job_id: str, body: JobFileActionRequest):
+    """单文件 暂停 / 开始 / 删除（运行中由下载子进程在 ≤1s 内应用）。"""
+    if not jm.get_job(job_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    try:
+        result = jm.apply_file_control(job_id, body.op, body.paths, body.fids)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return {"ok": True, **result}
 
 
 @app.get("/api/jobs/{job_id}/logs")

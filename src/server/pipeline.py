@@ -37,6 +37,9 @@ class DownloadPipeline:
         control_file: str = "",
         job_id: str = "",
         state_persist_interval: float = 5.0,
+        selection_file: str = "",
+        reload_selection=None,
+        override_file: str = "",
     ):
         self.file_api = file_api
         self.share_id = share_id
@@ -46,6 +49,20 @@ class DownloadPipeline:
         self.state_file = state_file
         self.control_file = control_file
         self.job_id = job_id
+        # 运行中追加勾选：前端改写 selection.json 后，由 reload_selection() 重新列举并追加队列
+        self.selection_file = str(selection_file or "").strip()
+        self.reload_selection = reload_selection
+        self._selection_stamp = self._file_stamp(self.selection_file)
+        self._selection_failed_stamp = None
+        # 逐文件暂停/删除：file_override.yaml 由 Web 进程写，本进程只读（声明式暂停 + 一次性重试 + 持久删除）
+        self.override_file = str(override_file or "").strip()
+        self._override_stamp = self._file_stamp(self.override_file)
+        self._applied_paused: set[str] = set()
+        self._applied_deleted: set[str] = set()
+        # 正在转存的文件不能立刻删（会把转存结果变成孤儿），转存结束再删
+        self._deferred_delete: set[str] = set()
+        # 已经就地删过网盘副本的路径，启动补删时跳过（避免对同一 fid 删两次）
+        self._cloud_purged: set[str] = set()
         self.lock = threading.RLock()
         self.scheduler = PipelineScheduler(file_api, prefer_path_order=strict_download_order)
 
@@ -65,6 +82,226 @@ class DownloadPipeline:
         self._user_pause_mode: str | None = None
         self._stop = threading.Event()
         self._worker_errors: dict[str, BaseException] = {}
+
+    @staticmethod
+    def _file_stamp(path: str):
+        """文件指纹（mtime_ns + size）；不存在返回 None。用来判断前端是否改了勾选。"""
+        if not path:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _maybe_reload_selection(self) -> None:
+        """勾选文件被改写（运行中追加勾选）时，重新列举分享并把新文件追加进队列。
+
+        只加没跟踪过的路径（scheduler.append_files 负责判重），已完成/在队列中的不动。
+        """
+        if not self.reload_selection or not self.selection_file:
+            return
+        stamp = self._file_stamp(self.selection_file)
+        if stamp == self._selection_stamp:
+            return
+        try:
+            files = self.reload_selection()
+        except Exception as e:
+            # 网络/接口抖动时不推进指纹，下个 tick 继续重试；同一次改动只报一次错
+            if stamp != self._selection_failed_stamp:
+                self.log.error(f"  [勾选] 重新列举勾选文件失败（稍后重试）: {e}")
+                self._selection_failed_stamp = stamp
+            return
+        self._selection_stamp = stamp
+        self._selection_failed_stamp = None
+        # 用户已删除的文件不再回到队列（deleted 集合持久化在 file_override.yaml）
+        files = [f for f in (files or []) if self.file_api.file_path(f) not in self._applied_deleted]
+        with self.lock:
+            result = self.scheduler.append_files(list(files))
+        added = result.get("added") or []
+        skipped = result.get("skipped") or []
+        if added:
+            self.log.info(f"  [勾选] 检测到勾选更新：新增 {len(added)} 个文件进入队列")
+            for path in added:
+                self.log.info(f"    + {path}")
+        else:
+            self.log.info("  [勾选] 检测到勾选更新，但没有新文件（都已在队列或已下载）")
+        if skipped:
+            self.log.info(f"  [勾选] 跳过 {len(skipped)} 个已在队列中的文件")
+        self._persist_state(force=True)
+
+    # ---------- 逐文件暂停 / 开始 / 删除（file_override.yaml，Web 进程写、本进程读） ----------
+
+    def _read_file_override(self) -> tuple[set, set, set] | None:
+        """读逐文件控制文件，返回 (paused, deleted, retry)；读失败返回 None 让调用方下个 tick 重试。"""
+        if not self.override_file or not os.path.isfile(self.override_file):
+            return set(), set(), set()
+        try:
+            with open(self.override_file, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception as e:
+            self.log.warning(f"  [文件] 读取逐文件控制失败（稍后重试）: {e}")
+            return None
+        if not isinstance(data, dict):
+            self.log.warning("  [文件] 逐文件控制文件结构异常（稍后重试）")
+            return None
+
+        def _paths(key: str) -> set[str]:
+            raw = data.get(key) or []
+            if not isinstance(raw, list):
+                return set()
+            return {str(item).strip() for item in raw if str(item).strip()}
+
+        return _paths("paused"), _paths("deleted"), _paths("retry")
+
+    def _apply_file_override(self, *, force: bool = False) -> None:
+        """文件指纹变了才解析一次；顺序 = 删除 → 恢复 → 取消暂停 → 强制暂停。"""
+        if not self.override_file:
+            return
+        stamp = self._file_stamp(self.override_file)
+        if not force and stamp == self._override_stamp:
+            return
+        parsed = self._read_file_override()
+        if parsed is None:
+            return
+        paused, deleted, retry = parsed
+        self._override_stamp = stamp
+
+        # 1) 删除先做，避免紧接着又去暂停一个马上要消失的文件
+        for path in sorted(deleted - self._applied_deleted):
+            self._drop_file(path)
+        self._applied_deleted |= deleted
+
+        # 2) 一次性「开始」意图（幂等：state 已不是 paused/failed 时无副作用）
+        for path in sorted(retry):
+            self._resume_file(path)
+
+        # 3) 从暂停集合里被移除的 = 取消暂停
+        for path in sorted(self._applied_paused - paused):
+            self._resume_file(path)
+        self._applied_paused = set(paused)
+
+        # 4) 集合内的一律压回 paused
+        for path in sorted(self._applied_paused):
+            self._enforce_paused(path)
+
+    def _enforce_paused(self, path: str) -> None:
+        """把文件压回 paused；正在下载的连带暂停 aria2（保留已下进度）。"""
+        with self.lock:
+            job = self.scheduler.jobs.get(path)
+            # transferring 不在队列里闲着，此刻打断会把已发出的转存变成孤儿副本；
+            # 留到转存结束变成 ready 后，下一次 tick 会把它压成 paused（还没开始下载，符合预期）
+            if job is None or job.state in ("paused", "done", "failed", "cleanup", "transferring"):
+                return
+            gid = str(job.gid or "").strip()
+            was_downloading = job.state == "downloading"
+        if was_downloading and gid:
+            try:
+                self.file_api.aria2_client.aria2_pause(gid)
+            except Exception as e:
+                self.log.warning(f"  [文件] 暂停 Aria2 任务失败 gid={gid}（队列内仍会暂停调度）: {e}")
+        with self.lock:
+            job = self.scheduler.jobs.get(path)
+            if job is None or not self.scheduler.mark_user_paused(job):
+                return
+            aria2_paused = was_downloading and bool(gid)
+        self.log.info(
+            f"  [文件] 已暂停（用户）: {path}" + (" | Aria2 已暂停，进度保留" if aria2_paused else "")
+        )
+        self._persist_state(force=True)
+
+    def _resume_file(self, path: str) -> bool:
+        with self.lock:
+            job = self.scheduler.jobs.get(path)
+            if job is None or not self.scheduler.resume_file(job):
+                return False
+            state = job.state
+        self.log.info(f"  [文件] 已恢复（用户）: {path} → {state}")
+        self._persist_state(force=True)
+        return True
+
+    def _drop_file(self, path: str) -> bool:
+        """按用户要求把文件从任务里删掉：先停 aria2、再删云端副本，最后摘出队列。"""
+        with self.lock:
+            job = self.scheduler.jobs.get(path)
+            if job is None:
+                return False
+            state = job.state
+            if state == "transferring":
+                if path not in self._deferred_delete:
+                    self._deferred_delete.add(path)
+                    self.log.info(f"  [文件] 正在转存，转存结束后再删除: {path}")
+                return False
+            gid = str(job.gid or "").strip()
+            fid = str(job.file_item.get("my_fid") or "").strip()
+        # my_fid 由 initialize/转存成功时写入；重启或追加勾选后可能还没解析，按目录缓存再查一次
+        if not fid and state not in ("done", "cleanup"):
+            try:
+                fid = self.scheduler.cloud_fid_for(path)
+            except Exception as e:
+                self.log.warning(f"  [文件] 查询网盘副本失败: {path} | {e}")
+                fid = ""
+        if gid:
+            try:
+                self.file_api.aria2_client.aria2_remove(gid)
+            except Exception as e:
+                self.log.warning(f"  [文件] 移除 Aria2 任务失败 gid={gid}: {e}")
+        if fid and state not in ("done", "cleanup"):
+            try:
+                self.file_api.quark_client.delete_my_fids([fid])
+                self._cloud_purged.add(path)
+                self.log.info(f"  [文件] 已删除网盘副本: {path}")
+            except Exception as e:
+                self.log.error(f"  [文件] 删除网盘副本失败（请手动清理）: {path} | {e}")
+        with self.lock:
+            dropped = self.scheduler.drop_files([path])
+        if dropped:
+            self.log.info(f"  [文件] 已按用户操作删除并从队列移除: {path}")
+            self._persist_state(force=True)
+        return bool(dropped)
+
+    def _flush_deferred_deletes(self) -> None:
+        """转存结束（不再是 transferring/cleanup）的延后删除，现在执行。"""
+        if not self._deferred_delete:
+            return
+        for path in list(self._deferred_delete):
+            with self.lock:
+                job = self.scheduler.jobs.get(path)
+                busy = bool(job is not None and job.state in ("transferring", "cleanup"))
+            if busy:
+                continue
+            self._deferred_delete.discard(path)
+            self._drop_file(path)
+
+    def _purge_deleted_cloud_copies(self) -> None:
+        """启动时清一次「用户已删除」文件的网盘副本。
+
+        运行中删除是就地删的；任务当时没在跑的话，删除只写进 override，
+        云端那份还占着配额，所以每次启动顺手补一刀。
+        """
+        for path in sorted(self._applied_deleted - self._cloud_purged):
+            try:
+                fid = self.scheduler.cloud_fid_for(path)
+            except Exception as e:
+                self.log.warning(f"  [文件] 查询网盘副本失败: {path} | {e}")
+                continue
+            if not fid:
+                continue
+            try:
+                self.file_api.quark_client.delete_my_fids([fid])
+                self.log.info(f"  [文件] 已清理已删除文件的网盘副本: {path}")
+            except Exception as e:
+                self.log.error(f"  [文件] 删除网盘副本失败（请手动清理）: {path} | {e}")
+
+    def _tick_file_controls(self) -> None:
+        """每个 tick 应用一次逐文件控制（暂停/开始/删除 ≤1s 生效）。"""
+        if not self.override_file:
+            return
+        self._apply_file_override()
+        self._flush_deferred_deletes()
+        # 自愈：转存/提交可能把刚暂停的文件抢回 ready，这里再压回去
+        for path in list(self._applied_paused):
+            self._enforce_paused(path)
 
     def _read_control_command(self) -> str:
         if not self.control_file or not os.path.isfile(self.control_file):
@@ -144,6 +381,10 @@ class DownloadPipeline:
             f"<= {self.aria2_queue_resume_threshold} 恢复（清理不受影响）"
         )
         self._persist_state()
+        # 重启后仍然尊重用户操作：暂停的继续暂停，删除的不再下载
+        self._apply_file_override(force=True)
+        # 上次没在跑的时候删掉的文件，云端副本这时补清一次（占配额）
+        self._purge_deleted_cloud_copies()
 
     def _refresh_aria2_backpressure(self) -> bool:
         """
@@ -226,6 +467,7 @@ class DownloadPipeline:
             f"  [{worker}] pending={counts['pending']} transferring={transferring_n} "
             f"transfer_retry={transfer_retry_n} "
             f"ready(待下载)={counts['ready']} retry={counts['retry']} downloading={counts['downloading']} "
+            f"paused={counts.get('paused', 0)} "
             f"cleanup={counts['cleanup']} done={counts['done']} failed={counts['failed']} "
             f"| 主下载={main_n} 下载重试={retry_n} | Aria2排队={self._last_aria2_waiting}({pause_flag})"
         )
@@ -242,6 +484,8 @@ class DownloadPipeline:
         try:
             while any(thread.is_alive() for thread in threads):
                 self._apply_user_control()
+                self._maybe_reload_selection()
+                self._tick_file_controls()
                 if self._worker_errors:
                     self._stop.set()
                 elif self._soft_pause_should_exit():
@@ -249,6 +493,9 @@ class DownloadPipeline:
                     self._stop.set()
                 elif not self._has_pending_work() and self._user_pause_mode is None:
                     time.sleep(2)
+                    # 收尾前再看一次勾选：刚好在空档追加的文件不会被漏掉
+                    self._maybe_reload_selection()
+                    self._tick_file_controls()
                     if not self._has_pending_work():
                         self._stop.set()
                 for thread in threads:
@@ -544,6 +791,8 @@ class DownloadPipeline:
     def _download_submit_tick(self) -> None:
         """从待下载队列(ready)取全部候选并逐个处理；不因已有 downloading 而提前停止。"""
         self._apply_user_control()
+        # 先落地逐文件控制：避免把用户刚暂停/刚删除的文件又提交给 aria2
+        self._tick_file_controls()
         if self._user_ingest_blocked():
             return
         if self._refresh_aria2_backpressure():
@@ -565,6 +814,7 @@ class DownloadPipeline:
 
     def _retry_submit_tick(self) -> None:
         self._apply_user_control()
+        self._tick_file_controls()
         if self._user_ingest_blocked():
             return
         if self._refresh_aria2_backpressure():
@@ -601,6 +851,9 @@ class DownloadPipeline:
             return 0
 
     def _poll_one_download(self, job: Job) -> None:
+        # 竞态守卫：本 tick 取到 job 之后可能刚被用户暂停/删除，不能再去 unpause aria2
+        if job.state != "downloading":
+            return
         task = job.download_task or {}
         gid = job.gid or str(task.get("gid", "")).strip()
         if not gid:

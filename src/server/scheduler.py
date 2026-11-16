@@ -25,6 +25,7 @@ JobState = Literal[
     "ready",  # 待下载队列：转存完成后有序进入；下载 Worker 从此取任务
     "retry",
     "downloading",
+    "paused",  # 用户逐文件暂停：保留 Aria2 任务与进度，恢复后回到 ready/pending
     "cleanup",
     "done",
     "failed",
@@ -74,6 +75,9 @@ class PipelineScheduler:
         self.ordered_paths: list[str] = []
         self.jobs: dict[str, Job] = {}
         self.failed_files: list[str] = []
+        # 网盘目录按目录缓存：一个目录只列一次（初始化与运行中追加勾选共用）
+        self._my_dir_cache: dict[str, dict[str, str]] = {}
+        self.logger = None
 
     @staticmethod
     def _local_size_matches(actual: int | None, expected: int) -> bool:
@@ -85,31 +89,33 @@ class PipelineScheduler:
             return True
         return int(actual) == expected
 
+    def cloud_fid_for(self, relative_path: str) -> str:
+        """网盘里是否已有该文件的转存副本；有则返回 fid（供后续取直链/删副本复用）。
+
+        按目录缓存，一个目录只列一次，避免逐文件一次 file/sort。
+        """
+        relative_dir = self.file_api.relative_dir(relative_path)
+        if relative_dir not in self._my_dir_cache:
+            cache: dict[str, str] = {}
+            try:
+                parent_fid = self.file_api._parent_fid_for(relative_dir)
+                if parent_fid:
+                    for name, entry in self.file_api._entries_by_name(parent_fid).items():
+                        fid = str(entry.get("fid") or "").strip()
+                        if fid:
+                            cache[name] = fid
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"  列举网盘目录失败，按未转存处理: /{relative_dir} | {e}")
+            self._my_dir_cache[relative_dir] = cache
+        base_name = relative_path.rsplit("/", 1)[-1]
+        return self._my_dir_cache[relative_dir].get(base_name, "")
+
     def initialize(self, all_files: list[dict], logger) -> None:
+        self.logger = logger
         ordered = sorted(all_files, key=self.file_api.file_sort_key)
         quark_files_by_name, local_downloaded_sizes, aria2_tasks_by_name = self.file_api.refresh_runtime_state()
         skipped = []
-
-        # 网盘目录按目录缓存：一个目录只列一次，避免逐文件一次 file/sort
-        my_dir_cache: dict[str, dict[str, str]] = {}
-
-        def _my_drive_fid(relative_path: str) -> str:
-            """网盘里是否已有该文件的转存副本；有则返回 fid（供后续取直链/删副本复用）。"""
-            relative_dir = self.file_api.relative_dir(relative_path)
-            if relative_dir not in my_dir_cache:
-                cache: dict[str, str] = {}
-                try:
-                    parent_fid = self.file_api._parent_fid_for(relative_dir)
-                    if parent_fid:
-                        for name, entry in self.file_api._entries_by_name(parent_fid).items():
-                            fid = str(entry.get("fid") or "").strip()
-                            if fid:
-                                cache[name] = fid
-                except Exception as e:
-                    logger.warning(f"  列举网盘目录失败，按未转存处理: /{relative_dir} | {e}")
-                my_dir_cache[relative_dir] = cache
-            base_name = relative_path.rsplit("/", 1)[-1]
-            return my_dir_cache[relative_dir].get(base_name, "")
 
         for file_item in ordered:
             path = self.file_api.file_path(file_item)
@@ -179,7 +185,7 @@ class PipelineScheduler:
                 )
                 continue
 
-            my_fid = _my_drive_fid(path)
+            my_fid = self.cloud_fid_for(path)
             already_ready = path in quark_files_by_name or bool(my_fid)
             if my_fid:
                 file_item["my_fid"] = my_fid
@@ -215,6 +221,60 @@ class PipelineScheduler:
         for item in skipped:
             logger.info(f"    - {item}")
 
+    def append_files(self, files: list[dict], logger=None) -> dict:
+        """运行中追加勾选：把新文件加入队列（只加没跟踪过的路径）。
+
+        返回 {"added": [...], "skipped": [...]}。
+        - 已在 jobs 里的路径（任何状态）一律跳过，避免重复转存/重复下载与覆盖已完成记录；
+        - 本地已有同大小副本 → 直接 done / cleanup，不再下载；
+        - 网盘已有转存副本 → 标 already_transferred，交给「确认已转存」分支，不重复转存。
+        """
+        if logger is not None:
+            self.logger = logger
+        added: list[str] = []
+        skipped: list[str] = []
+        candidates: list[dict] = []
+        for file_item in files:
+            if self.file_api.file_path(file_item) in self.jobs:
+                skipped.append(self.file_api.file_path(file_item))
+            else:
+                candidates.append(file_item)
+        local_sizes: dict[str, int] = {}
+        if candidates:
+            try:
+                local_sizes = self.file_api.get_local_downloaded_sizes_from_dirs()
+            except Exception as e:
+                if self.logger:
+                    self.logger.warning(f"  读取本地下载目录失败（按未下载处理）: {e}")
+        for file_item in sorted(candidates, key=self.file_api.file_sort_key):
+            path = self.file_api.file_path(file_item)
+            if not path or path in self.jobs:
+                skipped.append(path)
+                continue
+            size = int(file_item.get("size", 0) or 0)
+            job = Job(path=path, size=size, file_item=dict(file_item))
+            self.jobs[path] = job
+            self.ordered_paths.append(path)
+            added.append(path)
+
+            local_size = local_sizes.get(path)
+            if local_size is not None and self._local_size_matches(local_size, size):
+                if self.cloud_fid_for(path):
+                    job.state = "cleanup"
+                    job.already_transferred = True
+                    job.note = "本地已存在，待清理网盘"
+                else:
+                    job.state = "done"
+                    job.note = "本地已存在"
+                continue
+            my_fid = self.cloud_fid_for(path)
+            if my_fid:
+                job.file_item["my_fid"] = my_fid
+                job.file_item["_already_transferred"] = True
+                job.already_transferred = True
+                job.note = "已转存，跳过重复转存，按偏好序进入待下载队列"
+        return {"added": added, "skipped": skipped}
+
     def counts(self) -> dict[str, int]:
         result = {
             "pending": 0,
@@ -223,6 +283,7 @@ class PipelineScheduler:
             "ready": 0,
             "retry": 0,
             "downloading": 0,
+            "paused": 0,
             "cleanup": 0,
             "done": 0,
             "failed": 0,
@@ -237,6 +298,43 @@ class PipelineScheduler:
 
     def jobs_in(self, *states: JobState) -> list[Job]:
         return [self.jobs[path] for path in self.ordered_paths if self.jobs[path].state in states]
+
+    def mark_user_paused(self, job: Job) -> bool:
+        """用户逐文件暂停：冻结未结束的文件；已完成/待清理/失败的不动。"""
+        if job.state in ("paused", "done", "cleanup", "failed"):
+            return False
+        job.state = "paused"
+        job.note = "已暂停（用户）"
+        return True
+
+    def resume_file(self, job: Job) -> bool:
+        """用户逐文件「开始」：paused 与 failed 都恢复到待下载/转存队列。"""
+        if job.state == "paused":
+            job.state = "ready" if job.already_transferred else "pending"
+            job.note = "已恢复（用户）"
+            return True
+        if job.state == "failed":
+            if job.path in self.failed_files:
+                self.failed_files.remove(job.path)
+            job.state = "ready" if job.already_transferred else "pending"
+            job.note = "用户重新开始（此前失败）"
+            job.download_task = None
+            return True
+        return False
+
+    def drop_files(self, paths: list[str]) -> int:
+        """用户从任务里删掉这些文件：从有序队列、任务表、失败清单里一并摘除。"""
+        dropped = 0
+        for path in paths:
+            job = self.jobs.pop(path, None)
+            if job is None:
+                continue
+            if path in self.ordered_paths:
+                self.ordered_paths.remove(path)
+            if path in self.failed_files:
+                self.failed_files.remove(path)
+            dropped += 1
+        return dropped
 
     def mark_failed(self, job: Job, note: str, *, keep_cloud: bool = False) -> None:
         """标记失败。
@@ -528,6 +626,7 @@ class PipelineScheduler:
                 "retry_download": [j.path for j in self.plan_retry_download_candidates()],
                 "pending_transfer": [j.path for j in self.jobs_in("pending")],
                 "transfer_retry": [j.path for j in self.jobs_in("transfer_retry")],
+                "paused": [j.path for j in self.jobs_in("paused")],
             },
             "counts": counts,
             "failed_files": list(self.failed_files),

@@ -832,3 +832,198 @@ if not isinstance(data_node, dict) or data_node.get("status") is None:
 - 转存成功后立即崩溃（进程被 kill、断电）仍会留孤儿副本；当前靠「下次按名字复用」而不是「先记 fid 再轮询」，
   后者需要落盘中间状态，暂不做。
 
+
+## 十九、2.5.2：任务运行中继续追加勾选（2026-11-16）
+
+### 19.1 需求与旧行为
+
+用户报（m03422，逐字）：「nas上正在下载，分享目录那里，无法选择更多后，无法点击"下载所选"」。
+
+旧实现是「先暂停再追加」，两道闸都在前端：
+
+| 位置 | 旧代码 | 后果 |
+| --- | --- | --- |
+| `treeSyncHeader()` | `btn.disabled = running || (!selFiles && !selDirs)` | 运行中按钮直接禁用，连 hover 文案都写着「暂停后再勾选」 |
+| `treeDownloadSelected()` | 开头 `if (jobIsActive(job)) { setTreeMsg("任务正在运行：先暂停…", "err"); return; }` | 即便手动触发也不发请求 |
+
+### 19.2 为什么不能只改前端
+
+`jobs_manager.add_job_selection()` 只把 fid 并进 `jobs.yaml` 的 `job["selection"]`；而下载子进程在启动时
+通过 `QUARK_AUTO_DL_SELECTION_FILE` 指向的 `state/jobs/<id>/selection.json` 读一次勾选（`quark_main.load_selection()`），
+之后只按进程内的 `ordered_paths` 干活。所以单方面解禁按钮 = 「提示已加入，但永远不下」——
+比禁用更糟。真正要动的是子进程的队列。
+
+### 19.3 后端改动
+
+| 文件 | 改动 | 关键点 |
+| --- | --- | --- |
+| `src/server/jobs_manager.py` | 新增 `write_selection_file(job_id, selection)`；`start_job` / `add_job_selection` 改走它 | tmp（`.<pid>.<time_ns>.tmp`）+ `_write_private_text`(0600) + `os.replace`：子进程随时可能在读，**必须原子**；写失败抛 `ValueError("勾选已记入任务，但写入勾选文件失败…")` |
+| `src/server/scheduler.py` | `append_files(files) -> {added, skipped}`；闭包 `_my_drive_fid` 提成方法 `cloud_fid_for` | 已在 `self.jobs` 的路径**任何状态都不覆盖**（done 不会被拉回 pending）；本地同大小 → `done`；云端有副本 → 复用 fid |
+| `src/server/pipeline.py` | `selection_file` / `reload_selection` 参数 + `_maybe_reload_selection()` | 指纹（`st_mtime_ns` + `st_size`）不变不重列；失败不推进指纹、同一改动只报一次错；空档期追加也不漏 |
+| `src/server/quark_main.py` | 抽出 `list_share_selection()`；`load_selection(strict=True)` | strict 下读/解析失败一律抛错，**绝不**退化成「下载整个分享」 |
+
+「重新列举」这个动作必须放在子进程里：分享列表要带 `stoken`/`share_id`/`target_fid`，这些只有子进程有；
+跨进程传函数也只能靠「写一个文件 + 子进程自己重算」。
+
+### 19.4 前端改动
+
+- `treeSyncHeader`：条件改为 `!selFiles && !selDirs`；title 运行中为「把勾选项追加到正在运行的任务（当前批次下完自动接着下）」。
+- `treeDownloadSelected`：删掉运行中早退，记 `wasRunning`；成功后仅当**不在运行**才 `POST /start`（运行中再调会报「任务已在运行中，PID=…」），
+  运行中提示追加一句「已加入队列，当前批次下完接着下」。
+- 运行中**取消勾选**（`treeRemoveTaken`）保持拦截：现在删的是「正在处理的那一份」，语义上应该先暂停。
+
+### 19.5 验证
+
+| 场景 | 结果 |
+| --- | --- |
+| 单测 | `127 passed`（新增 `tests/pytest/test_runtime_append.py` 8 个） |
+| 追加语义 | 已在 `jobs` 的路径进 `skipped` 且状态不变；本地已有同大小 → `done`；云端有副本 → `my_fid` 复用 |
+| 指纹侦测 | 文件不变 → `reload_selection` 调用 0 次；改写后 → 队列 {a,b}，`state.yaml` 顺序 `["a.mp4", "b.mp4"]` |
+| 失败重试 | `reload_selection` 抛错 → 不抛出、队列不变、下个 tick 再试（attempts == [1, 1]） |
+| 预演（本机打桩） | 运行中任务勾 1 文件 → 按钮可点，`POST /api/jobs/jtest/selection/add`，**未**调 `/start`，提示「已加入队列，当前批次下完接着下」 |
+| 预演（暂停任务） | 同样操作 → 追加后调 `/start`，提示「已开始下载」 |
+
+预演用的是 `/tmp` 下的临时 app（打桩 `_share_context` 与 `jm`），验证完脚本与进程都已删除；真实 NAS 未部署（m03414「nas上先不动」）。
+
+### 19.6 边界
+
+- 运行中**取消勾选**仍要求先暂停：此刻删的可能正是正在转存 / 下载的那份，先停再改更安全。
+- 追加只是「排进队列」：网盘容量不足时依旧「转存一个 → 下完删一个」，不会因为勾得多就并行推进。
+- 若追加的文件**必须**下载却被夸克拒绝（23018、被删、权限变更），它会在队列里按普通失败处理，不影响已在下的一批。
+
+## 二十、2.5.3：逐文件 暂停 / 开始 / 删除（2026-11-16）
+
+### 20.1 需求（m03657，逐字要点）
+
+> 在文件进度那里，要求可以对每个文件进行暂停、开始、删除操作。
+> 1. 已经下载完成的，不用管
+> 2. 已经开始下载的，点击暂停需要将在 aria2 那里也暂停
+> 3. 没有开始下载的，点击暂停就不用管 aria2 那里行尾，
+> 现在一个文件是一行文字 + 一行进度条，按钮放在右侧，占两行
+
+落地时的语义表：
+
+| 当前状态 | ⏸ 暂停 | ▶ 开始 | ✕ 删除 |
+| --- | --- | --- | --- |
+| `pending` / `transfer_retry` / `ready` / `retry` | 直接改 `paused`，**不碰 Aria2** | 回 `ready`（已转存）或 `pending` | 移除 Aria2 任务（若有 gid）、删云端副本、摘队列与勾选 |
+| `transferring` | **等这次转存结束**再生效 | — | 同上，**延后**到转存结束（此刻打断会留云端孤儿副本） |
+| `downloading` | `forcePause(gid)` + 改 `paused`，进度保留 | 回 `ready`（Aria2 任务仍在，提交时走 `unpause`） | `forceRemove(gid)` + 删云端副本 + 摘队列 |
+| `failed` | 不处理（已是终态） | 清 `failed_files`、重新入队 | 摘队列 |
+| `done` / `cleanup` | 不处理 | 不处理 | **不给按钮**（用户要求「已经下载完成的不用管」） |
+
+### 20.2 为什么必须新增 `file_override.yaml`
+
+三条约束把「只改一个地方」的路都堵死了：
+
+1. **`pipeline_state.yaml` 是子进程的私有输出**，Web 只读（`job_files`）。Web 去改它，会被子进程下一个
+   `_persist_state()` 整份覆盖；反过来，子进程改了 Web 也不知道。
+2. **子进程重启不读 `pipeline_state.yaml`**：`initialize()` 每次都重新列举分享、按「本地有没有完整副本 / 云端有没有副本」
+   重建整个队列。所以「暂停」若只写进 state，重启就丢了。
+3. **Web 与子进程是两个进程**，控制指令只能落文件。
+
+于是新增 `state/jobs/<job_id>/file_override.yaml`（0600，tmp + `os.replace` 原子写），Web 写、子进程读：
+
+```yaml
+paused:  ["脱口秀/S01E03.mkv"]   # 声明式：集合内的文件必须保持暂停
+deleted: ["脱口秀/S01E01.mkv"]   # 持久：重启后也不再下载
+retry:   []                      # 一次性意图：点「开始」/失败重开时写，子进程幂等消费
+```
+
+`paused` 之所以是**声明式**而不是「一次命令」：子进程可能在同一个 tick 里把这个文件从 `transferring` 推进到
+`ready`，甚至提交给 Aria2。只有「每个 tick 重放一次」才压得住——这条同时也是自愈机制（见 20.3）。
+
+「运行中 vs 没运行」两条路：
+
+| 任务状态 | `apply_file_control` 返回 | 谁落地 |
+| --- | --- | --- |
+| 子进程在跑 | `applied: "pipeline"` | 只写 override，等子进程 ≤1s 后读到 |
+| 子进程没跑 | `applied: "immediate"` | Web 直接把 `pipeline_state.yaml` 里这些文件改好（暂停/恢复/摘除），下次启动被 `restart` 语义接住 |
+
+### 20.3 子进程侧（`src/server/pipeline.py`）
+
+| 新方法 | 作用 | 关键细节 |
+| --- | --- | --- |
+| `_read_file_override()` | 读三个集合 | 文件不存在 → 三个空集；YAML 坏了 → `log.warning` + 返回 `None`（**不推进指纹**，下个 tick 重试，不能因为一个坏文件让整个 tick 崩） |
+| `_apply_file_override(force=False)` | 落地意图 | 指纹（`st_mtime_ns`+`st_size`）不变直接返回；顺序固定为 ① 新 `deleted` 逐个删 ② `retry` 逐个恢复 ③ 从 `paused` 里被拿掉的逐个恢复 ④ 把 `paused` 里剩下的逐个压暂停 |
+| `_enforce_paused(path)` | 压成 `paused` | 跳过 `paused/done/failed/cleanup`；**跳过 `transferring`**（打断会留孤儿副本，等它变 `ready` 后下一次 tick 自然压住）；只有 `downloading` 且有 gid 才 `aria2_pause`（异常只 `log.warning`，Aria2 挂了不该让暂停失败） |
+| `_resume_file(path)` | 恢复一个文件 | 走 `scheduler.resume_file`，成功后 `_persist_state(force=True)` 并打日志 |
+| `_drop_file(path)` | 删一个文件 | `transferring` → 进 `_deferred_delete` 直接返回；否则 `aria2_remove(gid)` → 云端副本 `delete_my_fids`（失败只 `log.error` 提示手动清理，不阻塞）→ `scheduler.drop_files` |
+| `_flush_deferred_deletes()` | 延后删除 | `_deferred_delete` 里的路径一旦不再是 `transferring/cleanup`，移出集合并真删 |
+| `_purge_deleted_cloud_copies()` | 启动补删 | 任务没在跑时用户删的文件只写了 override，云端那几 GB 还占配额；`initialize()` 末尾对 `deleted - _cloud_purged` 各删一次 |
+
+调用点（保证「点了就生效」且不会把刚删的文件又提交出去）：
+
+- `initialize()` 末尾：`_apply_file_override(force=True)` + `_purge_deleted_cloud_copies()` → 重启后暂停态/删除态仍然生效；
+- `run()` 主循环：紧跟 `_maybe_reload_selection()` 调 `_tick_file_controls()`（= 读 override + 冲延后删除 + 全量重放 `_applied_paused`）；
+- `_download_submit_tick()` / `_retry_submit_tick()` 开头：先 `_tick_file_controls()` 再挑候选，避免把刚被暂停的文件提交给 Aria2；
+- `_poll_one_download()` 开头新增守卫 `if job.state != "downloading": return`：本 tick 取到 job 之后它可能刚被暂停/删除，
+  不守卫就会走到 `paused → aria2_unpause` 分支，把用户的暂停立刻撤销。
+
+删除云端副本时还需要 `my_fid`：刚重启/刚追加的文件可能还没解析出 fid，`_drop_file` 里退一步用
+`scheduler.cloud_fid_for(path)` 现查；两条路都删成功的路径记进 `_cloud_purged`，避免
+`_apply_file_override` 与 `_purge_deleted_cloud_copies` 对同一个 fid 删两次（这条是写测试时踩出来的：
+断言写成 `[["mine1"], ["mine1"]]` 才发现重复删除）。
+
+### 20.4 调度器（`src/server/scheduler.py`）
+
+- `JobState` 增加 `"paused"`，`counts()` 同步加键，`_log_counts` 输出里多一列 `paused=N`（在 `downloading` 与 `cleanup` 之间）。
+- `mark_user_paused(job)` → `paused` + note「已暂停（用户）」；`resume_file(job)` → `paused` 回 `ready|pending`、
+  `failed` 回 `ready|pending` 并清 `failed_files`；`drop_files(paths)` → 同时从 `jobs` / `ordered_paths` / `failed_files` 摘除。
+- `persist_payload()` 的 `queues` 增加 `paused`，落盘后重启也能看出哪些是用户暂停的（真正的真源仍是 override）。
+
+### 20.5 Web 侧（`src/server/jobs_manager.py` + `web_app.py`）
+
+- `POST /api/jobs/{job_id}/files/action`，body `{"op": "pause|resume|delete", "paths": [...], "fids": [...]}`
+  （别名 `suspend` / `start` / `remove`）；任务不存在 404，参数/执行错误 400。
+- `apply_file_control()`：op 归一 → 改 override 三集合（互斥：pause 清 `retry`，resume 清 `paused`，delete 清两者）→
+  `delete` **总是**把 fid 从 `jobs.yaml` 的 `selection` 与 `selection.json` 摘掉（所以「删了就能重新勾选」），
+  没跑时再 `_drop_state_files` + `_drop_state_paths`；`resume` 没跑时 `_reset_state_paths`（`ready|pending`、清 note 与 `failed_files`）。
+- `GET /api/jobs/{id}/files` 合并 override：跳过 `deleted`；`paused` 里的文件若 state 不是终态就显示成 `paused`；
+  每条补 `paused / can_pause / can_resume / can_delete` 四个布尔（前端据此显示按钮，避免前端自己再推一遍状态机）；
+  `counts` / `stats` 都按合并后的列表重算。
+- `start_job` 的 env 多一个 `QUARK_AUTO_DL_FILE_OVERRIDE_FILE`，`quark_main` 读它并传给 `DownloadPipeline(override_file=…)`。
+
+### 20.6 前端（`src/web/static/index.html`）
+
+- 行结构：`.file-row`（flex）→ `.file-main`（名字 + meta + 进度条，两行）+ `.file-actions`（⏸ / ▶ / ✕ 竖排，两行高）。
+  按钮按 `can_*` 设 `hidden`；`.file-row[data-state="paused"]` 用黄色进度条，`FILE_STATE_LABELS` 加 `paused: "已暂停"`。
+- 暂停的行 meta 走专门分支：「已暂停 · 37.5% · 375 B/1000 B」——停下来时也有百分比和已下量，否则看起来像「没下载」。
+- 汇总行多一项「已暂停 N」；删除后本地立即把那行摘掉、`treeState.taken.delete(fid)`、重绘目录树，
+  提示「已删除：xxx（可在目录树里重新勾选）」；暂停/恢复提示带「（运行中，约 1 秒内生效）」。
+- `#detail` 的事件委托统一处理三种 `data-role`（`file-pause` / `file-resume` / `file-del`），
+  与既有的目录树委托共用一处，不再各写一份。
+
+### 20.7 验证
+
+| 项目 | 结果 |
+| --- | --- |
+| 单测 | **149 passed**（新增 `test_file_control.py` 11、`test_file_action_api.py` 3、`test_pipeline_file_override.py` 8） |
+| override 持久化 | 文件 0600、键排序；坏 YAML 不抛、不推进指纹（`test_broken_override_file_does_not_break_tick`） |
+| 暂停语义 | `ready` → `paused`；`downloading` 暂停后 `progress` 仍 25.0（进度不被清零） |
+| 自愈 | 外部把 state 改回 `ready` 后，下一次 tick 又压回 `paused` |
+| 延后删除 | `transferring` 时不删、不摘队列；转存结束变 `ready` 后 `_flush_deferred_deletes` 才真删 |
+| 启动补删 | `deleted` 的文件在 `initialize()` 里被删云端副本（`[["mine1"]]`，不重复） |
+| 运行中 vs 空闲 | 子进程在跑 → 只写 override（`applied: "pipeline"`，state 不动）；空闲 → 直接改 state（`applied: "immediate"`） |
+| 预演（本机打桩，真 Chromium） | 每行 `.file-main` 39px == `.file-actions` 39px、按钮列在右侧（列宽 29px）；`done` 行三按钮全 hidden；⏸ → 行变 `paused`、meta「已暂停 · 37.5% · 375 B/1000 B」、按钮换 ▶；▶ → 回 `pending`；✕ → 行消失、汇总「完成 1/4 · 已暂停 1 · 失败 1」 |
+
+预演用的是 `/tmp` 下的临时 app（打桩 `jm.*` 与 `_share_context`，5 行假数据），验证完脚本与进程都已删除；
+截图留在 `~/Downloads/quark-file-controls.png`。**真实 NAS 未部署**（用户 m03414「nas上先不动」，那台机器上 S01E01 还在下）。
+
+### 20.8 边界与未验证
+
+- **本地半成品不清理**：`delete` 只 `forceRemove` Aria2 任务，不回删下载目录里的半成品文件。重新勾选同一个文件时，
+  Aria2 默认 `allow-overwrite=false` + `auto-file-renaming=true`，可能把新的存成 `xxx.mkv.1`（**未在真机验证**）。
+  要彻底干净，删除时该顺带删本地文件，但那需要确认真实路径与 `local_copy_is_intact` 判据，这版没做。
+- **全部文件都暂停时进程不退出**：`has_work()` 判的是 `state not in ("done","failed")`，`paused` 也算未完成，
+  所以子进程会一直活着（每 30 秒一行计数）。这是有意的——Aria2 任务和进程都在，点「开始」秒恢复；
+  代价是「暂停一切」不会释放进程。
+- **删云端副本是 best-effort**：失败只 `log.error`「删除网盘副本失败（请手动清理）」，不影响本地队列状态；
+  残留的那份仍占 10 GiB 配额，会继续卡住后面的转存。
+- **`paused` 不进 `failed_files`**：暂停不是失败，日志里的失败统计不会因为它变化；但 `stats` 的「已下载文件数」也不含它。
+- **接口不拦「删已完成」**：「已完成的行不给按钮」只是前端按 `can_delete` 隐藏；直接调接口仍能把 `done` 的文件从列表里摘掉
+  （`_drop_file` 对 `done/cleanup` 不删云端副本，本地文件也不动，所以只是观感问题）。要严格可以加一道
+  `can_delete` 校验，但那会让「列表中残留一条早就下完的记录」没法清理，暂时保持宽松。
+- 逐文件控制与「软暂停/硬暂停」正交：硬暂停会 `_purge_aria2_for_job` 把 Aria2 任务清掉，之后再点某个文件的 ▶，
+  它会按 `ready` 重新取直链提交（相当于重下），而不是续传——因为 Aria2 那边的任务已经没了。
+
+

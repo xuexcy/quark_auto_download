@@ -104,6 +104,8 @@ STATE_FILE = str(
 CONTROL_FILE = str(os.getenv("QUARK_AUTO_DL_CONTROL_FILE") or "").strip()
 # 前端勾选范围（由 jobs_manager.start_job 写到 state/jobs/<id>/selection.json）
 SELECTION_FILE = str(os.getenv("QUARK_AUTO_DL_SELECTION_FILE") or "").strip()
+# 逐文件暂停/删除控制文件（由 jobs_manager.apply_file_control 写到 state/jobs/<id>/file_override.yaml）
+OVERRIDE_FILE = str(os.getenv("QUARK_AUTO_DL_FILE_OVERRIDE_FILE") or "").strip()
 VERIFY_REPORT_FILE = str(
     os.getenv("QUARK_AUTO_DL_VERIFY_REPORT_FILE")
     or ARIA2_CONFIG.get("verify_report_file")
@@ -167,11 +169,13 @@ def init_clients():
     return quark_client, aria2_client
 
 
-def load_selection() -> tuple[set[str], set[str], bool]:
+def load_selection(strict: bool = False) -> tuple[set[str], set[str], bool]:
     """读取前端勾选范围，返回 (文件 fid 集合, 目录 fid 集合, 是否限定了范围)。
 
     文件不存在/内容损坏都按"全量下载"处理（third=False），避免因为前端数据问题把任务卡死；
     文件存在但两个集合都空 = 用户把勾选全取消了，此时 third=True 表示本次不下载任何文件。
+
+    strict=True（运行中追加勾选时用）：读不出来就抛错，绝不退化成"下载整个分享"。
     """
     if not SELECTION_FILE or not os.path.isfile(SELECTION_FILE):
         return set(), set(), False
@@ -179,9 +183,13 @@ def load_selection() -> tuple[set[str], set[str], bool]:
         with open(SELECTION_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
+        if strict:
+            raise ValueError(f"读取勾选范围失败: {e}") from e
         log.warning(f"读取勾选范围失败（按全量下载处理）: {e}")
         return set(), set(), False
     if not isinstance(data, dict):
+        if strict:
+            raise ValueError("勾选范围格式不正确")
         log.warning("勾选范围格式不正确（按全量下载处理）")
         return set(), set(), False
 
@@ -209,10 +217,30 @@ def load_share_files(quark_client):
     log.info(f"  share_id={share_id}  root_fid={root_fid}  target_fid={target_fid}")
 
     log.info("▶ 正在获取文件列表...")
-    selected_file_fids, selected_dir_fids, selection_constrained = load_selection()
+    all_files = list_share_selection(quark_client, share_id, stoken, target_fid)
+
+    if not all_files:
+        log.warning("未找到任何文件，退出。")
+
+    return stoken, share_id, target_fid, all_files
+
+
+def list_share_selection(
+    quark_client,
+    share_id: str,
+    stoken: str,
+    target_fid: str,
+    verbose: bool = True,
+    strict: bool = False,
+) -> list[dict]:
+    """按当前 selection.json 列出分享里要下载的文件（排序 + 正则过滤）。
+
+    启动时由 load_share_files 调用；运行中追加勾选时由流水线回调重新调用（verbose=False 少刷日志）。
+    """
+    selected_file_fids, selected_dir_fids, selection_constrained = load_selection(strict=strict)
     if selection_constrained and not selected_file_fids and not selected_dir_fids:
         log.warning("勾选为空：本次任务不下载任何文件（如需其它文件，请在页面上重新勾选后再开始）")
-        return stoken, share_id, target_fid, []
+        return []
     if selected_file_fids or selected_dir_fids:
         log.info(
             f"  仅下载勾选项：选中文件 {len(selected_file_fids)} 个 / "
@@ -227,8 +255,9 @@ def load_share_files(quark_client):
     )
     log.info(f"  共找到 {len(all_files)} 个文件")
     all_files = sorted(all_files, key=FileApi.file_sort_key)
-    for f in all_files:
-        log.info(f"    {FileApi.file_path(f)}  ({FileApi.format_size(f.get('size', 0))})")
+    if verbose:
+        for f in all_files:
+            log.info(f"    {FileApi.file_path(f)}  ({FileApi.format_size(f.get('size', 0))})")
 
     if FILE_NAME_PATTERN is not None:
         before_count = len(all_files)
@@ -236,10 +265,7 @@ def load_share_files(quark_client):
         log.info(f"▶ 按正则过滤: {FILE_NAME_REGEX}")
         log.info(f"  过滤后剩余 {len(all_files)}/{before_count} 个文件")
 
-    if not all_files:
-        log.warning("未找到任何文件，退出。")
-
-    return stoken, share_id, target_fid, all_files
+    return all_files
 
 
 def main():
@@ -282,6 +308,8 @@ def main():
     log.info(f"状态文件: {STATE_FILE}")
     if CONTROL_FILE:
         log.info(f"控制文件: {CONTROL_FILE}")
+    if OVERRIDE_FILE:
+        log.info(f"逐文件控制文件: {OVERRIDE_FILE}")
     pipeline = DownloadPipeline(
         file_api=file_api,
         share_id=share_id,
@@ -294,6 +322,18 @@ def main():
         aria2_queue_resume_threshold=ARIA2_QUEUE_RESUME_THRESHOLD,
         control_file=CONTROL_FILE,
         job_id=JOB_ID,
+        selection_file=SELECTION_FILE,
+        override_file=OVERRIDE_FILE,
+        # 运行中追加勾选：前端改 selection.json 后，流水线回调这里重新列举分享
+        reload_selection=(
+            (
+                lambda: list_share_selection(
+                    quark_client, share_id, stoken, target_fid, verbose=False, strict=True
+                )
+            )
+            if SELECTION_FILE
+            else None
+        ),
     )
     pipeline.initialize(all_files)
     failed_files = pipeline.run()
