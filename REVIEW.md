@@ -992,6 +992,8 @@ retry:   []                      # 一次性意图：点「开始」/失败重�
   提示「已删除：xxx（可在目录树里重新勾选）」；暂停/恢复提示带「（运行中，约 1 秒内生效）」。
 - `#detail` 的事件委托统一处理三种 `data-role`（`file-pause` / `file-resume` / `file-del`），
   与既有的目录树委托共用一处，不再各写一份。
+- 2.5.4 微调：按钮从「竖排两行」改成「并排一行」，`.file-actions` 用 `flex-direction: row` + `align-items: stretch`，
+  整行高度仍跟着左侧两行（实测同高 25px，两按钮各 32×25px、同一 y）；只在 NAS 页面注入候选 CSS 量过矩形后落盘。
 
 ### 20.7 验证
 

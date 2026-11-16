@@ -345,10 +345,12 @@
       font: .78rem/1.4 var(--mono);
     }
     .file-row-meta { flex: 0 0 auto; font: .72rem/1.4 var(--mono); color: var(--muted); white-space: nowrap; }
-    .file-actions { flex: 0 0 auto; display: flex; flex-direction: column; justify-content: center; gap: .18rem; }
+    /* 按钮排成一行，整行高度占满左侧「文件名 + 进度条」两行的高度 */
+    .file-actions { flex: 0 0 auto; display: flex; flex-direction: row; align-items: stretch; justify-content: center; gap: .3rem; }
     .file-btn, .file-row-del {
+      display: inline-flex; align-items: center; justify-content: center;
       border: 1px solid var(--line); background: transparent; color: var(--muted);
-      border-radius: 6px; padding: 0 .4rem; min-width: 1.8rem;
+      border-radius: 6px; padding: 0 .55rem; min-width: 2rem;
       font: .72rem/1.4 var(--mono); cursor: pointer; text-align: center;
     }
     .file-btn:hover {

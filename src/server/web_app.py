@@ -177,7 +177,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-APP_VERSION = "2.5.3"
+APP_VERSION = "2.5.4"
 CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROCESS_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
 PROCESS_START_TS = time.time()
