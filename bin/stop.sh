@@ -70,13 +70,16 @@ if [ -d "$JOBS_DIR" ]; then
 fi
 
 echo "=== 兜底清理残留进程 ==="
-# 只杀命令行里带本项目绝对路径的进程：不再用宽泛的 pkill -f，避免误杀
-# 其它部署实例、编辑器（vim/tail）或同机其他用户的同名脚本。
+# 只杀命令行里带本项目绝对路径、并且"可执行文件本身是 python"的进程：
+# 不用宽泛的 pkill -f，避免误杀其它部署实例或同机其他用户的同名脚本；
+# 额外要求 $2 含 python，是为了排除 vim/tail/grep 这类"参数里带了脚本名"的编辑器与查看器
+# （只按子串匹配时，vim src/server/quark_main.py 会同时命中 root 与 src/server/quark_main.py 而被误杀）。
 for pid in $(ps -eo pid=,args= 2>/dev/null | awk -v root="$PROJECT_ROOT" '
-  index($0, root) && (index($0, "uvicorn web_app:app") || index($0, "src/quark_main.py")) { print $1 }
+  index($0, root) && index($2, "python") &&
+  (index($0, "uvicorn web_app:app") || index($0, "src/server/quark_main.py")) { print $1 }
 '); do
   case "$pid" in
-    "$$"|"") continue ;;
+    "$$"|"$PPID"|"") continue ;;
   esac
   kill -TERM "$pid" 2>/dev/null || true
 done

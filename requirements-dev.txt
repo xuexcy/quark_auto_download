@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# 仅测试需要
+pytest==9.2.0
+httpx==0.28.1

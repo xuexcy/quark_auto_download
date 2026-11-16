@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>设置 · Quark Auto Download</title>
+  <style>
+    :root {
+      --bg: #0f1412;
+      --panel: #171e1b;
+      --panel-2: #1e2823;
+      --line: #2c3a33;
+      --text: #e7eee9;
+      --muted: #8fa196;
+      --accent: #3dba7a;
+      --accent-dim: #2a8f5c;
+      --radius: 10px;
+      --font: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Sarasa Mono SC", "Cascadia Code", "Consolas", monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(1100px 520px at 8% -8%, #1a3328 0%, transparent 55%),
+        radial-gradient(800px 420px at 100% 0%, #1a2430 0%, transparent 50%),
+        var(--bg);
+    }
+    .wrap { width: min(720px, calc(100% - 2rem)); margin: 0 auto; padding: 2.2rem 0 4rem; }
+    .header-top {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      gap: 1rem; flex-wrap: wrap; margin-bottom: .15rem;
+    }
+    .brand { font-family: var(--mono); font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); margin: 0 0 .45rem; }
+    h1 { margin: 0; font-size: clamp(1.4rem, 3vw, 1.85rem); font-weight: 600; }
+    .sub { margin: .5rem 0 0; color: var(--muted); line-height: 1.5; }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.15rem 1.25rem;
+      margin: 1rem 0;
+    }
+    .panel-head {
+      display: flex; flex-direction: column; gap: .25rem;
+      margin: 0 0 .85rem; padding-bottom: .75rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel h2 {
+      margin: 0; font-size: 1rem; font-weight: 600;
+    }
+    .panel-desc {
+      margin: 0; font-size: .78rem; color: var(--muted); line-height: 1.45;
+      font-family: var(--mono);
+    }
+    label { display: block; font-size: .8rem; color: var(--muted); margin: .7rem 0 .3rem; }
+    .panel > label:first-of-type { margin-top: 0; }
+    input, textarea {
+      width: 100%; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+      border-radius: 8px; padding: .65rem .75rem; font: 500 .92rem/1.4 var(--mono); outline: none;
+    }
+    input:focus, textarea:focus { border-color: var(--accent-dim); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+    button, a.btn-ghost {
+      border: 0; border-radius: 8px; padding: .65rem 1rem; font: 600 .88rem/1 var(--font); cursor: pointer;
+    }
+    .btn-primary { background: var(--accent); color: #062214; }
+    .btn-restart {
+      background: color-mix(in srgb, #c47a3a 88%, #1a1008);
+      color: #1a1008;
+    }
+    .btn-restart:disabled { opacity: .55; cursor: wait; }
+    .restart-hint {
+      margin: 0; font-size: .78rem; color: var(--muted); line-height: 1.4;
+      flex: 1 1 12rem;
+    }
+    a.btn-ghost, button.btn-ghost {
+      display: inline-flex; align-items: center; text-decoration: none;
+      background: transparent; color: var(--text); border: 1px solid var(--line);
+    }
+    a.btn-ghost:hover, button.btn-ghost:hover { border-color: var(--accent-dim); color: var(--accent); }
+    .msg { margin-top: .7rem; min-height: 1.1rem; font-size: .86rem; color: var(--muted); }
+    .msg.ok { color: var(--accent); }
+    .msg.err { color: #ff8e86; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
+    @media (max-width: 560px) { .grid-2 { grid-template-columns: 1fr; } }
+    .actions-bar {
+      margin-top: 1.25rem; padding-top: .25rem;
+      display: flex; gap: .6rem; flex-wrap: wrap; align-items: center;
+    }
+    .tabs { display: flex; gap: .4rem; margin: 0 0 .8rem; }
+    .tab {
+      background: transparent; color: var(--muted); border: 1px solid var(--line);
+      padding: .45rem .85rem; font-size: .82rem;
+    }
+    .tab.is-active { color: var(--accent); border-color: var(--accent-dim); }
+    .hint { margin: .5rem 0 0; font-size: .78rem; color: var(--muted); line-height: 1.5; }
+    .cmd-row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .4rem 0 0; }
+    .cmd-row code { flex: 1 1 auto; padding: .3rem .45rem; font-size: .78rem; font-family: var(--mono);
+      background: rgba(255, 255, 255, .06); border-radius: 6px; word-break: break-all; }
+    .qr-box { display: flex; gap: 1.1rem; align-items: center; flex-wrap: wrap; }
+    .qr-canvas {
+      width: 220px; height: 220px; flex: 0 0 auto;
+      display: flex; align-items: center; justify-content: center;
+      background: #fff; border-radius: 8px; overflow: hidden;
+      border: 1px solid var(--line);
+    }
+    .qr-canvas svg { width: 100%; height: 100%; display: block; }
+    .qr-canvas .qr-empty { color: #9aa7a0; font-size: .76rem; text-align: center; padding: .6rem; }
+    .qr-side { flex: 1 1 12rem; display: flex; flex-direction: column; gap: .6rem; }
+    .qr-status { margin: 0; font-size: .86rem; color: var(--muted); min-height: 1.2rem; }
+    .qr-status.ok { color: var(--accent); }
+    .qr-status.err { color: #ff8e86; }
+    .backend-info { margin: .35rem 0 0; font-size: .76rem; font-family: var(--mono); color: var(--muted); word-break: break-all; }
+    .app-ver {
+      display: inline-block; margin-left: .4rem; padding: .02rem .4rem;
+      border: 1px solid var(--line); border-radius: 999px;
+      font-size: .68rem; letter-spacing: .02em; color: var(--muted);
+      vertical-align: middle; text-transform: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="header-top">
+        <div>
+          <p class="brand">Quark Auto Download <span class="app-ver" id="app-ver" title="Web 版本"></span></p>
+          <h1>设置</h1>
+        </div>
+        <a class="btn-ghost" href="/">返回任务</a>
+      </div>
+      <p class="sub">配置 Quark / Aria2。敏感字段以掩码显示，未修改则保留原值。</p>
+      <p class="sub backend-info" id="backend-info"></p>
+    </header>
+
+    <section class="panel" aria-labelledby="cfg-login">
+      <div class="panel-head">
+        <h2 id="cfg-login">夸克登录</h2>
+        <p class="panel-desc">扫码自动拿 Cookie，或手工粘贴</p>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab is-active" type="button" role="tab" data-tab="qr" id="tab-qr">扫码登录</button>
+        <button class="tab" type="button" role="tab" data-tab="manual" id="tab-manual">手工 Cookie</button>
+      </div>
+
+      <div class="tab-panel" id="panel-qr">
+        <div class="qr-box">
+          <div class="qr-canvas" id="qr-canvas">
+            <p class="qr-empty">点右侧按钮<br />生成二维码</p>
+          </div>
+          <div class="qr-side">
+            <button class="btn-primary" id="btn-qr-start" type="button">生成二维码</button>
+            <p class="qr-status" id="qr-status">用手机夸克 App 扫码，并在 App 内点确认。</p>
+          </div>
+        </div>
+        <p class="hint">扫码成功后 Cookie 会自动写入配置，无需手工复制。二维码约 3 分钟过期，过期后重新生成即可。</p>
+      </div>
+
+      <div class="tab-panel" id="panel-manual" hidden>
+        <label for="cookie-input">Cookie</label>
+        <textarea id="cookie-input" rows="3" placeholder="__pus=...; __puus=..."></textarea>
+        <div class="actions-bar">
+          <button class="btn-primary" id="btn-cookie-save" type="button">校验并保存</button>
+          <button class="btn-ghost" id="btn-cookie-test" type="button">测试当前 Cookie</button>
+        </div>
+        <p class="hint">保存前会请求夸克接口校验，无效的 Cookie 不会写入配置。</p>
+      </div>
+      <p class="msg" id="login-msg"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="cfg-quark">
+      <div class="panel-head">
+        <h2 id="cfg-quark">Quark</h2>
+        <p class="panel-desc">网盘 Cookie、转存目录与文件过滤</p>
+      </div>
+      <label for="quark_cookie">Cookie（掩码不改）</label>
+      <textarea id="quark_cookie" rows="2"></textarea>
+      <label for="save_to_dir">转存目录 save_to_dir</label>
+      <input id="save_to_dir" />
+      <label for="file_name_regex">文件过滤正则</label>
+      <input id="file_name_regex" />
+    </section>
+
+    <section class="panel" aria-labelledby="cfg-aria2">
+      <div class="panel-head">
+        <h2 id="cfg-aria2">Aria2</h2>
+        <p class="panel-desc">RPC、下载目录与排队阈值</p>
+      </div>
+      <label for="aria2_host">RPC Host</label>
+      <input id="aria2_host" />
+      <label for="aria2_secret">Secret</label>
+      <input id="aria2_secret" />
+      <label for="aria2_download_dir">下载临时目录</label>
+      <input id="aria2_download_dir" />
+      <label for="download_destination_dir">完成后目录</label>
+      <input id="download_destination_dir" />
+      <div class="grid-2">
+        <div>
+          <label for="aria2_queue_pause_threshold">排队暂停阈值</label>
+          <input id="aria2_queue_pause_threshold" type="number" />
+        </div>
+        <div>
+          <label for="aria2_queue_resume_threshold">排队恢复阈值</label>
+          <input id="aria2_queue_resume_threshold" type="number" />
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="cfg-runtime">
+      <div class="panel-head">
+        <h2 id="cfg-runtime">运行环境</h2>
+        <p class="panel-desc">只读：本服务由谁托管、开机自启是否开启</p>
+      </div>
+      <p class="hint" id="runtime-info">读取中…</p>
+      <p class="hint" id="autostart-info"></p>
+      <div class="cmd-row" id="autostart-cmd-row" hidden>
+        <code id="autostart-cmd"></code>
+        <button class="btn-ghost" id="btn-copy-cmd" type="button">复制</button>
+      </div>
+      <p class="hint">页面不提供「开机自启」开关：改 systemd 配置是系统操作，Web 接口不代劳，也不需要 sudo 权限。需要时按上面命令手动执行。</p>
+    </section>
+
+    <div class="actions-bar">
+      <button class="btn-primary" id="btn-save-config" type="button">保存配置</button>
+      <button class="btn-restart" id="btn-restart" type="button">重启服务</button>
+      <a class="btn-ghost" href="/">返回任务</a>
+      <p class="restart-hint">重启将停止 Web 及所有下载任务</p>
+    </div>
+    <div class="msg" id="cfg-msg"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    // 运行方式由后端 /api/health 只读报告，决定重启按钮走哪条路
+    let runtimeMode = "unknown";
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail || res.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return data;
+    }
+
+    function setMsg(el, text, kind = "") {
+      el.textContent = text || "";
+      el.className = "msg" + (kind ? " " + kind : "");
+    }
+
+    function fillConfig(cfg) {
+      const q = cfg.quark || {}, a = cfg.aria2 || {};
+      $("quark_cookie").value = q.quark_cookie || "";
+      $("save_to_dir").value = q.save_to_dir || "";
+      $("file_name_regex").value = q.file_name_regex || "";
+      $("aria2_host").value = a.aria2_host || "";
+      $("aria2_secret").value = a.aria2_secret || "";
+      $("aria2_download_dir").value = a.aria2_download_dir || "";
+      $("download_destination_dir").value = a.download_destination_dir || "";
+      $("aria2_queue_pause_threshold").value = a.aria2_queue_pause_threshold ?? 700;
+      $("aria2_queue_resume_threshold").value = a.aria2_queue_resume_threshold ?? 500;
+    }
+
+    // ---------- 夸克登录 ----------
+    let qrTimer = null;
+    let qrSessionId = "";
+    let qrRenewals = 0;
+    let qrTick = null;
+    let qrDeadline = 0;
+    let qrMessage = "等待扫码…";
+    const QR_MAX_RENEWALS = 3;
+    // 服务端二维码有效期 180 秒；页面按 120 秒倒计时，提前 60 秒自动续期
+    const QR_COUNTDOWN_SEC = 120;
+
+    function setQrStatus(text, kind = "") {
+      const el = $("qr-status");
+      el.textContent = text || "";
+      el.className = "qr-status" + (kind ? " " + kind : "");
+    }
+
+    function stopQrPolling() {
+      if (qrTimer) {
+        clearTimeout(qrTimer);
+        qrTimer = null;
+      }
+      stopCountdown();
+    }
+
+    function stopCountdown() {
+      if (qrTick) {
+        clearInterval(qrTick);
+        qrTick = null;
+      }
+    }
+
+    function renderQrCountdown() {
+      const left = Math.max(0, Math.ceil((qrDeadline - Date.now()) / 1000));
+      const base = (qrMessage || "等待扫码").replace(/…+$/, "");
+      setQrStatus(base + "…（剩余 " + left + " 秒）");
+      if (left <= 0) stopCountdown();
+    }
+
+    function startCountdown(message, deadline) {
+      qrMessage = message || "等待扫码…";
+      qrDeadline = deadline;
+      stopCountdown();
+      renderQrCountdown();
+      qrTick = setInterval(renderQrCountdown, 1000);
+    }
+
+    function switchTab(name) {
+      const isQr = name === "qr";
+      $("tab-qr").classList.toggle("is-active", isQr);
+      $("tab-manual").classList.toggle("is-active", !isQr);
+      $("panel-qr").hidden = !isQr;
+      $("panel-manual").hidden = isQr;
+    }
+
+    $("tab-qr").onclick = () => switchTab("qr");
+    $("tab-manual").onclick = () => switchTab("manual");
+
+    async function pollQr(sessionId, deadline) {
+      try {
+        const st = await api("/api/quark/login/qr/" + encodeURIComponent(sessionId));
+        qrSessionId = st.session_id || sessionId;
+        if (st.status === "confirmed") {
+          stopQrPolling();
+          const who = st.nickname ? "（" + st.nickname + "）" : "";
+          setQrStatus("登录成功" + who + "，Cookie 已保存", "ok");
+          setMsg($("login-msg"), "Cookie 已保存：" + (st.cookie_masked || ""), "ok");
+          fillConfig(await api("/api/config"));
+          return;
+        }
+        if (st.status === "expired") {
+          stopQrPolling();
+          renewQr();
+          return;
+        }
+        if (st.status === "failed") {
+          stopQrPolling();
+          setQrStatus(st.message || st.status, "err");
+          return;
+        }
+        qrMessage = st.message || "等待扫码…";
+        renderQrCountdown();
+      } catch (e) {
+        stopQrPolling();
+        setQrStatus(e.message, "err");
+        return;
+      }
+      if (Date.now() > deadline) {
+        stopQrPolling();
+        renewQr();
+        return;
+      }
+      qrTimer = setTimeout(() => pollQr(sessionId, deadline), 1500);
+    }
+
+    function renewQr() {
+      if (qrRenewals >= QR_MAX_RENEWALS) {
+        setQrStatus("二维码已过期，请点「生成二维码」重新生成", "err");
+        return;
+      }
+      qrRenewals += 1;
+      setQrStatus("二维码已过期，正在自动刷新（第 " + qrRenewals + " 次）…");
+      startQr(false);
+    }
+
+    async function startQr(manual) {
+      stopQrPolling();
+      if (manual) qrRenewals = 0;
+      setQrStatus("正在申请二维码…");
+      try {
+        const data = await api("/api/quark/login/qr", { method: "POST", body: "{}" });
+        const box = $("qr-canvas");
+        if (data.qr_svg) {
+          box.innerHTML = data.qr_svg;
+        } else {
+          box.innerHTML = "";
+          const p = document.createElement("p");
+          p.className = "qr-empty";
+          p.textContent = "服务端缺少二维码渲染依赖，请手工复制链接生成";
+          box.appendChild(p);
+        }
+        const ttlSec = Math.min(Number(data.expires_in || QR_COUNTDOWN_SEC) || QR_COUNTDOWN_SEC, QR_COUNTDOWN_SEC);
+        const deadline = Date.now() + ttlSec * 1000;
+        startCountdown("等待扫码…", deadline);
+        pollQr(data.session_id, deadline);
+      } catch (e) {
+        setQrStatus(e.message, "err");
+      }
+    }
+
+    $("btn-qr-start").onclick = () => startQr(true);
+
+    $("btn-cookie-save").onclick = async () => {
+      const cookie = $("cookie-input").value.trim();
+      if (!cookie) {
+        setMsg($("login-msg"), "请先粘贴 Cookie", "err");
+        return;
+      }
+      const btn = $("btn-cookie-save");
+      btn.disabled = true;
+      try {
+        const data = await api("/api/quark/cookie", {
+          method: "POST",
+          body: JSON.stringify({ cookie }),
+        });
+        const who = data.nickname ? "（" + data.nickname + "）" : "";
+        setMsg($("login-msg"), "Cookie 校验通过并已保存" + who, "ok");
+        $("cookie-input").value = "";
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("login-msg"), e.message, "err");
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    $("btn-cookie-test").onclick = async () => {
+      try {
+        const info = await api("/api/quark/cookie/test", { method: "POST", body: "{}" });
+        const who = info.nickname ? "（" + info.nickname + "）" : "";
+        setMsg($("login-msg"), (info.message || "") + who, info.ok ? "ok" : "err");
+      } catch (e) {
+        setMsg($("login-msg"), e.message, "err");
+      }
+    };
+
+    $("btn-save-config").onclick = async () => {
+      try {
+        await api("/api/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            quark: {
+              quark_cookie: $("quark_cookie").value,
+              save_to_dir: $("save_to_dir").value,
+              file_name_regex: $("file_name_regex").value,
+            },
+            aria2: {
+              aria2_host: $("aria2_host").value.trim(),
+              aria2_secret: $("aria2_secret").value,
+              aria2_download_dir: $("aria2_download_dir").value,
+              download_destination_dir: $("download_destination_dir").value,
+              aria2_queue_pause_threshold: Number($("aria2_queue_pause_threshold").value || 700),
+              aria2_queue_resume_threshold: Number($("aria2_queue_resume_threshold").value || 500),
+            },
+          }),
+        });
+        setMsg($("cfg-msg"), "配置已保存", "ok");
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    };
+
+    function renderRuntime(h) {
+      runtimeMode = (h && h.supervisor) || "unknown";
+      const info = $("runtime-info");
+      const auto = $("autostart-info");
+      const row = $("autostart-cmd-row");
+      if (runtimeMode === "systemd") {
+        info.textContent = `运行方式：systemd 托管（unit ${h.unit || "未知"}，Restart=${h.restart_policy || "未知"}）`;
+        if (h.autostart === true) auto.textContent = "开机自启：已开启（unit 已 enable）";
+        else if (h.autostart === false) auto.textContent = "开机自启：已关闭";
+        else auto.textContent = "开机自启：未知（unit 没有 [Install] 段或未安装到 systemd）";
+        if (h.unit) {
+          $("autostart-cmd").textContent = `sudo systemctl ${h.autostart === false ? "enable" : "disable"} ${h.unit}`;
+          row.hidden = false;
+        } else {
+          row.hidden = true;
+        }
+      } else if (runtimeMode === "pidfile") {
+        info.textContent = "运行方式：脚本启动（bin/start.sh，state/web.pid）";
+        auto.textContent = "开机自启：不适用（本机没有 systemd；需要自启请自行配置 launchd/cron）";
+        row.hidden = true;
+      } else {
+        info.textContent = "运行方式：未识别（可能是手动 uvicorn、容器或前台终端）";
+        auto.textContent = "开机自启：不适用";
+        row.hidden = true;
+      }
+    }
+
+    $("btn-copy-cmd").onclick = async () => {
+      const text = $("autostart-cmd").textContent || "";
+      try {
+        await navigator.clipboard.writeText(text);
+        setMsg($("cfg-msg"), "命令已复制：" + text, "ok");
+      } catch (e) {
+        setMsg($("cfg-msg"), "复制失败，请手动选中复制", "err");
+      }
+    };
+
+    $("btn-restart").onclick = async () => {
+      const tip = runtimeMode === "systemd"
+        ? "确认重启 Web 服务？当前由 systemd 托管：进程会退出，约 5 秒后由 systemd 自动拉起，期间下载会中断，页面请稍后刷新。"
+        : "确认重启 Web 服务？将停止 Web 及所有下载任务，页面将短暂不可用，请稍后刷新。";
+      if (!confirm(tip)) return;
+      const btn = $("btn-restart");
+      btn.disabled = true;
+      try {
+        await api("/api/web/restart", { method: "POST", body: "{}" });
+        setMsg($("cfg-msg"), "正在重启…请稍后刷新", "ok");
+      } catch (e) {
+        btn.disabled = false;
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    };
+
+    (async () => {
+      try {
+        fillConfig(await api("/api/config"));
+      } catch (e) {
+        setMsg($("cfg-msg"), e.message, "err");
+      }
+    })();
+
+    (async () => {
+      try {
+        const h = await api("/api/health");
+        if (h && h.version) $("app-ver").textContent = "v" + h.version;
+        renderRuntime(h);
+        if (h && h.pid) {
+          const bits = [`后端 ${h.version}`, `PID ${h.pid}`, `启动 ${h.started_at}`];
+          if (h.code_root) bits.push(h.code_root);
+          $("backend-info").textContent = bits.join(" · ");
+        }
+      } catch (e) { /* 版本信息只是辅助，拿不到就不显示 */ }
+    })();
+  </script>
+</body>
+</html>

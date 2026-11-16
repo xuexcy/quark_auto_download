@@ -1,0 +1,1966 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Quark Auto Download</title>
+  <style>
+    :root {
+      --bg: #0f1412;
+      --panel: #171e1b;
+      --panel-2: #1e2823;
+      --line: #2c3a33;
+      --text: #e7eee9;
+      --muted: #8fa196;
+      --accent: #3dba7a;
+      --accent-dim: #2a8f5c;
+      --danger: #d4534a;
+      --warn: #c9a227;
+      --radius: 10px;
+      --sidebar-w: 300px;
+      --topbar-h: 4rem;
+      --font: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      --mono: ui-monospace, "Sarasa Mono SC", "Cascadia Code", "Consolas", monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      color: var(--text);
+      background:
+        radial-gradient(1100px 520px at 8% -8%, #1a3328 0%, transparent 55%),
+        radial-gradient(800px 420px at 100% 0%, #1a2430 0%, transparent 50%),
+        var(--bg);
+    }
+    .app {
+      display: grid;
+      grid-template-columns: var(--sidebar-w) 1fr;
+      height: 100vh;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      height: 100%;
+      min-height: 0;
+      max-height: 100%;
+    }
+    .sidebar-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: .5rem; height: var(--topbar-h); min-height: var(--topbar-h);
+      padding: 0 1rem; border-bottom: 1px solid var(--line); box-sizing: border-box;
+    }
+    .sidebar-brand {
+      font-family: var(--mono); font-size: .65rem; letter-spacing: .06em; line-height: 1.2;
+      text-transform: uppercase; color: var(--accent); margin: 0;
+    }
+    .sidebar-title { margin: .15rem 0 0; font-size: 1.05rem; font-weight: 600; line-height: 1.25; }
+    .icon-btn {
+      width: 2.1rem; height: 2.1rem; padding: 0; border-radius: 8px;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 1.25rem; line-height: 1; font-weight: 600;
+    }
+    .sidebar-body { flex: 1; overflow: auto; padding: .65rem .7rem; }
+    .sidebar-foot {
+      padding: .75rem .9rem; border-top: 1px solid var(--line);
+      display: flex; gap: .5rem; flex-wrap: wrap;
+    }
+    .add-form {
+      margin: 0 .7rem .55rem; padding: .75rem;
+      border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+    }
+    .add-form.hidden { display: none; }
+    .add-form label { display: block; font-size: .72rem; color: var(--muted); margin: .45rem 0 .2rem; }
+    .add-form label:first-child { margin-top: 0; }
+    .add-form input {
+      width: 100%; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+      border-radius: 8px; padding: .5rem .6rem; font: 500 .82rem/1.35 var(--mono); outline: none;
+    }
+    .add-form input:focus { border-color: var(--accent-dim); }
+    .add-actions { display: flex; gap: .4rem; margin-top: .65rem; }
+    /* 分享目录树：先看目录结构，再勾选要下载的文件/文件夹 */
+    .tree-panel { margin-top: .5rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
+    .tree-panel.hidden { display: none; }
+    .tree-head {
+      display: flex; align-items: center; justify-content: space-between; gap: .4rem;
+      padding: .4rem .5rem; border-bottom: 1px solid var(--line);
+    }
+    .tree-head span { font-size: .72rem; color: var(--muted); }
+    .tree-head button { padding: .3rem .55rem; font-size: .72rem; }
+    .tree-body { max-height: 15rem; overflow: auto; padding: .25rem; }
+    .tree-row {
+      display: flex; align-items: center; gap: .35rem;
+      padding: .18rem .3rem .18rem calc(.3rem + var(--depth, 0) * .9rem);
+      border-radius: 6px; font-size: .8rem; font-family: var(--mono);
+    }
+    .tree-row:hover { background: color-mix(in srgb, var(--panel-2) 75%, transparent); }
+    .tree-row.is-dir { cursor: pointer; }
+    .tree-row.inherited { opacity: .55; }
+    .tree-caret {
+      flex: 0 0 auto; width: 1rem; height: 1rem; padding: 0; background: transparent;
+      color: var(--muted); font-size: .7rem; line-height: 1; border-radius: 4px; text-align: center;
+    }
+    .tree-row.is-dir .tree-caret:hover { color: var(--accent); }
+    .tree-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tree-size { flex: 0 0 auto; font-size: .7rem; color: var(--muted); }
+    .tree-check { flex: 0 0 auto; accent-color: var(--accent); }
+    .tree-hint { padding: .45rem .5rem; font-size: .74rem; color: var(--muted); }
+    .tree-hint.err { color: #ff8e86; }
+    /* 右侧「分享目录」面板 */
+    .job-tree { margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 0 auto; }
+    .job-tree[hidden] { display: none; }
+    .job-tree-head { display: flex; align-items: center; gap: .45rem; padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; }
+    .job-tree-caret { font-size: .72rem; color: var(--muted); width: .9rem; text-align: center; }
+    .job-tree-title { font-size: .84rem; font-weight: 600; white-space: nowrap; }
+    .job-tree-summary { font-size: .74rem; color: var(--muted); font-family: var(--mono); }
+    .job-tree-summary.on { color: var(--accent); }
+    .job-tree-spacer { flex: 1 1 auto; }
+    .job-tree-head button { padding: .3rem .6rem; font-size: .74rem; }
+    .job-tree .tree-body { max-height: min(18rem, 22vh); padding: .2rem .35rem .45rem; }
+    .job-tree.folded .tree-body { display: none; }
+    .job-tree .msg { margin: 0 .7rem .55rem; }
+    .tree-badge { flex: 0 0 auto; font-size: .68rem; line-height: 1.4; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+    .tree-badge.sel { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+    .tree-badge.done { color: #7fd6a2; border-color: color-mix(in srgb, #7fd6a2 40%, var(--line)); }
+    .tree-badge.busy { color: #ffcf6b; border-color: color-mix(in srgb, #ffcf6b 40%, var(--line)); }
+    .tree-badge.fail { color: #ff8e86; border-color: color-mix(in srgb, #ff8e86 40%, var(--line)); }
+.tree-badge.warn { color: #ffcf6b; border-color: color-mix(in srgb, #ffcf6b 45%, var(--line)); border-style: dashed; }
+    .tree-row.taken { opacity: .62; }
+    /* 框高 3.5rem；任务名字高/行高 2.8rem（80%），上下 padding 各 0.35rem（10%） */
+    .job-item {
+      width: 100%; text-align: left; border: 1px solid transparent; border-radius: 10px;
+      background: transparent; color: var(--text);
+      padding: .35rem .75rem; height: 3.5rem; min-height: 3.5rem; margin-bottom: .45rem;
+      box-sizing: border-box;
+      display: flex; align-items: center;
+      cursor: pointer; font: 500 .82rem/1.35 var(--font);
+    }
+    .job-item:hover { background: color-mix(in srgb, var(--panel-2) 80%, transparent); border-color: var(--line); }
+    .job-item.active {
+      background: color-mix(in srgb, var(--accent) 12%, var(--panel-2));
+      border-color: color-mix(in srgb, var(--accent) 40%, var(--line));
+    }
+    .job-item-row {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: .55rem; min-width: 0; width: 100%;
+      height: 2.8rem; min-height: 2.8rem;
+    }
+    .job-item-url {
+      flex: 1 1 auto; min-width: 0;
+      font-family: var(--mono); font-size: 2.8rem; font-weight: 600; color: var(--text);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      line-height: 2.8rem;
+    }
+    .job-item-meta {
+      flex: 0 1 auto; max-width: 55%; min-width: 0;
+      margin: 0; font-size: .95rem; color: var(--muted); font-family: var(--mono);
+      display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
+      gap: .08rem; overflow: hidden;
+    }
+    .job-item-meta .pill { flex-shrink: 0; font-size: .95rem; line-height: 1.2; }
+    .job-item-meta [data-role="item-progress"] {
+      min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: .88rem; line-height: 1.2; text-align: right;
+    }
+    .main {
+      display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden;
+    }
+    .main-bar {
+      display: flex; align-items: center; justify-content: space-between; gap: .75rem;
+      min-height: var(--topbar-h);
+      padding: .55rem 1.25rem; border-bottom: 1px solid var(--line); box-sizing: border-box;
+      background: color-mix(in srgb, var(--panel) 70%, transparent);
+    }
+    .main-bar-title {
+      display: flex; align-items: flex-start; gap: .55rem; min-width: 0; flex: 1;
+    }
+    .main-bar h1 {
+      margin: 0; font-size: 1.05rem; font-weight: 600; line-height: 1.35;
+      min-width: 0; overflow-wrap: anywhere; word-break: break-all;
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem;
+    }
+    .main-bar h1 .detail-title-name {
+      min-width: 0; cursor: text; border-radius: 4px;
+      border: 1px solid transparent; padding: .1rem .25rem; margin: -.1rem -.25rem;
+    }
+    .main-bar h1 .detail-title-name:hover {
+      border-color: var(--line); background: color-mix(in srgb, var(--panel-2) 70%, transparent);
+    }
+    .main-bar h1 .detail-title-name[hidden] { display: none; }
+    .main-bar h1 .detail-title-edit {
+      min-width: 8rem; max-width: min(28rem, 70vw); flex: 1 1 auto;
+      border: 1px solid var(--accent-dim); border-radius: 6px;
+      background: var(--bg); color: var(--text);
+      padding: .2rem .45rem; font: 600 1.05rem/1.35 var(--font); outline: none;
+    }
+    .main-bar h1 .detail-title-edit[hidden] { display: none; }
+    .main-bar h1 a.detail-share-url {
+      font-family: var(--mono); font-size: .82rem; font-weight: 500;
+      color: var(--accent); text-decoration: none; word-break: break-all;
+    }
+    .main-bar h1 a.detail-share-url:hover { text-decoration: underline; }
+    .main-bar h1 a.detail-share-url[hidden] { display: none; }
+    /* padding-top 与 .sidebar-body 一致，使详情首行与左侧首个 .job-item 顶边平齐；
+       底边无 padding，使日志框下沿与侧栏 foot（含设置）底边对齐 */
+    .main-body {
+      position: relative;
+      flex: 1; min-height: 0; display: flex; flex-direction: column;
+      padding: .65rem 1.25rem 0; overflow: auto;
+    }
+    /* 详情区无外层卡片框，仅保留内部 stats / log 等分区；列布局把剩余高度交给日志 */
+    .detail {
+      margin: 0; padding: 0; background: transparent; border: 0;
+      flex: 1; min-height: 0; display: flex; flex-direction: column;
+    }
+    .detail[hidden] { display: none; }
+    .empty-hint { flex-shrink: 0; }
+    /* 消息叠在日志上方，不占用高度、不把日志顶离侧栏底边 */
+    #jobs-msg {
+      flex: 0 0 auto; margin: 0; min-height: 0;
+      position: absolute; left: 1.25rem; right: 1.25rem; bottom: .35rem;
+      z-index: 2; pointer-events: none;
+    }
+    #jobs-msg:empty { display: none; }
+    button {
+      border: 0; border-radius: 8px; padding: .65rem 1rem; font: 600 .88rem/1 var(--font); cursor: pointer;
+    }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: var(--accent); color: #062214; }
+    .btn-danger { background: color-mix(in srgb, var(--danger) 88%, #000); color: #fff; }
+    .btn-warn { background: color-mix(in srgb, var(--warn) 85%, #000); color: #1a1400; }
+    .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+    a.btn-ghost {
+      display: inline-flex; align-items: center; text-decoration: none;
+      border: 1px solid var(--line); border-radius: 8px; padding: .55rem .9rem;
+      font: 600 .82rem/1 var(--font); color: var(--text);
+    }
+    a.btn-ghost:hover { border-color: var(--accent-dim); color: var(--accent); }
+    .msg { margin-top: .55rem; min-height: 1.1rem; font-size: .82rem; color: var(--muted); }
+    .msg.ok { color: var(--accent); }
+    .msg.err { color: #ff8e86; }
+    .empty-hint { color: var(--muted); font-size: .9rem; padding: 2rem 0; text-align: center; }
+    .job-actions { display: flex; flex-wrap: wrap; gap: .45rem; margin: 0 0 .25rem; align-items: center; }
+    /* 开始 / 暂停 / 删除：统一尺寸与字号；delete 的 margin-left:auto 仅推到右侧 */
+    .job-action-btn {
+      box-sizing: border-box;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: .65rem 1rem;
+      min-width: 5.75rem;
+      min-height: 2.4rem;
+      font-size: .88rem;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+    .job-actions [data-act="delete"] { margin-left: auto; }
+    .job-meta { margin-top: .55rem; font-size: .78rem; color: var(--muted); font-family: var(--mono); }
+    .pill { display: inline-flex; align-items: center; gap: .35rem; font-family: var(--mono); font-size: .8rem; }
+    .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); }
+    .dot.on { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+    .dot.pause { background: var(--warn); }
+    .dot.off { background: var(--danger); }
+    .dot.done { background: var(--accent); }
+    .dot.fail { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent); }
+    .stats {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; margin: .75rem 0;
+      flex-shrink: 0;
+    }
+    .job-actions, .job-meta { flex-shrink: 0; }
+    .stat {
+      border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+      padding: .7rem .8rem;
+    }
+    .stat-label { font-size: .72rem; color: var(--muted); margin: 0 0 .35rem; }
+    .stat-value { font-family: var(--mono); font-size: .95rem; font-weight: 600; margin: 0; word-break: break-all; }
+    .stat-pct { color: var(--muted); font-weight: 500; }
+    /* 始终展开的日志面板（不用 details：浏览器对 details+flex 高度约束不可靠，
+       会导致 pre 随内容撑高、父级 height:auto，从而无法 overflow 滚动且底边对不齐） */
+    .job-log {
+      margin-top: .5rem;
+      border-top: 1px dashed var(--line);
+      padding-top: .5rem;
+      /* 吃掉 detail 剩余高度，下沿贴齐视口底（与侧栏 .sidebar-foot 底边对齐）；
+         保底 10rem，避免被上方目录树/进度面板挤成 0 高度而「看不到日志」 */
+      flex: 1 1 auto;
+      min-height: 10rem;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .job-log-head {
+      display: flex; align-items: center; gap: .5rem;
+      font-size: .82rem; color: var(--accent); font-family: var(--mono);
+      flex-shrink: 0; min-width: 0; margin-bottom: .35rem;
+    }
+    .job-log-title { flex: 0 0 auto; white-space: nowrap; }
+    .job-log-path {
+      flex: 1 1 auto; min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: .72rem; color: var(--muted);
+    }
+    .job-log-head button { flex: 0 0 auto; padding: .35rem .65rem; font-size: .78rem; }
+    /* 高度由 flex 链限制；overflow:auto 使滚轮在框内滚动 */
+    pre.log {
+      margin: 0; flex: 1 1 0; min-height: 0; height: 0;
+      overflow: auto; overscroll-behavior: contain;
+      background: #0b100e; border: 1px solid var(--line);
+      border-radius: 8px; padding: .75rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
+    }
+    /* 单文件进度：只吃内容高度（最多 32vh / 18rem），剩余高度仍留给日志 */
+    .job-files {
+      flex: 0 0 auto; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
+      display: flex; flex-direction: column; min-height: 0; max-height: min(30vh, 16rem);
+    }
+    .job-files[hidden] { display: none; }
+    .job-files-head {
+      display: flex; align-items: center; gap: .5rem; flex-shrink: 0; margin-bottom: .3rem;
+      font-size: .82rem; color: var(--accent); font-family: var(--mono);
+    }
+    .job-files-title { flex: 0 0 auto; white-space: nowrap; }
+    .job-files-summary {
+      flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: .72rem; color: var(--muted);
+    }
+    .job-files-filter {
+      flex: 0 0 auto; width: 8rem; border: 1px solid var(--line); background: var(--bg); color: var(--text);
+      border-radius: 6px; padding: .22rem .45rem; font: .72rem/1.2 var(--mono); outline: none;
+    }
+    .job-files-filter:focus { border-color: var(--accent-dim); }
+    .file-list { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+    .file-row { padding: .3rem .1rem; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+    .file-row:last-child { border-bottom: 0; }
+    .file-row-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; }
+    .file-row-name {
+      flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font: .78rem/1.4 var(--mono);
+    }
+    .file-row-meta { flex: 0 0 auto; font: .72rem/1.4 var(--mono); color: var(--muted); white-space: nowrap; }
+    .file-row-del {
+      flex: 0 0 auto; align-self: center;
+      border: 1px solid var(--line); background: transparent; color: var(--muted);
+      border-radius: 6px; padding: 0 .35rem; font: .72rem/1.4 var(--mono); cursor: pointer;
+    }
+    .file-row-del:hover {
+      color: var(--danger);
+      border-color: color-mix(in srgb, var(--danger) 55%, var(--line));
+    }
+    .file-bar { height: .28rem; margin-top: .2rem; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+    .file-bar > i { display: block; height: 100%; width: 0; background: var(--accent-dim); transition: width .3s ease; }
+    .file-row[data-state="downloading"] .file-bar > i { background: var(--accent); }
+    .file-row[data-state="done"] .file-bar > i,
+    .file-row[data-state="cleanup"] .file-bar > i { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+    .file-row[data-state="failed"] .file-bar > i { background: var(--danger); }
+    .file-row[data-state="failed"] .file-row-meta { color: #ff8e86; }
+    .file-row[data-state="done"] .file-row-name,
+    .file-row[data-state="cleanup"] .file-row-name { color: var(--muted); }
+    .pause-menu {
+      position: fixed; background: #121a16; border: 1px solid var(--line);
+      border-radius: 8px; padding: .35rem; min-width: 220px; z-index: 50;
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
+    }
+    .pause-menu button { display: block; width: 100%; text-align: left; margin: .2rem 0; }
+    .pause-wrap { position: relative; z-index: 6; }
+    .menu-btn { display: none; }
+    .backdrop { display: none; }
+    @media (max-width: 820px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar {
+        position: fixed; inset: 0 auto 0 0; width: min(var(--sidebar-w), 88vw); z-index: 20;
+        transform: translateX(-105%); transition: transform .2s ease;
+        box-shadow: 8px 0 28px rgba(0,0,0,.35);
+      }
+      .sidebar.open { transform: translateX(0); }
+      .backdrop {
+        display: block; position: fixed; inset: 0; background: rgba(0,0,0,.45);
+        z-index: 15; opacity: 0; pointer-events: none; transition: opacity .2s ease;
+      }
+      .backdrop.show { opacity: 1; pointer-events: auto; }
+      .menu-btn { display: inline-flex; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .app { height: 100dvh; min-height: 100dvh; }
+      .main-body { overflow: auto; }
+      /* 窄屏时整块日志保底 14rem（原先只给 pre 设 12rem，会把外层 .job-log 撑破） */
+      .job-log { min-height: 14rem; }
+    }
+    .app-ver {
+      display: inline-block; margin-left: .35rem; padding: .02rem .38rem;
+      border: 1px solid var(--line); border-radius: 999px;
+      font-size: .64rem; letter-spacing: .02em; color: var(--muted);
+      vertical-align: middle; text-transform: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="backdrop" id="backdrop"></div>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <div>
+          <p class="sidebar-brand">Quark Auto Download <span class="app-ver" id="app-ver" title="Web 版本"></span></p>
+          <p class="sidebar-title">任务</p>
+        </div>
+        <button class="btn-primary icon-btn" id="btn-toggle-add" type="button" title="新增任务">+</button>
+      </div>
+      <div class="add-form hidden" id="add-form">
+        <label for="new_name">任务名（必填）</label>
+        <input id="new_name" placeholder="必填，不可与已有任务重名" />
+        <label for="new_url">分享链接（必填）</label>
+        <input id="new_url" placeholder="https://pan.quark.cn/s/xxxx" />
+        <label for="new_pwd">提取码（可选）</label>
+        <input id="new_pwd" placeholder="可选" />
+        <div class="add-actions">
+          <button class="btn-primary" id="btn-add" type="button">新增</button>
+          <button class="btn-ghost" id="btn-cancel-add" type="button">取消</button>
+        </div>
+        <div class="msg" id="add-msg"></div>
+      </div>
+      <div class="sidebar-body" id="job-list"></div>
+      <div class="sidebar-foot">
+        <button class="btn-ghost" id="btn-refresh" type="button">刷新</button>
+        <a class="btn-ghost" href="/settings">设置</a>
+      </div>
+    </aside>
+
+    <div class="main">
+      <div class="main-bar">
+        <div class="main-bar-title">
+          <button class="btn-ghost icon-btn menu-btn" id="btn-menu" type="button" title="任务列表">☰</button>
+          <h1 id="detail-title">
+            <span class="detail-title-name" id="detail-title-name" title="点击重命名">任务详情</span>
+            <input class="detail-title-edit" id="detail-title-edit" type="text" hidden maxlength="120" aria-label="任务名" />
+            <a class="detail-share-url" id="detail-title-url" hidden target="_blank" rel="noopener noreferrer"></a>
+          </h1>
+        </div>
+      </div>
+      <div class="main-body">
+        <div id="detail-empty" class="empty-hint">在左侧选择或新增任务</div>
+        <div id="detail" class="detail" hidden>
+          <div class="job-actions">
+            <button class="btn-primary job-action-btn" data-act="start" type="button">开始</button>
+            <span class="pause-wrap" data-role="pause-wrap">
+              <button class="btn-warn job-action-btn" data-act="pause-menu" type="button">暂停 ▾</button>
+            </span>
+            <button class="btn-danger job-action-btn" data-act="delete" type="button">删除</button>
+          </div>
+          <div class="job-meta" data-role="meta"></div>
+          <div class="stats" data-role="stats"></div>
+          <div class="job-tree" data-role="tree-panel" hidden>
+            <div class="job-tree-head" data-role="tree-toggle">
+              <span class="job-tree-caret" data-role="tree-caret">▾</span>
+              <span class="job-tree-title">分享目录</span>
+              <span class="job-tree-summary" data-role="tree-summary">不勾选 = 下载整个分享目录</span>
+              <span class="job-tree-spacer"></span>
+              <button class="btn-ghost" data-act="tree-reload" type="button">刷新</button>
+              <button class="btn-ghost" data-act="tree-clear" type="button">清空勾选</button>
+              <button class="btn-primary" data-act="tree-download" type="button">下载所选</button>
+            </div>
+            <div class="tree-body" data-role="tree-body"></div>
+            <div class="msg" data-role="tree-msg"></div>
+          </div>
+          <div class="job-files" data-role="files-panel">
+            <div class="job-files-head">
+              <span class="job-files-title">文件进度</span>
+              <span class="job-files-summary" data-role="files-summary"></span>
+              <input class="job-files-filter" data-role="files-filter" type="text" placeholder="过滤文件" aria-label="过滤文件" />
+            </div>
+            <div class="file-list" data-role="files"></div>
+          </div>
+          <div class="job-log" data-role="log-panel">
+            <div class="job-log-head">
+              <span class="job-log-title">任务日志</span>
+              <span class="job-log-path" data-role="log-path"></span>
+              <button class="btn-ghost" data-act="refresh-log" type="button">刷新日志</button>
+            </div>
+            <pre class="log" data-role="log">加载中…</pre>
+          </div>
+        </div>
+        <div class="msg" id="jobs-msg"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let openPauseMenu = false;
+    let selectedId = null;
+    let renaming = false;
+    /** @type {Map<string, object>} */
+    const jobCache = new Map();
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, {
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+        ...options,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail || res.statusText;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+      }
+      return data;
+    }
+
+    function setMsg(el, text, kind = "") {
+      el.textContent = text || "";
+      el.className = "msg" + (kind ? " " + kind : "");
+    }
+
+    function statusView(job) {
+      // 以进程存活为准，不单信 status 字符串（避免 stop 后假「运行中」）
+      if (job.running || job.pid) {
+        if (job.status === "soft_pausing") return { text: "软暂停中", cls: "pause" };
+        return { text: "运行中", cls: "on" };
+      }
+      // 进程已退出时，终态（完成/有失败）要能看出来，否则和「已暂停」混在一起
+      const status = String(job.status || "");
+      if (status === "done") return { text: "已完成", cls: "done" };
+      if (status === "failed") return { text: "有失败", cls: "fail" };
+      return { text: "已暂停", cls: "off" };
+    }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function isHttpUrl(url) {
+      try {
+        const u = new URL(String(url || "").trim());
+        return u.protocol === "http:" || u.protocol === "https:";
+      } catch {
+        return false;
+      }
+    }
+
+    function isJobRunning(job) {
+      return !!(job && (job.running || job.pid));
+    }
+
+    function formatSize(bytes) {
+      const n = Math.max(Number(bytes) || 0, 0);
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) {
+        const v = n / 1024;
+        return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")} KB`;
+      }
+      if (n < 1024 * 1024 * 1024) {
+        const v = n / (1024 * 1024);
+        return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")} MB`;
+      }
+      const v = n / (1024 * 1024 * 1024);
+      return `${v.toFixed(v >= 10 ? 1 : 2).replace(/\.0$/, "")} GB`;
+    }
+
+    function jobStats(job) {
+      const s = job.stats || {};
+      const total_files = Number(s.total_files ?? job.total_files ?? 0) || 0;
+      const done_files = Number(s.done_files ?? job.done_files ?? 0) || 0;
+      const total_size = Number(s.total_size ?? job.total_size ?? 0) || 0;
+      const existing_or_done_size =
+        Number(s.existing_or_done_size ?? job.existing_or_done_size ?? 0) || 0;
+
+      let filesPct =
+        s.existing_or_done_files_percent ?? job.existing_or_done_files_percent;
+      if (filesPct == null || filesPct === "") {
+        filesPct = total_files > 0 ? (100 * done_files) / total_files : null;
+      } else {
+        filesPct = Number(filesPct);
+        if (!Number.isFinite(filesPct)) filesPct = null;
+      }
+
+      let sizePct = s.existing_or_done_percent ?? job.existing_or_done_percent;
+      if (sizePct == null || sizePct === "") {
+        sizePct = total_size > 0 ? (100 * existing_or_done_size) / total_size : null;
+      } else {
+        sizePct = Number(sizePct);
+        if (!Number.isFinite(sizePct)) sizePct = null;
+      }
+
+      return {
+        total_files,
+        total_size,
+        done_files,
+        existing_or_done_size,
+        existing_or_done_files_percent: filesPct,
+        existing_or_done_percent: sizePct,
+      };
+    }
+
+    function formatExistingPercent(pct) {
+      if (pct == null || !Number.isFinite(pct)) return "—";
+      const v = Math.round(pct * 10) / 10;
+      return `${Number.isInteger(v) ? v : v.toFixed(1)}%`;
+    }
+
+    function formatFilesProgress(done, total, pct) {
+      return `${done} / ${total} (${formatExistingPercent(pct)})`;
+    }
+
+    function formatSidebarFilesProgress(done, total, pct) {
+      const t = Number(total) || 0;
+      if (t <= 0) return "—";
+      return `${Number(done) || 0}/${t} (${formatExistingPercent(pct)})`;
+    }
+
+    function positionPauseMenu(menu, anchorBtn) {
+      if (!menu || !anchorBtn) return;
+      const r = anchorBtn.getBoundingClientRect();
+      const mw = Math.max(menu.offsetWidth || 0, 220);
+      const mh = menu.offsetHeight || 0;
+      let left = r.right - mw;
+      let top = r.bottom + 4;
+      left = Math.max(8, Math.min(left, window.innerWidth - mw - 8));
+      if (mh && top + mh > window.innerHeight - 8) {
+        top = Math.max(8, r.top - mh - 4);
+      }
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+      menu.style.right = "auto";
+    }
+
+    function formatSizeProgress(existing, total, pct) {
+      return `${formatSize(existing)} / ${formatSize(total)} (${formatExistingPercent(pct)})`;
+    }
+
+    function jobDisplayName(job) {
+      const name = String(job?.name || "").trim();
+      if (name) return name;
+      return String(job?.id || "").trim() || "(未命名)";
+    }
+
+    function setSidebarOpen(open) {
+      $("sidebar").classList.toggle("open", open);
+      $("backdrop").classList.toggle("show", open);
+    }
+
+    function buildPauseMenu() {
+      return `
+        <div class="pause-menu">
+          <button class="btn-ghost" data-act="pause-soft" type="button">软暂停：保留下载中，清排队</button>
+          <button class="btn-danger" data-act="pause-hard" type="button">硬暂停：暂停下载中+排队（可恢复）</button>
+        </div>`;
+    }
+
+    function createListItem(job) {
+      const st = statusView(job);
+      const el = document.createElement("button");
+      el.type = "button";
+      el.className = "job-item" + (selectedId === job.id ? " active" : "");
+      el.dataset.id = job.id;
+      el.innerHTML = `
+        <div class="job-item-row">
+          <div class="job-item-url" data-role="item-url">${escapeHtml(jobDisplayName(job))}</div>
+          <div class="job-item-meta" data-role="item-meta">
+            <span class="pill"><span class="dot ${st.cls}"></span>${st.text}</span>
+            <span data-role="item-progress"></span>
+          </div>
+        </div>`;
+      patchListItem(el, job);
+      return el;
+    }
+
+    function patchListItem(el, job) {
+      const st = statusView(job);
+      const stats = jobStats(job);
+      el.classList.toggle("active", selectedId === job.id);
+      const urlEl = el.querySelector('[data-role="item-url"]');
+      const nextTitle = jobDisplayName(job);
+      if (urlEl && urlEl.textContent !== nextTitle) urlEl.textContent = nextTitle;
+      const meta = el.querySelector('[data-role="item-meta"]');
+      if (meta) {
+        meta.innerHTML =
+          `<span class="pill"><span class="dot ${st.cls}"></span>${st.text}</span>` +
+          `<span data-role="item-progress">${escapeHtml(formatSidebarFilesProgress(stats.done_files, stats.total_files, stats.existing_or_done_files_percent))}</span>`;
+      }
+    }
+
+    function statsHtml(job) {
+      const s = jobStats(job);
+      return `
+        <div class="stat">
+          <p class="stat-label">已有文件数 / 总文件数</p>
+          <p class="stat-value">${escapeHtml(formatFilesProgress(s.done_files, s.total_files, s.existing_or_done_files_percent))}</p>
+        </div>
+        <div class="stat">
+          <p class="stat-label">已有文件大小 / 总文件大小</p>
+          <p class="stat-value">${escapeHtml(formatSizeProgress(s.existing_or_done_size, s.total_size, s.existing_or_done_percent))}</p>
+        </div>`;
+    }
+
+    function metaHtml(job) {
+      const st = statusView(job);
+      const msg = String(job.message || "").trim();
+      // 启动类文案与 status pill / pid 重复，不展示
+      const hideMsg = !msg || /^(运行中|已开始|已启动(\s*PID[=＝]\S*)?)$/i.test(msg);
+      let html =
+        `<span class="pill"><span class="dot ${st.cls}"></span>${st.text}</span>` +
+        ` · id=${escapeHtml(job.id)}`;
+      if (job.pid) html += ` · pid=${job.pid}`;
+      // 勾选下载：只下用户选中的文件/文件夹
+      const selection = job.selection || {};
+      const selFiles = Array.isArray(selection.file_fids) ? selection.file_fids.length : 0;
+      const selDirs = Array.isArray(selection.dir_fids) ? selection.dir_fids.length : 0;
+      if (selFiles || selDirs) html += ` · 仅下载勾选：${selFiles} 文件 / ${selDirs} 文件夹`;
+      if (!hideMsg) html += ` · ${escapeHtml(msg)}`;
+      return html;
+    }
+
+    function setDetailTitle(job) {
+      const nameEl = $("detail-title-name");
+      const editEl = $("detail-title-edit");
+      const urlEl = $("detail-title-url");
+      if (renaming) return;
+      if (!job) {
+        nameEl.hidden = false;
+        nameEl.textContent = "任务详情";
+        nameEl.title = "";
+        nameEl.style.cursor = "default";
+        editEl.hidden = true;
+        urlEl.hidden = true;
+        urlEl.removeAttribute("href");
+        urlEl.textContent = "";
+        return;
+      }
+      nameEl.hidden = false;
+      nameEl.textContent = jobDisplayName(job);
+      nameEl.title = "点击重命名";
+      nameEl.style.cursor = "text";
+      editEl.hidden = true;
+      const raw = String(job.share_url || "").trim();
+      if (raw && isHttpUrl(raw)) {
+        urlEl.hidden = false;
+        urlEl.href = raw;
+        urlEl.textContent = raw;
+      } else {
+        urlEl.hidden = true;
+        urlEl.removeAttribute("href");
+        urlEl.textContent = "";
+      }
+    }
+
+    function beginRename() {
+      if (!selectedId || renaming) return;
+      const job = jobCache.get(selectedId);
+      if (!job) return;
+      renaming = true;
+      const nameEl = $("detail-title-name");
+      const editEl = $("detail-title-edit");
+      nameEl.hidden = true;
+      editEl.hidden = false;
+      editEl.value = jobDisplayName(job);
+      editEl.focus();
+      editEl.select();
+    }
+
+    async function commitRename({ cancel = false } = {}) {
+      if (!renaming) return;
+      const editEl = $("detail-title-edit");
+      const id = selectedId;
+      const job = id ? jobCache.get(id) : null;
+      const prev = job ? jobDisplayName(job) : "";
+      const next = editEl.value.trim();
+      renaming = false;
+      editEl.hidden = true;
+      $("detail-title-name").hidden = false;
+      if (cancel || !id || !job) {
+        setDetailTitle(job || null);
+        return;
+      }
+      if (!next) {
+        setMsg($("jobs-msg"), "任务名不能为空", "err");
+        setDetailTitle(job);
+        return;
+      }
+      if (next === prev) {
+        setDetailTitle(job);
+        return;
+      }
+      try {
+        await api(`/api/jobs/${id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ name: next }),
+        });
+        setMsg($("jobs-msg"), "已重命名", "ok");
+        await refreshJobs({ silentLog: true });
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+        setDetailTitle(jobCache.get(id) || job);
+      }
+    }
+
+    function patchDetail(job) {
+      const box = $("detail");
+      const empty = $("detail-empty");
+      if (!job) {
+        box.hidden = true;
+        empty.hidden = false;
+        setDetailTitle(null);
+        resetFileState(null);
+        treeEnsureForJob(null);
+        return;
+      }
+      empty.hidden = true;
+      box.hidden = false;
+      setDetailTitle(job);
+
+      const running = isJobRunning(job);
+      const startBtn = box.querySelector('button[data-act="start"]');
+      const pauseBtn = box.querySelector('button[data-act="pause-menu"]');
+      if (startBtn) startBtn.disabled = running;
+      if (pauseBtn) pauseBtn.disabled = !running;
+
+      const pauseWrap = box.querySelector('[data-role="pause-wrap"]');
+      if (pauseWrap) {
+        const hasMenu = !!pauseWrap.querySelector(".pause-menu");
+        if (openPauseMenu && !hasMenu) {
+          pauseWrap.insertAdjacentHTML("beforeend", buildPauseMenu());
+          const menu = pauseWrap.querySelector(".pause-menu");
+          const anchor = pauseWrap.querySelector('button[data-act="pause-menu"]');
+          positionPauseMenu(menu, anchor);
+        } else if (openPauseMenu && hasMenu) {
+          positionPauseMenu(
+            pauseWrap.querySelector(".pause-menu"),
+            pauseWrap.querySelector('button[data-act="pause-menu"]')
+          );
+        } else if (!openPauseMenu && hasMenu) {
+          pauseWrap.querySelector(".pause-menu")?.remove();
+        }
+      }
+
+      const metaEl = box.querySelector('[data-role="meta"]');
+      const nextMeta = metaHtml(job);
+      if (metaEl && metaEl.innerHTML !== nextMeta) metaEl.innerHTML = nextMeta;
+
+      const statsEl = box.querySelector('[data-role="stats"]');
+      const nextStats = statsHtml(job);
+      if (statsEl && statsEl.innerHTML !== nextStats) statsEl.innerHTML = nextStats;
+
+      // 右侧「分享目录」面板：换任务时重挂，同一任务只更新头部状态
+      treeEnsureForJob(job);
+      treeSyncHeader(job);
+
+      const pathEl = box.querySelector('[data-role="log-path"]');
+      if (pathEl && job.log_path && pathEl.textContent !== job.log_path) {
+        pathEl.textContent = job.log_path;
+      }
+    }
+
+    // 记录日志框当前显示的是「哪个任务的哪种状态」，避免 5s 轮询每次都拉 250 行
+    const logState = { id: null, status: null };
+
+    function jobIsActive(job) {
+      return !!job && (job.running || job.pid);
+    }
+
+    async function refreshLogIfNeeded({ scrollBottom = false } = {}) {
+      if (!selectedId) return;
+      const job = jobCache.get(selectedId) || null;
+      const status = String((job && job.status) || "");
+      // 只有「换了任务 / 状态变了 / 还在跑」才值得再拉一次日志
+      if (logState.id === selectedId && logState.status === status && !jobIsActive(job)) return;
+      await fillJobLog({ scrollBottom });
+    }
+
+    async function fillJobLog({ scrollBottom = false } = {}) {
+      if (!selectedId) return;
+      logState.id = selectedId;
+      logState.status = String(((jobCache.get(selectedId) || {}).status) || "");
+      const pre = $("detail").querySelector('[data-role="log"]');
+      const pathEl = $("detail").querySelector('[data-role="log-path"]');
+      if (!pre) return;
+      const prevScroll = pre.scrollTop;
+      const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
+      try {
+        const data = await api(`/api/jobs/${selectedId}/logs?lines=250`);
+        if (pathEl) pathEl.textContent = data.path || "";
+        const next = data.content || "(暂无日志)";
+        if (pre.textContent !== next) {
+          pre.textContent = next;
+          if (scrollBottom || nearBottom) pre.scrollTop = pre.scrollHeight;
+          else pre.scrollTop = prevScroll;
+        }
+      } catch (e) {
+        pre.textContent = `读取日志失败: ${e.message}`;
+      }
+    }
+
+    // ---- 单文件下载进度（/api/jobs/{id}/files 轮询渲染） ----
+    const FILE_STATE_LABELS = {
+      pending: "等待转存",
+      transfer_retry: "转存重试",
+      transferring: "转存中",
+      ready: "待下载",
+      retry: "重试中",
+      downloading: "下载中",
+      cleanup: "待清理",
+      done: "已完成",
+      failed: "失败",
+    };
+    const FILE_RENDER_LIMIT = 400; // 超大任务只渲染前 N 行，用过滤框缩小范围
+    const fileState = { id: null, files: [], filter: "", sig: "", loaded: false, lastActive: null, rows: new Map() };
+
+    function fileSignature(data) {
+      const files = Array.isArray(data.files) ? data.files : [];
+      let downloaded = 0;
+      for (const f of files) downloaded += Number(f.downloaded) || 0;
+      return `${files.length}:${data.updated_at || ""}:${downloaded}`;
+    }
+
+    function formatSpeed(bytesPerSec) {
+      const v = Number(bytesPerSec) || 0;
+      return v > 0 ? `${formatSize(v)}/s` : "";
+    }
+
+    function fileMetaText(file) {
+      const label = FILE_STATE_LABELS[file.state] || file.state || "未知";
+      const total = Number(file.total) || Number(file.size) || 0;
+      const done = Number(file.downloaded) || 0;
+      const pct = Number(file.progress) || 0;
+      if (file.state === "done" || file.state === "cleanup") {
+        return `${label} · ${formatSize(total || done)}`;
+      }
+      if (file.state === "downloading") {
+        const speed = formatSpeed(file.speed);
+        const pctText = total > 0 ? `${pct.toFixed(1)}%` : "—";
+        return `${label} · ${pctText} · ${formatSize(done)}/${formatSize(total)}${speed ? " · " + speed : ""}`;
+      }
+      if (file.state === "failed") {
+        return `${label} · ${file.note || "见任务日志"}`;
+      }
+      return `${label} · ${formatSize(total)}`;
+    }
+
+    function fileRowFor(key, file) {
+      let row = fileState.rows.get(key);
+      if (!row) {
+        row = document.createElement("div");
+        row.className = "file-row";
+        const head = document.createElement("div");
+        head.className = "file-row-head";
+        const name = document.createElement("span");
+        name.className = "file-row-name";
+        const meta = document.createElement("span");
+        meta.className = "file-row-meta";
+        const del = document.createElement("button");
+        del.type = "button";
+        del.className = "file-row-del";
+        del.dataset.role = "file-del";
+        del.textContent = "✕";
+        del.title = "从任务里删除这个文件（删除后可重新勾选）";
+        head.append(name, meta, del);
+        const bar = document.createElement("div");
+        bar.className = "file-bar";
+        bar.appendChild(document.createElement("i"));
+        row.append(head, bar);
+        fileState.rows.set(key, row);
+      }
+      const path = String(file.path || "(未知)");
+      row.dataset.fid = String(file.fid || "");
+      row.dataset.path = path;
+      const nameEl = row.querySelector(".file-row-name");
+      const metaEl = row.querySelector(".file-row-meta");
+      const barEl = row.querySelector(".file-bar > i");
+      if (nameEl.textContent !== path) nameEl.textContent = path;
+      if (row.title !== path) row.title = path;
+      const meta = fileMetaText(file);
+      if (metaEl.textContent !== meta) metaEl.textContent = meta;
+      const pct = Math.max(0, Math.min(100, Number(file.progress) || 0));
+      const width = `${pct}%`;
+      if (barEl.style.width !== width) barEl.style.width = width;
+      const state = String(file.state || "");
+      if (row.dataset.state !== state) row.dataset.state = state;
+      return row;
+    }
+
+    function renderFileList() {
+      const panel = $("detail").querySelector('[data-role="files-panel"]');
+      const box = $("detail").querySelector('[data-role="files"]');
+      const summaryEl = $("detail").querySelector('[data-role="files-summary"]');
+      if (!panel || !box || !summaryEl) return;
+      if (!selectedId) {
+        panel.hidden = true;
+        return;
+      }
+      const files = fileState.files;
+      panel.hidden = files.length === 0;
+
+      const keyword = fileState.filter.trim().toLowerCase();
+      const matched = keyword
+        ? files.filter((f) => String(f.path || "").toLowerCase().includes(keyword))
+        : files;
+      const shown = matched.slice(0, FILE_RENDER_LIMIT);
+
+      const keep = new Set(shown.map((f) => String(f.path || "")));
+      for (const [key, row] of [...fileState.rows]) {
+        if (!keep.has(key)) {
+          row.remove();
+          fileState.rows.delete(key);
+        }
+      }
+      let ref = box.firstChild;
+      for (const file of shown) {
+        const row = fileRowFor(String(file.path || ""), file);
+        if (row !== ref) box.insertBefore(row, ref);
+        else ref = ref.nextSibling;
+      }
+
+      let done = 0, running = 0, failed = 0;
+      for (const f of files) {
+        if (f.state === "done" || f.state === "cleanup") done += 1;
+        else if (f.state === "failed") failed += 1;
+        else if (f.state !== "pending" && f.state !== "transfer_retry") running += 1;
+      }
+      let text = `完成 ${done}/${files.length}`;
+      if (running) text += ` · 进行中 ${running}`;
+      if (failed) text += ` · 失败 ${failed}`;
+      if (keyword && matched.length !== files.length) text += ` · 匹配 ${matched.length}`;
+      if (matched.length > shown.length) text += ` · 仅显示前 ${FILE_RENDER_LIMIT}（可过滤）`;
+      if (summaryEl.textContent !== text) summaryEl.textContent = text;
+    }
+
+    function resetFileState(jobId) {
+      const nextId = jobId || null;
+      if (fileState.id !== nextId) {
+        // 切换任务时清掉过滤词，否则新任务的列表可能被上一轮的过滤条件筛空
+        fileState.filter = "";
+        const filterEl = $("detail").querySelector('[data-role="files-filter"]');
+        if (filterEl) filterEl.value = "";
+      }
+      fileState.id = nextId;
+      fileState.files = [];
+      fileState.sig = "";
+      fileState.loaded = false;
+      fileState.lastActive = null;
+      for (const row of fileState.rows.values()) row.remove();
+      fileState.rows.clear();
+      const box = $("detail").querySelector('[data-role="files"]');
+      if (box) box.textContent = "";
+      const summaryEl = $("detail").querySelector('[data-role="files-summary"]');
+      if (summaryEl) summaryEl.textContent = "";
+      const panel = $("detail").querySelector('[data-role="files-panel"]');
+      if (panel) panel.hidden = !jobId;
+    }
+
+    async function fillJobFiles() {
+      if (!selectedId) return;
+      const jobId = selectedId;
+      try {
+        const data = await api(`/api/jobs/${jobId}/files?limit=2000`);
+        if (selectedId !== jobId) return; // 期间切换了任务
+        const sig = fileSignature(data);
+        fileState.loaded = true;
+        if (sig === fileState.sig) return; // 状态没变，不重排 DOM
+        fileState.sig = sig;
+        fileState.files = Array.isArray(data.files) ? data.files : [];
+        renderFileList();
+      } catch (e) {
+        if (selectedId !== jobId) return;
+        fileState.loaded = true;
+        fileState.files = [];
+        renderFileList();
+      }
+    }
+
+    function refreshFilesIfNeeded() {
+      if (!selectedId) {
+        resetFileState(null);
+        return Promise.resolve();
+      }
+      if (fileState.id !== selectedId) resetFileState(selectedId);
+      const job = jobCache.get(selectedId) || null;
+      const active = jobIsActive(job);
+      // 非运行态的状态文件不会再变：只有首次 / 刚转成非运行态时才补一次
+      if (!active && fileState.loaded && fileState.lastActive === active) return Promise.resolve();
+      fileState.lastActive = active;
+      return fillJobFiles();
+    }
+
+    function selectJob(id, { closeSidebar = true } = {}) {
+      if (renaming && id !== selectedId) {
+        // 切换任务时放弃未提交的编辑
+        renaming = false;
+        $("detail-title-edit").hidden = true;
+        $("detail-title-name").hidden = false;
+      }
+      selectedId = id || null;
+      openPauseMenu = false;
+      resetFileState(selectedId);
+      for (const el of $("job-list").querySelectorAll(".job-item")) {
+        el.classList.toggle("active", el.dataset.id === selectedId);
+      }
+      const job = selectedId ? jobCache.get(selectedId) : null;
+      patchDetail(job || null);
+      if (closeSidebar && window.matchMedia("(max-width: 820px)").matches) {
+        setSidebarOpen(false);
+      }
+      if (selectedId) {
+        fillJobLog({ scrollBottom: true });
+        fileState.lastActive = jobIsActive(jobCache.get(selectedId) || null);
+        fillJobFiles();
+      }
+    }
+
+    function syncJobs(jobs) {
+      const box = $("job-list");
+      const ids = new Set(jobs.map((j) => j.id));
+      const prevSelected = selectedId;
+
+      if (!jobs.length) {
+        box.innerHTML = '<div class="empty-hint" style="padding:1rem .4rem;text-align:left;">暂无任务，点右上角 + 新增</div>';
+        jobCache.clear();
+        selectedId = null;
+        resetFileState(null);
+        patchDetail(null);
+        return;
+      }
+      box.querySelector(".empty-hint")?.remove();
+
+      for (const el of [...box.querySelectorAll(".job-item")]) {
+        if (!ids.has(el.dataset.id)) el.remove();
+      }
+
+      let anchor = null;
+      for (const job of jobs) {
+        let el = box.querySelector(`.job-item[data-id="${job.id}"]`);
+        if (!el) el = createListItem(job);
+        else patchListItem(el, job);
+
+        if (!anchor) {
+          if (box.firstChild !== el) box.insertBefore(el, box.firstChild);
+        } else if (anchor.nextSibling !== el) {
+          box.insertBefore(el, anchor.nextSibling);
+        }
+        anchor = el;
+        jobCache.set(job.id, job);
+      }
+
+      if (selectedId && !jobCache.has(selectedId)) {
+        selectedId = null;
+        openPauseMenu = false;
+      }
+      if (!selectedId && jobs.length) {
+        selectedId = jobs[0].id;
+      }
+      if (prevSelected !== selectedId) resetFileState(selectedId);
+      patchDetail(selectedId ? jobCache.get(selectedId) : null);
+      for (const el of box.querySelectorAll(".job-item")) {
+        el.classList.toggle("active", el.dataset.id === selectedId);
+      }
+    }
+
+    async function refreshJobs({ silentLog = true } = {}) {
+      const data = await api("/api/jobs");
+      const jobs = data.jobs || [];
+      syncJobs(jobs);
+      if (silentLog && selectedId) {
+        refreshLogIfNeeded({ scrollBottom: false });
+      }
+      await refreshFilesIfNeeded();
+    }
+
+    function showAddForm(show) {
+      $("add-form").classList.toggle("hidden", !show);
+      if (show) $("new_name").focus();
+    }
+
+    $("btn-toggle-add").onclick = () => {
+      const hidden = $("add-form").classList.contains("hidden");
+      showAddForm(hidden);
+    };
+    $("btn-cancel-add").onclick = () => {
+      showAddForm(false);
+      setMsg($("add-msg"), "");
+    };
+
+    // ---- 分享目录树（右侧面板）：浏览 → 勾选 → 「下载所选」追加入任务 ----
+    // 可反复勾选：每次只把新的 fid 追加到任务（POST /api/jobs/{id}/selection/add），
+    // 已下载 / 已在其它任务里的会被后端拦下并提示「已经添加过了」。
+    // 勾选结果落库到 state/jobs/<id>/selection.json；不勾选任何东西 = 下载整棵分享目录。
+    const TREE_STATE_LABELS = {
+      pending: "等待转存",
+      transferring: "转存中",
+      transfer_retry: "转存重试",
+      ready: "排队中",
+      retry: "重试中",
+      downloading: "下载中",
+      cleanup: "已下载",
+      done: "已下载",
+      failed: "失败",
+      selected: "已勾选",
+    };
+
+    const treeState = {
+      jobId: "",
+      rootFid: "",
+      folded: false,
+      foldedHint: "",
+      expanded: new Set(),
+      selectedFiles: new Set(),
+      selectedDirs: new Set(),
+      parent: new Map(),
+      names: new Map(),
+      taken: new Map(),
+      oversize: new Set(),
+      maxFileSizeGb: 0,
+    };
+
+    function treePanelEl() {
+      return $("detail").querySelector('[data-role="tree-panel"]');
+    }
+
+    function treeBodyEl() {
+      return $("detail").querySelector('[data-role="tree-body"]');
+    }
+
+    function setTreeMsg(text, kind = "") {
+      const el = $("detail").querySelector('[data-role="tree-msg"]');
+      if (el) setMsg(el, text, kind);
+    }
+
+    function treeFormatSize(bytes) {
+      const n = Number(bytes) || 0;
+      if (n <= 0) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = n;
+      let i = 0;
+      while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1; }
+      return (i === 0 ? String(value) : value.toFixed(1)) + " " + units[i];
+    }
+
+    function treeHintEl(text, isError) {
+      const el = document.createElement("div");
+      el.className = "tree-hint" + (isError ? " err" : "");
+      el.textContent = text;
+      return el;
+    }
+
+    function treeSelectionPayload() {
+      const payload = {};
+      if (treeState.selectedFiles.size) payload.file_fids = Array.from(treeState.selectedFiles);
+      if (treeState.selectedDirs.size) payload.dir_fids = Array.from(treeState.selectedDirs);
+      return Object.keys(payload).length ? payload : null;
+    }
+
+    function treeSyncHeader(job) {
+      const panel = treePanelEl();
+      if (!panel) return;
+      const summary = panel.querySelector('[data-role="tree-summary"]');
+      const selFiles = treeState.selectedFiles.size;
+      const selDirs = treeState.selectedDirs.size;
+      const jobSel = (job && job.selection) || {};
+      const jobFiles = Array.isArray(jobSel.file_fids) ? jobSel.file_fids.length : 0;
+      const jobDirs = Array.isArray(jobSel.dir_fids) ? jobSel.dir_fids.length : 0;
+      if (summary) {
+        if (selFiles || selDirs) {
+          summary.textContent = "本次已勾选 " + selFiles + " 文件 / " + selDirs + " 文件夹";
+          summary.classList.add("on");
+        } else if (jobFiles || jobDirs) {
+          summary.textContent =
+            "任务已勾选 " + jobFiles + " 文件 / " + jobDirs + " 文件夹";
+          summary.classList.add("on");
+        } else {
+          summary.textContent = "不勾选 = 下载整个分享目录";
+          summary.classList.remove("on");
+        }
+      }
+      const btn = panel.querySelector('button[data-act="tree-download"]');
+      if (btn) {
+        const running = jobIsActive(job);
+        btn.disabled = running || (!selFiles && !selDirs);
+        btn.title = running
+          ? "任务运行中：暂停后再勾选，重新「开始」才会生效"
+          : "把勾选项追加到任务并开始下载";
+      }
+      const clearBtn = panel.querySelector('button[data-act="tree-clear"]');
+      if (clearBtn) clearBtn.disabled = !selFiles && !selDirs;
+    }
+
+    function applyTreeFold() {
+      const panel = treePanelEl();
+      if (!panel) return;
+      panel.classList.toggle("folded", Boolean(treeState.folded));
+      const caret = panel.querySelector('[data-role="tree-caret"]');
+      if (caret) caret.textContent = treeState.folded ? "▸" : "▾";
+    }
+
+    function treeInheritedFrom(fid) {
+      let cur = treeState.parent.get(fid) || "";
+      let guard = 0;
+      while (cur && guard < 500) {
+        if (treeState.selectedDirs.has(cur)) return cur;
+        cur = treeState.parent.get(cur) || "";
+        guard += 1;
+      }
+      return "";
+    }
+
+    function treeRowEl(entry, depth) {
+      const row = document.createElement("div");
+      row.className = "tree-row" + (entry.is_dir ? " is-dir" : "");
+      row.dataset.fid = entry.fid;
+      row.dataset.dir = entry.is_dir ? "1" : "0";
+      row.dataset.oversize = entry.oversize ? "1" : "";
+      row.style.setProperty("--depth", String(depth));
+
+      if (entry.is_dir) {
+        const caret = document.createElement("button");
+        caret.type = "button";
+        caret.className = "tree-caret";
+        caret.dataset.role = "caret";
+        caret.textContent = "▸";
+        caret.title = "展开 / 折叠";
+        row.append(caret);
+      } else {
+        const spacer = document.createElement("span");
+        spacer.className = "tree-caret";
+        row.append(spacer);
+      }
+
+      const check = document.createElement("input");
+      check.type = "checkbox";
+      check.className = "tree-check";
+      check.dataset.role = "check";
+      check.title = entry.is_dir ? "勾选整个文件夹" : "勾选这个文件";
+      row.append(check);
+
+      const name = document.createElement("span");
+      name.className = "tree-name";
+      name.textContent = entry.name + (entry.is_dir ? "/" : "");
+      name.title = entry.name;
+      row.append(name);
+
+      const limitBadge = document.createElement("span");
+      limitBadge.className = "tree-badge warn";
+      limitBadge.dataset.role = "limit";
+      limitBadge.hidden = true;
+      row.append(limitBadge);
+
+      const badge = document.createElement("span");
+      badge.className = "tree-badge";
+      badge.dataset.role = "taken";
+      badge.hidden = true;
+      row.append(badge);
+
+      const size = document.createElement("span");
+      size.className = "tree-size";
+      size.textContent = entry.is_dir ? "" : treeFormatSize(entry.size);
+      row.append(size);
+      return row;
+    }
+
+    function treeBadgeClass(taken) {
+      if (!taken) return "";
+      if (taken.state === "selected") return "sel";
+      if (taken.state === "done" || taken.state === "cleanup") return "done";
+      if (taken.state === "failed") return "fail";
+      return "busy";
+    }
+
+    function treeTakenText(taken) {
+      const label = TREE_STATE_LABELS[taken.state] || "已添加";
+      if (taken.job_id === selectedId) return label;
+      const job = jobCache.get(taken.job_id);
+      const name =
+        (job && (jobDisplayName(job) || job.id)) || taken.job_name || taken.job_id || "";
+      return name ? label + " · " + name : label;
+    }
+
+    function treeRefreshRow(row) {
+      const fid = row.dataset.fid;
+      const check = row.querySelector('[data-role="check"]');
+      if (!check) return;
+      const isDir = row.dataset.dir === "1";
+      const inherited = treeInheritedFrom(fid);
+      const own = isDir ? treeState.selectedDirs.has(fid) : treeState.selectedFiles.has(fid);
+      const taken = treeState.taken.get(fid) || null;
+      // 只有「本任务」的勾选/记录能在这里取消；别的任务占用的仍然置灰
+      const ownedByMe = Boolean(taken) && taken.job_id === selectedId;
+      check.checked = Boolean(taken) || Boolean(inherited) || own;
+      check.disabled = (Boolean(taken) && !ownedByMe) || Boolean(inherited);
+      if (ownedByMe) {
+        check.title = isDir ? "取消勾选：把这个文件夹从任务里移除" : "取消勾选：把这个文件从任务里移除";
+      } else if (taken) {
+        check.title = "已被任务「" + (taken.job_name || taken.job_id) + "」占用";
+      }
+      row.classList.toggle("inherited", Boolean(inherited) && !taken);
+      row.classList.toggle("taken", Boolean(taken) && !ownedByMe);
+      const badge = row.querySelector('[data-role="taken"]');
+      if (badge) {
+        badge.hidden = !taken;
+        if (taken) {
+          badge.textContent = treeTakenText(taken);
+          badge.className = "tree-badge " + treeBadgeClass(taken);
+          badge.title = taken.job_name
+            ? "已在任务「" + taken.job_name + "」中"
+            : "";
+        }
+      }
+      const limitBadge = row.querySelector('[data-role="limit"]');
+      if (limitBadge) {
+        const over = row.dataset.oversize === "1";
+        limitBadge.hidden = !over;
+        if (over) {
+          limitBadge.textContent = treeState.maxFileSizeGb
+            ? "⚠ 超 " + treeState.maxFileSizeGb + " GiB"
+            : "⚠ 可能超限";
+          // 阈值是经验值（真实阈值夸克没公开），所以文案只说「可能」而不是断言
+          limitBadge.title =
+            "单个文件大于 " +
+            (treeState.maxFileSizeGb ? treeState.maxFileSizeGb + " GiB" : "经验阈值") +
+            "：普通账号下载常被夸克以 23018 拒绝（实测 7.11 GiB 被拒，更小的没测出边界）。" +
+            "与账号总容量无关，只跟单个文件大小有关；可在 conf/quark.yaml 用 quark_max_file_size_gb 调整或填 0 关闭";
+        }
+      }
+    }
+
+    function treeRefreshAll() {
+      const body = treeBodyEl();
+      if (!body) return;
+      for (const row of body.querySelectorAll(".tree-row")) treeRefreshRow(row);
+    }
+
+    function treeRenderEntries(container, entries, depth) {
+      const parentFid = container.dataset.owner || treeState.rootFid || "";
+      for (const entry of entries) {
+        treeState.parent.set(entry.fid, parentFid);
+        treeState.names.set(entry.fid, entry.name);
+        if (entry.taken) treeState.taken.set(entry.fid, entry.taken);
+        if (entry.oversize) treeState.oversize.add(entry.fid);
+        else treeState.oversize.delete(entry.fid);
+        const row = treeRowEl(entry, depth);
+        container.append(row);
+        treeRefreshRow(row);
+      }
+    }
+
+    async function treeFetch(pdirFid) {
+      // 链接/提取码由后端按 job_id 取，前端不再管
+      const data = await api("/api/share/tree", {
+        method: "POST",
+        body: JSON.stringify({ job_id: treeState.jobId, pdir_fid: pdirFid || "" }),
+      });
+      // 单文件上限（字节，0 = 后端未开启打标）→ 只用于 badge 文案
+      const limit = Number(data && data.max_file_size) || 0;
+      treeState.maxFileSizeGb = limit ? Math.round((limit / 1073741824) * 10) / 10 : 0;
+      return data;
+    }
+
+    function treeResetState(jobId) {
+      treeState.jobId = jobId || "";
+      treeState.rootFid = "";
+      treeState.expanded.clear();
+      treeState.selectedFiles.clear();
+      treeState.selectedDirs.clear();
+      treeState.parent.clear();
+      treeState.names.clear();
+      treeState.taken.clear();
+      treeState.oversize.clear();
+    }
+
+    async function treeLoadRoot(opts) {
+      const force = Boolean(opts && opts.force);
+      const job = selectedId ? jobCache.get(selectedId) : null;
+      const body = treeBodyEl();
+      if (!job || !body) return;
+      if (!force && treeState.jobId === job.id && body.childElementCount) return;
+      const jobId = job.id;
+      treeResetState(jobId);
+      body.replaceChildren(treeHintEl("加载中…"));
+      try {
+        const data = await treeFetch("");
+        if (treeState.jobId !== jobId) return; // 期间切换了任务，丢弃结果
+        treeState.rootFid = data.root_fid || data.pdir_fid || "";
+        body.replaceChildren();
+        if (!data.entries || !data.entries.length) {
+          body.append(treeHintEl("这个目录是空的"));
+          return;
+        }
+        treeRenderEntries(body, data.entries, 0);
+      } catch (e) {
+        if (treeState.jobId === jobId) body.replaceChildren(treeHintEl(e.message, true));
+      }
+    }
+
+    async function treeToggleDir(row) {
+      const fid = row.dataset.fid;
+      const depth = parseInt(row.style.getPropertyValue("--depth") || "0", 10) || 0;
+      const caret = row.querySelector('[data-role="caret"]');
+      const next = row.nextElementSibling;
+      const children = next && next.dataset.owner === fid ? next : null;
+      if (treeState.expanded.has(fid)) {
+        treeState.expanded.delete(fid);
+        if (children) children.hidden = true;
+        if (caret) caret.textContent = "▸";
+        return;
+      }
+      treeState.expanded.add(fid);
+      if (caret) caret.textContent = "▾";
+      if (children) {
+        children.hidden = false;
+        return;
+      }
+      const box = document.createElement("div");
+      box.dataset.owner = fid;
+      box.append(treeHintEl("加载中…"));
+      row.after(box);
+      try {
+        const data = await treeFetch(fid);
+        box.replaceChildren();
+        if (!data.entries || !data.entries.length) {
+          box.append(treeHintEl("（空目录）"));
+          return;
+        }
+        treeRenderEntries(box, data.entries, depth + 1);
+      } catch (e) {
+        box.replaceChildren(treeHintEl(e.message, true));
+      }
+    }
+
+    function treeDropSubtree(fid) {
+      for (const other of Array.from(treeState.selectedFiles)) {
+        let cur = treeState.parent.get(other) || "";
+        while (cur) {
+          if (cur === fid) { treeState.selectedFiles.delete(other); break; }
+          cur = treeState.parent.get(cur) || "";
+        }
+      }
+      for (const other of Array.from(treeState.selectedDirs)) {
+        let cur = treeState.parent.get(other) || "";
+        while (cur) {
+          if (cur === fid) { treeState.selectedDirs.delete(other); break; }
+          cur = treeState.parent.get(cur) || "";
+        }
+      }
+    }
+
+    function treeEnsureForJob(job) {
+      const panel = treePanelEl();
+      if (!panel) return;
+      if (!job || !String(job.share_url || "").trim()) {
+        panel.hidden = true;
+        return;
+      }
+      panel.hidden = false;
+      if (treeState.jobId === job.id) return;
+      treeResetState(job.id);
+      // 从没跑过的任务（还没有单文件状态）直接展开目录；跑过的先折叠，点开再看
+      treeState.folded = Number(job.total_files || 0) > 0;
+      applyTreeFold();
+      setTreeMsg("");
+      treeLoadRoot({ force: true });
+    }
+
+    function treeToggleFold() {
+      treeState.folded = !treeState.folded;
+      applyTreeFold();
+      const body = treeBodyEl();
+      if (!treeState.folded && body && !body.childElementCount) treeLoadRoot({ force: true });
+    }
+
+    function treeClearSelection() {
+      treeState.selectedFiles.clear();
+      treeState.selectedDirs.clear();
+      treeRefreshAll();
+      treeSyncHeader(selectedId ? jobCache.get(selectedId) : null);
+      setTreeMsg("");
+    }
+
+    async function treeDownloadSelected() {
+      const job = selectedId ? jobCache.get(selectedId) : null;
+      if (!job) return;
+      const payload = treeSelectionPayload();
+      if (!payload) {
+        setTreeMsg("先勾选要下载的文件或文件夹", "err");
+        return;
+      }
+      if (jobIsActive(job)) {
+        setTreeMsg("任务正在运行：先暂停，再勾选并重新「开始」才会生效", "err");
+        return;
+      }
+      const panel = treePanelEl();
+      const btn = panel ? panel.querySelector('button[data-act="tree-download"]') : null;
+      if (btn) btn.disabled = true;
+      try {
+        const data = await api("/api/jobs/" + job.id + "/selection/add", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        // 本地打标要区分「真加进来了」和「被拦下的重复项」：
+        // 重复项沿用后端给的归属任务，否则会显示成当前任务的「已勾选」。
+        const duplicatesList = Array.isArray(data.duplicates) ? data.duplicates : [];
+        const dupMap = new Map(duplicatesList.map((d) => [d.fid, d]));
+        const mark = (fid, kind) => {
+          const dup = dupMap.get(fid);
+          if (dup) {
+            treeState.taken.set(fid, {
+              job_id: dup.job_id,
+              job_name: dup.job_name,
+              state: dup.state || "selected",
+              kind: kind,
+            });
+            return;
+          }
+          treeState.taken.set(fid, {
+            job_id: job.id,
+            job_name: job.name,
+            state: "selected",
+            kind: kind,
+          });
+        };
+        for (const fid of payload.file_fids || []) mark(fid, "file");
+        for (const fid of payload.dir_fids || []) mark(fid, "dir");
+        treeState.selectedFiles.clear();
+        treeState.selectedDirs.clear();
+        treeRefreshAll();
+        treeSyncHeader(job);
+
+        const added = data.added || {};
+        const addedFiles = Number(added.files || 0);
+        const addedDirs = Number(added.dirs || 0);
+        const addedCount = addedFiles + addedDirs;
+        const duplicates = duplicatesList;
+        const parts = [];
+        if (addedCount) {
+          parts.push("已加入 " + addedFiles + " 个文件 / " + addedDirs + " 个文件夹");
+        } else {
+          parts.push("没有新增（勾选项都已经在任务里）");
+        }
+        const already = Number(data.already_in_job || 0);
+        if (already) parts.push(already + " 个已在该任务中");
+        if (duplicates.length) {
+          const names = duplicates
+            .slice(0, 3)
+            .map((d) => treeState.names.get(d.fid) || d.fid)
+            .join("、");
+          const more = duplicates.length > 3 ? " 等 " + duplicates.length + " 个" : "";
+          const owners = Array.from(
+            new Set(duplicates.map((d) => d.job_name || d.job_id))
+          ).join("、");
+          parts.push("跳过" + more + "：" + names + "（已在「" + owners + "」中）");
+        }
+        const oversizeCount = (payload.file_fids || []).filter((fid) =>
+          treeState.oversize.has(fid)
+        ).length;
+        if (oversizeCount) {
+          parts.push(
+            oversizeCount +
+              " 个文件大于 " +
+              (treeState.maxFileSizeGb ? treeState.maxFileSizeGb + " GiB" : "经验阈值") +
+              "（普通账号下载常被 23018 拒绝，可能失败）"
+          );
+        }
+        if (addedCount) {
+          try {
+            await api("/api/jobs/" + job.id + "/start", { method: "POST", body: "{}" });
+            parts.push("已开始下载");
+          } catch (e) {
+            parts.push("开始失败：" + e.message);
+          }
+        }
+        setTreeMsg(parts.join("；"), addedCount ? "ok" : "err");
+        await refreshJobs();
+      } catch (e) {
+        setTreeMsg(e.message, "err");
+      } finally {
+        treeSyncHeader(selectedId ? jobCache.get(selectedId) : null);
+      }
+    }
+
+    async function treeRemoveTaken(fid, isDir) {
+      const job = selectedId ? jobCache.get(selectedId) : null;
+      if (!job) return;
+      if (jobIsActive(job)) {
+        setTreeMsg("任务正在运行：先暂停任务，再取消勾选", "err");
+        treeRefreshAll();
+        return;
+      }
+      const payload = isDir ? { dir_fids: [fid] } : { file_fids: [fid] };
+      try {
+        const data = await api("/api/jobs/" + job.id + "/selection/remove", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        treeState.taken.delete(fid);
+        // removed.files 只统计 selection 里的命中项；只在状态文件里的文件由 state_files_removed 体现
+        if (
+          Number((data.removed || {}).files || 0) > 0 ||
+          Number(data.state_files_removed || 0) > 0
+        ) {
+          fileState.files = fileState.files.filter((f) => String(f.fid || "") !== fid);
+          fileState.sig = "";
+          renderFileList();
+        }
+        treeRefreshAll();
+        const label = treeState.names.get(fid) || fid;
+        const extra = isDir ? "（文件夹里已下载的文件仍留在「文件进度」，可在那里逐个删除）" : "";
+        setTreeMsg("已取消勾选：" + label + extra, "ok");
+        await refreshJobs();
+      } catch (e) {
+        setTreeMsg(e.message, "err");
+        treeRefreshAll();
+      }
+    }
+
+    async function removeJobFile(fid, label) {
+      const job = selectedId ? jobCache.get(selectedId) : null;
+      if (!job || !fid) return;
+      if (jobIsActive(job)) {
+        setMsg($("jobs-msg"), "任务正在运行：先暂停任务，再删除文件", "err");
+        return;
+      }
+      try {
+        await api("/api/jobs/" + job.id + "/selection/remove", {
+          method: "POST",
+          body: JSON.stringify({ file_fids: [fid] }),
+        });
+        // 本地先摘掉，避免等下一次轮询才消失
+        fileState.files = fileState.files.filter((f) => String(f.fid || "") !== fid);
+        fileState.sig = "";
+        renderFileList();
+        treeState.taken.delete(fid);
+        treeRefreshAll();
+        setMsg($("jobs-msg"), "已删除：" + label + "（可在目录树里重新勾选）", "ok");
+        await refreshJobs();
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+      }
+    }
+
+    function treeBindPanel() {
+      $("detail").addEventListener("click", (ev) => {
+        const head = ev.target.closest('[data-role="tree-toggle"]');
+        if (!head || ev.target.closest("button[data-act]")) return;
+        treeToggleFold();
+      });
+      $("detail").addEventListener("click", (ev) => {
+        const row = ev.target.closest(".tree-row");
+        if (!row || !row.closest('[data-role="tree-body"]')) return;
+        if (row.dataset.dir !== "1" || ev.target.closest(".tree-check")) return;
+        const tag = ev.target;
+        if (
+          ev.target.closest(".tree-caret") ||
+          tag === row ||
+          tag.classList.contains("tree-name") ||
+          tag.classList.contains("tree-size")
+        ) {
+          treeToggleDir(row);
+        }
+      });
+      $("detail").addEventListener("click", (ev) => {
+        const btn = ev.target.closest('[data-role="file-del"]');
+        if (!btn) return;
+        const fileRow = btn.closest(".file-row");
+        if (!fileRow) return;
+        ev.stopPropagation();
+        removeJobFile(fileRow.dataset.fid, fileRow.dataset.path || "(未知)");
+      });
+      $("detail").addEventListener("change", (ev) => {
+        const check = ev.target.closest(".tree-check");
+        if (!check || check.disabled) return;
+        const row = check.closest(".tree-row");
+        if (!row) return;
+        const fid = row.dataset.fid;
+        const takenNow = treeState.taken.get(fid) || null;
+        if (!check.checked && takenNow && takenNow.job_id === selectedId) {
+          // 取消勾选「已在本任务里」的条目 = 从任务勾选里移除（可再重新勾选）
+          treeRemoveTaken(fid, row.dataset.dir === "1");
+          return;
+        }
+        if (row.dataset.dir === "1") {
+          if (check.checked) {
+            treeState.selectedDirs.add(fid);
+            treeDropSubtree(fid);
+          } else {
+            treeState.selectedDirs.delete(fid);
+          }
+        } else if (check.checked) {
+          treeState.selectedFiles.add(fid);
+        } else {
+          treeState.selectedFiles.delete(fid);
+        }
+        treeRefreshAll();
+        treeSyncHeader(selectedId ? jobCache.get(selectedId) : null);
+      });
+    }
+
+    treeBindPanel();
+
+    $("btn-add").onclick = async () => {
+      try {
+        const name = $("new_name").value.trim();
+        if (!name) {
+          setMsg($("add-msg"), "请填写任务名", "err");
+          $("new_name").focus();
+          return;
+        }
+        const shareUrl = $("new_url").value.trim();
+        if (!shareUrl) {
+          setMsg($("add-msg"), "请填写分享链接", "err");
+          $("new_url").focus();
+          return;
+        }
+        if (!shareUrl.includes("/s/")) {
+          setMsg($("add-msg"), "分享链接格式不对，应形如 https://pan.quark.cn/s/xxxx", "err");
+          return;
+        }
+        const data = await api("/api/jobs", {
+          method: "POST",
+          body: JSON.stringify({
+            name,
+            share_url: shareUrl,
+            share_pwd: $("new_pwd").value,
+          }),
+        });
+        $("new_name").value = "";
+        $("new_url").value = "";
+        $("new_pwd").value = "";
+        setMsg(
+          $("add-msg"),
+          "已新增（默认暂停）：在右侧「分享目录」勾选文件后点「下载所选」",
+          "ok"
+        );
+        showAddForm(false);
+        await refreshJobs();
+        if (data.job?.id) selectJob(data.job.id, { closeSidebar: false });
+      } catch (e) {
+        setMsg($("add-msg"), e.message, "err");
+      }
+    };
+
+    $("btn-refresh").onclick = async () => {
+      try {
+        await refreshJobs();
+        setMsg($("jobs-msg"), "已刷新", "ok");
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+      }
+    };
+
+    $("btn-menu").onclick = () => setSidebarOpen(!$("sidebar").classList.contains("open"));
+    $("backdrop").onclick = () => setSidebarOpen(false);
+
+    $("detail-title-name").addEventListener("click", (ev) => {
+      if (!selectedId) return;
+      ev.preventDefault();
+      beginRename();
+    });
+    $("detail-title-edit").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        commitRename();
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        commitRename({ cancel: true });
+      }
+    });
+    $("detail-title-edit").addEventListener("blur", () => {
+      commitRename();
+    });
+
+    $("job-list").addEventListener("click", (ev) => {
+      const item = ev.target.closest(".job-item");
+      if (!item) return;
+      if (renaming) commitRename({ cancel: true });
+      selectJob(item.dataset.id);
+    });
+
+    $("detail").addEventListener("input", (ev) => {
+      const el = ev.target;
+      if (!el || el.getAttribute("data-role") !== "files-filter") return;
+      fileState.filter = el.value || "";
+      renderFileList();
+    });
+
+    $("detail").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn || !selectedId) return;
+      const id = selectedId;
+      const act = btn.dataset.act;
+      try {
+        if (act === "pause-menu") {
+          openPauseMenu = !openPauseMenu;
+          const job = jobCache.get(id);
+          if (job) patchDetail(job);
+          return;
+        }
+        if (act === "refresh-log") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await fillJobLog({ scrollBottom: true });
+          return;
+        }
+        if (act === "tree-reload") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await treeLoadRoot({ force: true });
+          return;
+        }
+        if (act === "tree-clear") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          treeClearSelection();
+          return;
+        }
+        if (act === "tree-download") {
+          ev.preventDefault();
+          ev.stopPropagation();
+          await treeDownloadSelected();
+          return;
+        }
+        openPauseMenu = false;
+        if (act === "start") {
+          await api(`/api/jobs/${id}/start`, { method: "POST", body: "{}" });
+        } else if (act === "pause-soft") {
+          await api(`/api/jobs/${id}/pause`, { method: "POST", body: JSON.stringify({ mode: "soft" }) });
+          setMsg($("jobs-msg"), "已下发软暂停", "ok");
+        } else if (act === "pause-hard") {
+          await api(`/api/jobs/${id}/pause`, { method: "POST", body: JSON.stringify({ mode: "hard" }) });
+          setMsg($("jobs-msg"), "已硬暂停", "ok");
+        } else if (act === "delete") {
+          const job = jobCache.get(id);
+          const label = jobDisplayName(job || { id });
+          if (!confirm(`确定删除任务「${label}」？删除后不可恢复。`)) return;
+          await api(`/api/jobs/${id}`, { method: "DELETE" });
+          selectedId = null;
+          setMsg($("jobs-msg"), "已删除", "ok");
+        }
+        await refreshJobs({ silentLog: false });
+        if (selectedId) await fillJobLog({ scrollBottom: true });
+      } catch (e) {
+        setMsg($("jobs-msg"), e.message, "err");
+        await refreshJobs({ silentLog: false });
+      }
+    });
+
+    document.addEventListener("click", (ev) => {
+      if (!ev.target.closest(".pause-wrap") && openPauseMenu) {
+        openPauseMenu = false;
+        const job = selectedId ? jobCache.get(selectedId) : null;
+        if (job) patchDetail(job);
+      }
+    });
+
+    (async () => {
+      await refreshJobs({ silentLog: false });
+      setInterval(() => {
+        refreshJobs().catch(() => {});
+      }, 5000);
+      api("/api/health")
+        .then((h) => {
+          const el = $("app-ver");
+          if (el && h && h.version) el.textContent = "v" + h.version;
+        })
+        .catch(() => {});
+    })();
+  </script>
+</body>
+</html>

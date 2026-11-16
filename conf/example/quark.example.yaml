@@ -28,3 +28,14 @@ task_poll_interval: 3
 
 # 转存任务超时（秒）
 task_timeout: 180
+
+# 请求用的 User-Agent：留空 = 官方桌面客户端 UA（quark-cloud-drive/2.5.20 …）。
+# 夸克的 file/download 会按 UA 区分：浏览器 UA 下普通账号会收到 400 code=23018
+# 「download file size limit」（大文件拿不到直链），客户端 UA 则正常返回直链。
+# 除非你明确想复现浏览器 UA 的行为，否则留空。
+quark_client_ua: ""
+
+# 单文件下载上限（GB）：仅用于「分享目录」里的「⚠ 超 x GiB」提示，默认 0 = 关闭。
+# 与账号总容量（total_space_gb）无关；用的是浏览器 UA 时才有意义（见 quark_client_ua）。
+# 填正数即开启（如 5），填 0 或负数关闭（只影响提示，不影响实际下载）。
+quark_max_file_size_gb: 0

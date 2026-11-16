@@ -1,4 +1,7 @@
-requests
-pyyaml
-fastapi
-uvicorn
+# 运行时依赖（版本固定，避免上游不兼容变更）
+requests==2.34.2
+PyYAML==6.0.3
+fastapi==0.163.1
+uvicorn==0.54.0
+# 扫码登录的二维码渲染（纯 Python，无 Pillow 依赖）
+segno==1.6.6
