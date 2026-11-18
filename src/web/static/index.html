@@ -1764,8 +1764,9 @@
       panel.hidden = false;
       if (treeState.jobId === job.id) return;
       treeResetState(job.id);
-      // 从没跑过的任务（还没有单文件状态）直接展开目录；跑过的先折叠，点开再看
-      treeState.folded = Number(job.total_files || 0) > 0;
+      // 一律默认折叠：切到任何任务都只留标题行，展开与否只由用户点击决定
+      // （旧规则是「有单文件状态就折叠、没有就展开」，导致同样都是暂停的两个任务表现不一致）
+      treeState.folded = true;
       applyTreeFold();
       setTreeMsg("");
       treeLoadRoot({ force: true });
