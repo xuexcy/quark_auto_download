@@ -1626,3 +1626,36 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
 | 勾上远端（同一张卡片，class 变 `aria2-card remote`） | block, h=18 | hidden=true, display=none, h=0 | hidden=true, display=none, h=0 |
 
 无后端改动，`pytest` 仍 **250 passed**。
+### 23.14 2.8.8：目录面板可整棵勾选 + 文件行点名字即勾选（2026-11-18）
+
+用户反馈（m06803，逐字）：「关于凡人修仙那个任务，我已经将199的下载任务删了，现在想重新选上后下载，但是现在无法重新选择"下载所选"按钮无法点击。」
+
+用户随后的需求（m06832，逐字）：「将"分享目录"改成"目录"，"目录"可选，选择后就可以点击下载，就是下载整个目录」。
+
+#### 23.14.1 现场核查（NAS 任务 j67bc357015）
+
+- `selection.json` 只剩 `198`/`200` 两个 fid（`199 4K.mp4` 的 `0d6da9f7…` 已被删除动作摘掉），
+  `file_override.yaml` 里 `deleted: [199 4K.mp4]`、`deleted_map` 有对应记录，`pipeline_state.yaml` 的 `files` 为空（进程已停）。
+- 浏览器实测：`199 4K.mp4` 那一行 `checked=false / disabled=false / 无 taken 徽标`，点复选框后按钮立刻从禁用变可用。
+  也就是说后端与勾选状态都正常，用户被挡住的是**交互入口**：只有那个小复选框能勾，点文件名没有任何反应，
+  加上没有「整个目录」的入口，删完一个文件想重下时很难找到能点的地方。
+
+#### 23.14.2 改动（只动 `src/web/static/index.html`）
+
+| 位置 | 改动 |
+| --- | --- |
+| 标题栏 | 「分享目录」→「目录」；默认摘要「勾选「目录」= 下载整个目录」；新增 `input[data-role="root-check"]`（整个目录） |
+| `treeSyncHeader()` | 同步根勾选框：`checked = 已勾选根目录 or 已在本任务里`，被别的任务占用时 `disabled` 并提示归属 |
+| 标题栏点击 | `ev.target.closest(".tree-check")` 时不再触发折叠 |
+| `change` 委托 | 新增根勾选框分支：勾上 = `selectedDirs.add(rootFid)`（提交为 `dir_fid`，整棵目录）；取消时若根目录已在本任务勾选 → `treeRemoveTaken(rootFid, true)` |
+| 行点击 | 文件行点名字/尺寸 = 勾选或取消（`tree-badge` 与置灰行除外），复选框仍在 |
+
+根目录被勾选后，所有子行经由既有的 `treeInheritedFrom()`（沿 `treeState.parent` 上溯）显示为「已勾选 + 置灰」，
+不会重复提交子项；`treeSelectionPayload()` 只带一个 `dir_fid`，与「勾文件夹 = 整棵子树」同一套后端语义，不需要改接口。
+
+#### 23.14.3 验证
+
+- `node --check`（抽出 `<script>` 块）通过；`pytest` **250 passed**（无后端改动）。
+- NAS 2.8.8 真机（任务「凡人修仙」，分享 5ba874e85746）：标题 「目录」、标题栏勾选框存在；
+  勾上 → 全部 `.tree-row` 的 `checked=true / disabled=true`、`下载所选` 可用、摘要「本次已勾选 0 文件 / 1 文件夹」；
+  取消 → 全部恢复可点、按钮回到禁用；点 `199 4K.mp4` 名字 → 该行选中、按钮可用（用户原先卡住的场景）。

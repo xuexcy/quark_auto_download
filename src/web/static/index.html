@@ -82,7 +82,7 @@
     }
     .add-form input:focus, .add-form select:focus { border-color: var(--accent-dim); }
     .add-actions { display: flex; gap: .4rem; margin-top: .65rem; }
-    /* 分享目录树：先看目录结构，再勾选要下载的文件/文件夹 */
+    /* 目录树：先看目录结构，再勾选要下载的文件/文件夹 */
     .tree-panel { margin-top: .5rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
     .tree-panel.hidden { display: none; }
     .tree-head {
@@ -110,7 +110,7 @@
     .tree-check { flex: 0 0 auto; accent-color: var(--accent); }
     .tree-hint { padding: .45rem .5rem; font-size: .74rem; color: var(--muted); }
     .tree-hint.err { color: #ff8e86; }
-    /* 右侧「分享目录」面板 */
+    /* 右侧「目录」面板 */
     .job-tree { margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 0 auto; }
     .job-tree[hidden] { display: none; }
     .job-tree-head { display: flex; align-items: center; gap: .45rem; padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; }
@@ -120,6 +120,9 @@
     .job-tree-summary.on { color: var(--accent); }
     .job-tree-spacer { flex: 1 1 auto; }
     .job-tree-head button { padding: .3rem .6rem; font-size: .74rem; }
+    /* 标题栏那个「整个目录」勾选框：全局 input 是 100% 宽，这里要收回成原生小方块 */
+    .job-tree-head .tree-check { width: auto; height: auto; margin: 0; padding: 0; }
+    .job-tree-head .tree-check:disabled { opacity: .45; }
     .job-tree .tree-body { max-height: min(18rem, 22vh); padding: .2rem .35rem .45rem; }
     .job-tree.folded .tree-body { display: none; }
     .job-tree .msg { margin: 0 .7rem .55rem; }
@@ -477,8 +480,9 @@
           <div class="job-tree" data-role="tree-panel" hidden>
             <div class="job-tree-head" data-role="tree-toggle">
               <span class="job-tree-caret" data-role="tree-caret">▾</span>
-              <span class="job-tree-title">分享目录</span>
-              <span class="job-tree-summary" data-role="tree-summary">不勾选 = 下载整个分享目录</span>
+              <input type="checkbox" class="tree-check tree-root-check" data-role="root-check" title="勾选 = 下载整个目录" aria-label="整个目录" />
+              <span class="job-tree-title">目录</span>
+              <span class="job-tree-summary" data-role="tree-summary">勾选「目录」= 下载整个目录</span>
               <span class="job-tree-spacer"></span>
               <button class="btn-ghost" data-act="tree-reload" type="button">刷新</button>
               <button class="btn-ghost" data-act="tree-clear" type="button">清空勾选</button>
@@ -871,7 +875,7 @@
       const nextStats = statsHtml(job);
       if (statsEl && statsEl.innerHTML !== nextStats) statsEl.innerHTML = nextStats;
 
-      // 右侧「分享目录」面板：换任务时重挂，同一任务只更新头部状态
+      // 右侧「目录」面板：换任务时重挂，同一任务只更新头部状态
       treeEnsureForJob(job);
       treeSyncHeader(job);
 
@@ -1314,10 +1318,10 @@
       setMsg($("add-msg"), "");
     };
 
-    // ---- 分享目录树（右侧面板）：浏览 → 勾选 → 「下载所选」追加入任务 ----
+    // ---- 目录树（右侧面板）：浏览 → 勾选 → 「下载所选」追加入任务 ----
     // 可反复勾选：每次只把新的 fid 追加到任务（POST /api/jobs/{id}/selection/add），
     // 已下载 / 已在其它任务里的会被后端拦下并提示「已经添加过了」。
-    // 勾选结果落库到 state/jobs/<id>/selection.json；不勾选任何东西 = 下载整棵分享目录。
+    // 勾选结果落库到 state/jobs/<id>/selection.json；勾选根目录或不勾选任何东西 = 下载整个目录。
     const TREE_STATE_LABELS = {
       pending: "等待转存",
       transferring: "转存中",
@@ -1403,7 +1407,7 @@
             "任务已勾选 " + jobFiles + " 文件 / " + jobDirs + " 文件夹";
           summary.classList.add("on");
         } else {
-          summary.textContent = "不勾选 = 下载整个分享目录";
+          summary.textContent = "勾选「目录」= 下载整个目录";
           summary.classList.remove("on");
         }
       }
@@ -1419,6 +1423,22 @@
       }
       const clearBtn = panel.querySelector('button[data-act="tree-clear"]');
       if (clearBtn) clearBtn.disabled = !selFiles && !selDirs;
+      const rootCheck = panel.querySelector('[data-role="root-check"]');
+      if (rootCheck) {
+        const rootFid = treeState.rootFid || "";
+        const taken = rootFid ? treeState.taken.get(rootFid) || null : null;
+        const ownedByMe = Boolean(taken) && taken.job_id === selectedId;
+        const own = Boolean(rootFid) && treeState.selectedDirs.has(rootFid);
+        rootCheck.checked = Boolean(taken) || own;
+        rootCheck.disabled = !rootFid || (Boolean(taken) && !ownedByMe);
+        rootCheck.title = !rootFid
+          ? "目录还没加载出来"
+          : ownedByMe
+            ? "取消勾选：把整个目录从任务勾选里移除"
+            : taken
+              ? "已被任务「" + (taken.job_name || taken.job_id) + "」占用"
+              : "勾选 = 下载整个目录";
+      }
     }
 
     function applyTreeFold() {
@@ -1904,14 +1924,22 @@
     function treeBindPanel() {
       $("detail").addEventListener("click", (ev) => {
         const head = ev.target.closest('[data-role="tree-toggle"]');
-        if (!head || ev.target.closest("button[data-act]")) return;
+        if (!head || ev.target.closest("button[data-act]") || ev.target.closest(".tree-check")) return;
         treeToggleFold();
       });
       $("detail").addEventListener("click", (ev) => {
         const row = ev.target.closest(".tree-row");
         if (!row || !row.closest('[data-role="tree-body"]')) return;
-        if (row.dataset.dir !== "1" || ev.target.closest(".tree-check")) return;
+        if (ev.target.closest(".tree-check")) return;
         const tag = ev.target;
+        if (row.dataset.dir !== "1") {
+          // 文件行：点名字/尺寸也能勾选（复选框本身照样管用），省得去点那个小方块
+          const fileCheck = row.querySelector(".tree-check");
+          if (!fileCheck || fileCheck.disabled || ev.target.closest(".tree-badge")) return;
+          fileCheck.checked = !fileCheck.checked;
+          fileCheck.dispatchEvent(new Event("change", { bubbles: true }));
+          return;
+        }
         if (
           ev.target.closest(".tree-caret") ||
           tag === row ||
@@ -1934,6 +1962,22 @@
         fileAction(op, fileRow.dataset.path || "", fileRow.dataset.fid || "");
       });
       $("detail").addEventListener("change", (ev) => {
+        const rootCheck = ev.target.closest('[data-role="root-check"]');
+        if (rootCheck) {
+          const rootFid = treeState.rootFid || "";
+          if (!rootFid) return;
+          const takenNow = treeState.taken.get(rootFid) || null;
+          if (!rootCheck.checked && takenNow && takenNow.job_id === selectedId) {
+            // 整个目录已经在本任务的勾选里：取消 = 把根目录从任务勾选移除
+            treeRemoveTaken(rootFid, true);
+            return;
+          }
+          if (rootCheck.checked) treeState.selectedDirs.add(rootFid);
+          else treeState.selectedDirs.delete(rootFid);
+          treeRefreshAll();
+          treeSyncHeader(selectedId ? jobCache.get(selectedId) : null);
+          return;
+        }
         const check = ev.target.closest(".tree-check");
         if (!check || check.disabled) return;
         const row = check.closest(".tree-row");
@@ -1996,7 +2040,7 @@
         $("new_pwd").value = "";
         setMsg(
           $("add-msg"),
-          "已新增（默认暂停）：在右侧「分享目录」勾选文件后点「下载所选」",
+          "已新增（默认暂停）：在右侧「目录」勾选文件或目录后点「下载所选」",
           "ok"
         );
         showAddForm(false);
