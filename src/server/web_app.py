@@ -126,27 +126,58 @@ def _check_basic_auth(request: Request) -> bool:
     except (ValueError, UnicodeDecodeError):
         return False
     username, _, password = decoded.partition(":")
-    return hmac.compare_digest(username, WEB_USERNAME) and hmac.compare_digest(
-        password, WEB_PASSWORD
+    # 必须用 bytes 比较：compare_digest 对非 ASCII 的 str 直接抛 TypeError，
+    # 会让整个站点 500（中文/emoji 口令是很正常的需求）。
+    return hmac.compare_digest(
+        username.encode("utf-8"), WEB_USERNAME.encode("utf-8")
+    ) and hmac.compare_digest(
+        password.encode("utf-8"), WEB_PASSWORD.encode("utf-8")
     )
+
+
+def _netloc_parts(value: str, default_scheme: str = "") -> tuple[str, str]:
+    """把 Host / Origin 归一成 (hostname, port)；缺端口时按 scheme 补默认端口。"""
+    text = str(value or "").strip()
+    if not text:
+        return ("", "")
+    parts = urlsplit(text if "//" in text else f"//{text}")
+    host = (parts.hostname or "").lower()
+    if not host:
+        return ("", "")
+    port = parts.port
+    if port is None:
+        scheme = (parts.scheme or default_scheme).lower()
+        if scheme == "https":
+            port = 443
+        elif scheme == "http":
+            port = 80
+    return (host, "" if port is None else str(port))
 
 
 def _request_is_same_origin(request: Request) -> bool:
     """浏览器跨站请求一定带 Origin（或 Referer）；非浏览器工具两者都没有。
 
     没有 Host 头的一律拒绝：HTTP/1.1 必须带 Host，缺失只能是手工构造的请求。
+    反向代理常把 Host 改写成 host:port、而 Origin 省略默认端口，所以按
+    (hostname, port) 归一后比较，而不是逐字比 netloc。
     """
-    host = request.headers.get("host", "").lower()
+    host = request.headers.get("host", "")
     if not host:
+        return False
+    host_name, host_port = _netloc_parts(host)
+    if not host_name:
         return False
     for header_name in ("origin", "referer"):
         value = request.headers.get(header_name)
         if not value:
             continue
-        netloc = urlsplit(value).netloc
-        if not netloc:
+        origin_name, origin_port = _netloc_parts(value)
+        if not origin_name:
             return False
-        return netloc.lower() == host
+        if origin_name != host_name:
+            return False
+        # Host 没写端口（反代常见）时只比主机名；两边都有端口才要求一致
+        return not (host_port and origin_port) or host_port == origin_port
     return True
 
 
@@ -177,7 +208,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.8.4"
 CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROCESS_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
 PROCESS_START_TS = time.time()
@@ -347,12 +378,26 @@ class ConfigUpdateRequest(BaseModel):
     aria2: Optional[dict[str, Any]] = None
 
 
+class Aria2TestRequest(BaseModel):
+    """测试一套 Aria2 配置是否连得上；secret 是掩码时用已保存的值。"""
+
+    name: str = ""
+    host: str = ""
+    secret: str = ""
+    # 远端配置：把「远端下载目录」一起带回来，测试时好说明文件会落到哪。
+    # 留 None = 请求里没带，按已保存的同名配置补齐（host 也对得上时）。
+    remote: bool | None = None
+    remote_dir: str | None = None
+
+
 class JobCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, description="任务显示名，必填且不可与已有任务重复")
     share_url: str = Field(..., min_length=1)
     share_pwd: str = ""
     # 前端目录树勾选结果；两项都空 = 下载整个分享目录（旧行为）
     selection: Optional[dict[str, list[str]]] = None
+    # 用哪套 Aria2 配置（conf/aria2.yaml 的 aria2_profiles），空 = 默认配置
+    aria2_profile: str = ""
 
 
 class JobPauseRequest(BaseModel):
@@ -401,6 +446,56 @@ def api_put_config(body: ConfigUpdateRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return {"ok": True, "saved": saved, "config": jm.get_all_configs(mask_secrets=True)}
+
+
+@app.get("/api/aria2/profiles")
+def api_aria2_profiles():
+    """全部 Aria2 配置（secret 掩码）+ 默认配置名，供设置页与新增任务下拉使用。"""
+    return jm.list_aria2_profiles()
+
+
+@app.post("/api/aria2/test")
+def api_aria2_test(body: Aria2TestRequest):
+    """连通性测试：设置页每张配置卡片上的「测试」按钮。"""
+    host = (body.host or "").strip()
+    secret = body.secret or ""
+    name = (body.name or "").strip()
+    saved = jm.aria2_target(name)
+    if not secret or "*" in secret:
+        # 页面上的 secret 是掩码（或刚加的卡片还没填）→ 用已保存的令牌。
+        # 但此时 host 只能沿用已保存的配置：否则请求体随便给个地址，
+        # 就会把明文令牌发到那台机器上（等于绕过配置接口的掩码）。
+        if host and saved["host"] and host.rstrip("/") != saved["host"].rstrip("/"):
+            raise HTTPException(
+                status_code=400,
+                detail="换 RPC 地址时必须重新填写令牌（不能用已保存的令牌测试陌生地址）",
+            )
+        host = host or saved["host"]
+        secret = saved["secret"]
+    if not host:
+        raise HTTPException(status_code=400, detail="请先填写 RPC Host")
+    if urlsplit(host).scheme.lower() not in ("http", "https"):
+        raise HTTPException(status_code=400, detail="RPC Host 必须以 http:// 或 https:// 开头")
+    # 用 curl / 脚本调这个接口时通常只给 name，远端标记与远端目录要沿用已保存的配置
+    same_profile_host = bool(saved["host"]) and host.rstrip("/") == saved["host"].rstrip("/")
+    if body.remote is None:
+        remote = bool(saved.get("remote")) if same_profile_host else False
+    else:
+        remote = bool(body.remote)
+    if body.remote_dir is None:
+        remote_dir = str(saved.get("remote_dir") or "") if same_profile_host else ""
+    else:
+        remote_dir = str(body.remote_dir or "")
+    try:
+        info = jm.test_aria2_connection(
+            host,
+            secret,
+            remote=remote,
+            remote_dir=remote_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"连接失败: {e}") from e
+    return {"ok": True, **info}
 
 
 def _save_quark_cookie(cookie: str) -> str:
@@ -501,7 +596,11 @@ def api_share_tree(body: ShareTreeRequest):
 
     limit = _max_download_file_size()
     for entry in entries:
-        size = int(entry.get("size") or 0)
+        try:
+            size = int(entry.get("size") or 0)
+        except (TypeError, ValueError):
+            # 分享接口偶尔把 size 给成字符串/空值，别让整个目录树 500
+            size = 0
         entry["oversize"] = bool(limit and not entry.get("is_dir") and size >= limit)
     return {
         "share_id": share_id,
@@ -562,7 +661,11 @@ def api_set_job_selection(job_id: str, body: JobSelectionRequest):
 def api_create_job(body: JobCreateRequest):
     try:
         job = jm.add_job(
-            body.share_url, body.share_pwd, name=body.name, selection=body.selection
+            body.share_url,
+            body.share_pwd,
+            name=body.name,
+            selection=body.selection,
+            aria2_profile=body.aria2_profile,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

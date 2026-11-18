@@ -109,6 +109,27 @@
     }
     .qr-canvas svg { width: 100%; height: 100%; display: block; }
     .qr-canvas .qr-empty { color: #9aa7a0; font-size: .76rem; text-align: center; padding: .6rem; }
+    .panel-head-row { flex-direction: row; align-items: flex-start; justify-content: space-between; gap: .8rem; }
+    .btn-add-row { flex: 0 0 auto; padding: .45rem .8rem; font-size: .82rem; }
+    .aria2-card {
+      border: 1px solid var(--line); border-radius: 8px; padding: .75rem .85rem; margin: .7rem 0;
+      background: color-mix(in srgb, var(--panel-2) 70%, transparent);
+    }
+    .aria2-card-head { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+    .aria2-card-head input[data-field="name"] { flex: 1 1 11rem; font-weight: 600; }
+    .aria2-remote { display: flex; align-items: center; gap: .35rem; margin: .35rem 0 0; font-size: .76rem; color: var(--muted); }
+    .aria2-remote input { width: auto; margin: 0; }
+    .aria2-card.remote { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+    .aria2-card.remote input[data-field="aria2_download_dir"]:disabled,
+    .aria2-card.remote input[data-field="download_destination_dir"]:disabled { opacity: .45; }
+    .aria2-default { display: inline-flex; align-items: center; gap: .3rem; margin: 0; font-size: .78rem; color: var(--muted); white-space: nowrap; }
+    .aria2-default input { width: auto; margin: 0; }
+    .aria2-card-actions { display: flex; gap: .35rem; margin-left: auto; }
+    .aria2-card-actions button { padding: .4rem .6rem; font-size: .78rem; }
+    .aria2-card > label:first-of-type { margin-top: .55rem; }
+    .aria2-test-msg { min-height: 1rem; margin: .45rem 0 0; }
+    .aria2-test-msg.ok { color: var(--accent); }
+    .aria2-test-msg.err { color: #ff8e86; }
     .qr-side { flex: 1 1 12rem; display: flex; flex-direction: column; gap: .6rem; }
     .qr-status { margin: 0; font-size: .86rem; color: var(--muted); min-height: 1.2rem; }
     .qr-status.ok { color: var(--accent); }
@@ -185,26 +206,23 @@
     </section>
 
     <section class="panel" aria-labelledby="cfg-aria2">
-      <div class="panel-head">
-        <h2 id="cfg-aria2">Aria2</h2>
-        <p class="panel-desc">RPC、下载目录与排队阈值</p>
+      <div class="panel-head panel-head-row">
+        <div>
+          <h2 id="cfg-aria2">Aria2</h2>
+          <p class="panel-desc">可配置多套 RPC；新增任务时选择用哪一套。两个目录都可不填：填了临时目录就先下到 &lt;临时&gt;/&lt;任务&gt;/（下完挪到完成目录，没填完成目录就挪到临时目录根下）；只填完成目录就直接下到完成目录；两个都不填则提交任务时不指定目录，由 Aria2 用自己的默认目录（本应用不校验、不移动文件）</p>
+        </div>
+        <button class="btn-ghost btn-add-row" id="btn-aria2-add" type="button" title="添加一套 Aria2 配置">＋ 添加</button>
       </div>
-      <label for="aria2_host">RPC Host</label>
-      <input id="aria2_host" />
-      <label for="aria2_secret">Secret</label>
-      <input id="aria2_secret" />
-      <label for="aria2_download_dir">下载临时目录</label>
-      <input id="aria2_download_dir" />
-      <label for="download_destination_dir">完成后目录</label>
-      <input id="download_destination_dir" />
+      <div id="aria2-list"></div>
+      <p class="hint" id="aria2-empty" hidden>还没有配置，点右上角「＋ 添加」新建一套。</p>
       <div class="grid-2">
         <div>
           <label for="aria2_queue_pause_threshold">排队暂停阈值</label>
-          <input id="aria2_queue_pause_threshold" type="number" />
+          <input id="aria2_queue_pause_threshold" type="number" min="1" step="10" />
         </div>
         <div>
           <label for="aria2_queue_resume_threshold">排队恢复阈值</label>
-          <input id="aria2_queue_resume_threshold" type="number" />
+          <input id="aria2_queue_resume_threshold" type="number" min="0" step="10" />
         </div>
       </div>
     </section>
@@ -255,18 +273,294 @@
       el.className = "msg" + (kind ? " " + kind : "");
     }
 
+    // 数字输入框留空 / 填 1e999 时 Number() 会给 NaN / Infinity，JSON.stringify 再把它变成
+    // null，后端下次启动读配置就会 TypeError。这里统一夹成合法整数。
+    function intField(id, fallback, min) {
+      const el = $(id);
+      const raw = Number(el ? el.value : NaN);
+      if (!Number.isFinite(raw)) return fallback;
+      const value = Math.round(raw);
+      return value >= min ? value : fallback;
+    }
+
     function fillConfig(cfg) {
       const q = cfg.quark || {}, a = cfg.aria2 || {};
       $("quark_cookie").value = q.quark_cookie || "";
       $("save_to_dir").value = q.save_to_dir || "";
       $("file_name_regex").value = q.file_name_regex || "";
-      $("aria2_host").value = a.aria2_host || "";
-      $("aria2_secret").value = a.aria2_secret || "";
-      $("aria2_download_dir").value = a.aria2_download_dir || "";
-      $("download_destination_dir").value = a.download_destination_dir || "";
       $("aria2_queue_pause_threshold").value = a.aria2_queue_pause_threshold ?? 700;
       $("aria2_queue_resume_threshold").value = a.aria2_queue_resume_threshold ?? 500;
+      aria2Profiles = Array.isArray(a.aria2_profiles)
+        ? a.aria2_profiles.map((p) => Object.assign({}, p))
+        : [];
+      aria2Default = a.aria2_default || "";
+      renderAria2();
     }
+
+    // ---------- 多 Aria2 配置 ----------
+    let aria2Profiles = [];
+    let aria2Default = "";
+
+    function aria2Field(row, field) {
+      const el = row.querySelector('[data-field="' + field + '"]');
+      return el ? el.value : "";
+    }
+
+    // 把页面上卡片里的当前值收回内存（增删卡片前必须先收，否则刚填的内容会丢）
+    function collectAria2() {
+      const list = $("aria2-list");
+      const cards = Array.from(list.querySelectorAll(".aria2-card"));
+      aria2Profiles = cards.map((card) => ({
+        name: aria2Field(card, "name").trim(),
+        aria2_host: aria2Field(card, "aria2_host").trim(),
+        aria2_secret: aria2Field(card, "aria2_secret"),
+        aria2_download_dir: aria2Field(card, "aria2_download_dir").trim(),
+        download_destination_dir: aria2Field(card, "download_destination_dir").trim(),
+        aria2_remote: !!card.querySelector('[data-field="aria2_remote"]').checked,
+        aria2_remote_dir: aria2Field(card, "aria2_remote_dir").trim(),
+      }));
+      const picked = list.querySelector('input[name="aria2-default"]:checked');
+      if (picked) {
+        const card = picked.closest(".aria2-card");
+        aria2Default = card ? aria2Field(card, "name").trim() : "";
+      }
+    }
+
+    function aria2Card(profile, isDefault) {
+      const card = document.createElement("div");
+      card.className = "aria2-card";
+
+      const head = document.createElement("div");
+      head.className = "aria2-card-head";
+      const nameInput = document.createElement("input");
+      nameInput.dataset.field = "name";
+      nameInput.placeholder = "配置名（唯一，如 本地 / NAS）";
+      nameInput.value = profile.name || "";
+      const defLabel = document.createElement("label");
+      defLabel.className = "aria2-default";
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = "aria2-default";
+      radio.checked = !!isDefault;
+      radio.setAttribute("aria-label", "设为默认配置");
+      defLabel.appendChild(radio);
+      defLabel.appendChild(document.createTextNode("默认"));
+      const actions = document.createElement("div");
+      actions.className = "aria2-card-actions";
+      for (const [act, text, title] of [
+        ["test", "测试", "连一次 aria2 RPC"],
+        ["del", "删除", "从配置里移除这一套"],
+      ]) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn-ghost";
+        btn.dataset.act = act;
+        btn.textContent = text;
+        btn.title = title;
+        actions.appendChild(btn);
+      }
+      head.append(nameInput, defLabel, actions);
+      card.appendChild(head);
+
+      // 远端 aria2：只有地址和令牌，落盘目录由对方决定
+      const remoteLabel = document.createElement("label");
+      remoteLabel.className = "aria2-remote";
+      const remoteBox = document.createElement("input");
+      remoteBox.type = "checkbox";
+      remoteBox.dataset.field = "aria2_remote";
+      remoteBox.checked = !!profile.aria2_remote;
+      remoteLabel.append(
+        remoteBox,
+        document.createTextNode("远端 aria2（文件落在对方机器上，本机不校验、不移动）"),
+      );
+      card.appendChild(remoteLabel);
+
+      // 远端目录：对方机器上的绝对路径。对方默认目录常不可写（实测 /downloads 只读时
+      // 每个文件都只得到 errorCode=16「Download aborted.」，页面上就是速度一直 0）
+      const remoteDirLabel = document.createElement("label");
+      remoteDirLabel.textContent = "远端下载目录（留空 = 用对方的默认目录）";
+      const remoteDirInput = document.createElement("input");
+      remoteDirInput.dataset.field = "aria2_remote_dir";
+      remoteDirInput.placeholder = "/downloads 或 /data/downloads";
+      remoteDirInput.value = profile.aria2_remote_dir || "";
+      remoteDirLabel.hidden = true;
+      remoteDirInput.hidden = true;
+      card.append(remoteDirLabel, remoteDirInput);
+
+      const fields = [
+        ["aria2_host", "RPC Host", "http://127.0.0.1:6800/jsonrpc"],
+        ["aria2_secret", "Secret（掩码不改）", "RPC secret，没有可留空"],
+        ["aria2_download_dir", "下载临时目录（可选）", "/vol2/1000/downloads"],
+        ["download_destination_dir", "完成后目录（可选，留空 = 留在临时目录根下）", "/vol2/1000/completed"],
+      ];
+      for (const [key, labelText, placeholder] of fields) {
+        const label = document.createElement("label");
+        label.textContent = labelText;
+        const input = document.createElement("input");
+        input.dataset.field = key;
+        input.placeholder = placeholder;
+        input.dataset.placeholder = placeholder;
+        input.value = profile[key] || "";
+        card.append(label, input);
+      }
+
+      // 远端模式下两个本机目录没有意义：置灰、清掉占位提示
+      const syncRemote = () => {
+        const remote = remoteBox.checked;
+        card.classList.toggle("remote", remote);
+        for (const key of ["aria2_download_dir", "download_destination_dir"]) {
+          const el = card.querySelector('[data-field="' + key + '"]');
+          if (!el) continue;
+          el.disabled = remote;
+          el.placeholder = remote ? "远端，不用填" : (el.dataset.placeholder || "");
+        }
+        // 远端目录只在远端模式下有意义：本机 aria2 的目录由上面两个字段管
+        remoteDirLabel.hidden = !remote;
+        remoteDirInput.hidden = !remote;
+        remoteDirInput.disabled = !remote;
+      };
+      remoteBox.addEventListener("change", () => {
+        syncRemote();
+        scheduleAria2AutoTest(card);
+      });
+      syncRemote();
+
+      // 改动地址/令牌后在原地自动测一次：别等到保存完再发现填的是 AriaNg 网页地址
+      for (const key of ["aria2_host", "aria2_secret", "aria2_remote_dir"]) {
+        const el = card.querySelector('[data-field="' + key + '"]');
+        if (el) el.addEventListener("change", () => scheduleAria2AutoTest(card));
+      }
+
+      const msg = document.createElement("p");
+      msg.className = "hint aria2-test-msg";
+      card.appendChild(msg);
+      return card;
+    }
+
+    function renderAria2() {
+      const list = $("aria2-list");
+      list.textContent = "";
+      aria2Profiles.forEach((profile, index) => {
+        const fallbackDefault = !aria2Default && index === 0;
+        list.appendChild(aria2Card(profile, fallbackDefault || profile.name === aria2Default));
+      });
+      $("aria2-empty").hidden = aria2Profiles.length > 0;
+    }
+
+    $("btn-aria2-add").onclick = () => {
+      collectAria2();
+      aria2Profiles.push({
+        name: "配置 " + (aria2Profiles.length + 1),
+        aria2_host: "",
+        aria2_secret: "",
+        aria2_download_dir: "",
+        download_destination_dir: "",
+        aria2_remote: false,
+      });
+      if (!aria2Default) aria2Default = aria2Profiles[aria2Profiles.length - 1].name;
+      renderAria2();
+      const cards = $("aria2-list").querySelectorAll(".aria2-card");
+      const last = cards[cards.length - 1];
+      if (last) last.querySelector('[data-field="aria2_host"]').focus();
+    };
+
+    // ---------- Aria2 配置：改动/保存时自动测试 ----------
+    // 用户要的是「添加配置时就自动测一次」：填完地址/令牌（或切到远端）就原地连一次，
+    // 出问题立刻在卡片下面写清楚，而不是等到建任务跑起来才发现地址填错。
+    const aria2AutoTimers = new WeakMap();
+
+    function aria2TestPayload(card) {
+      return {
+        name: aria2Field(card, "name").trim(),
+        host: aria2Field(card, "aria2_host").trim(),
+        secret: aria2Field(card, "aria2_secret"),
+        remote: !!card.querySelector('[data-field="aria2_remote"]').checked,
+        remote_dir: aria2Field(card, "aria2_remote_dir").trim(),
+      };
+    }
+
+    function aria2TestOkText(info) {
+      const dir = info.dir ? "，下载目录 " + info.dir : "";
+      return (
+        "连接成功：aria2 " + (info.version || "?") +
+        "（" + (info.host || "") + "）" +
+        "，活动 " + (info.num_active ?? 0) + " / 等待 " + (info.num_waiting ?? 0) + dir
+      );
+    }
+
+    async function testAria2Card(card, opts = {}) {
+      const msg = card.querySelector(".aria2-test-msg");
+      if (!msg) return false;
+      const payload = aria2TestPayload(card);
+      if (!payload.host) {
+        if (opts.showEmpty) {
+          msg.textContent = "先填 RPC Host 再测试";
+          msg.className = "hint aria2-test-msg";
+        }
+        return false;
+      }
+      msg.className = "hint aria2-test-msg";
+      msg.textContent = "测试中…";
+      try {
+        const info = await api("/api/aria2/test", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        if (!card.isConnected) return true; // 卡片已被重绘：别把结果写到孤儿节点上
+        msg.textContent = aria2TestOkText(info);
+        msg.className = "hint aria2-test-msg ok";
+        return true;
+      } catch (e) {
+        if (!card.isConnected) return false;
+        msg.textContent = e.message;
+        msg.className = "hint aria2-test-msg err";
+        return false;
+      }
+    }
+
+    function scheduleAria2AutoTest(card, delay = 800) {
+      const old = aria2AutoTimers.get(card);
+      if (old) clearTimeout(old);
+      aria2AutoTimers.set(card, setTimeout(() => {
+        aria2AutoTimers.delete(card);
+        testAria2Card(card);
+      }, delay));
+    }
+
+    async function testAllAria2Cards() {
+      const cards = Array.from($("aria2-list").querySelectorAll(".aria2-card"));
+      let bad = 0;
+      for (const card of cards) {
+        const ok = await testAria2Card(card);
+        if (!ok) bad += 1;
+      }
+      return { total: cards.length, bad };
+    }
+
+    $("aria2-list").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-act]");
+      if (!btn) return;
+      const card = btn.closest(".aria2-card");
+      const msg = card.querySelector(".aria2-test-msg");
+      if (btn.dataset.act === "del") {
+        const cards = Array.from($("aria2-list").querySelectorAll(".aria2-card"));
+        const index = cards.indexOf(card);
+        const removedName = aria2Field(card, "name").trim();
+        collectAria2();
+        if (index >= 0) aria2Profiles.splice(index, 1);
+        if (aria2Default === removedName) aria2Default = (aria2Profiles[0] || {}).name || "";
+        renderAria2();
+        setMsg($("cfg-msg"), "已删除配置「" + (removedName || "未命名") + "」，点「保存配置」后生效", "");
+        return;
+      }
+      // 测试：用卡片当前的 host/secret；secret 是掩码时后端会用已保存的值
+      btn.disabled = true;
+      try {
+        await testAria2Card(card, { showEmpty: true });
+      } finally {
+        btn.disabled = false;
+      }
+    });
 
     // ---------- 夸克登录 ----------
     let qrTimer = null;
@@ -275,7 +569,12 @@
     let qrTick = null;
     let qrDeadline = 0;
     let qrMessage = "等待扫码…";
+    // 每次「重新开始」自增：在飞的回调据此自杀，避免多轮流询叠加
+    let qrChain = 0;
+    // 连续网络失败次数（后端重启窗口里会连失败几次，不该直接放弃）
+    let qrFailures = 0;
     const QR_MAX_RENEWALS = 3;
+    const QR_MAX_FAILURES = 3;
     // 服务端二维码有效期 180 秒；页面按 120 秒倒计时，提前 60 秒自动续期
     const QR_COUNTDOWN_SEC = 120;
 
@@ -290,6 +589,7 @@
         clearTimeout(qrTimer);
         qrTimer = null;
       }
+      qrChain += 1; // 作废所有在飞回调（旧 timer 已经发出去的请求回来也不许再排下一轮）
       stopCountdown();
     }
 
@@ -326,9 +626,12 @@
     $("tab-qr").onclick = () => switchTab("qr");
     $("tab-manual").onclick = () => switchTab("manual");
 
-    async function pollQr(sessionId, deadline) {
+    async function pollQr(sessionId, deadline, chain) {
+      if (chain !== qrChain) return;
       try {
         const st = await api("/api/quark/login/qr/" + encodeURIComponent(sessionId));
+        if (chain !== qrChain) return;
+        qrFailures = 0;
         qrSessionId = st.session_id || sessionId;
         if (st.status === "confirmed") {
           stopQrPolling();
@@ -351,16 +654,28 @@
         qrMessage = st.message || "等待扫码…";
         renderQrCountdown();
       } catch (e) {
-        stopQrPolling();
-        setQrStatus(e.message, "err");
+        if (chain !== qrChain) return;
+        qrFailures += 1;
+        if (qrFailures >= QR_MAX_FAILURES) {
+          stopQrPolling();
+          setQrStatus(e.message, "err");
+          return;
+        }
+        // 单次网络抖动（例如后端正好重启）不该结束轮询：退避后再试
+        setQrStatus((e.message || "网络错误") + "，正在重试…", "err");
+        qrTimer = setTimeout(
+          () => pollQr(sessionId, deadline, chain),
+          1500 * Math.pow(2, qrFailures)
+        );
         return;
       }
+      if (chain !== qrChain) return;
       if (Date.now() > deadline) {
         stopQrPolling();
         renewQr();
         return;
       }
-      qrTimer = setTimeout(() => pollQr(sessionId, deadline), 1500);
+      qrTimer = setTimeout(() => pollQr(sessionId, deadline, chain), 1500);
     }
 
     function renewQr() {
@@ -376,9 +691,15 @@
     async function startQr(manual) {
       stopQrPolling();
       if (manual) qrRenewals = 0;
+      qrFailures = 0;
+      const chain = qrChain; // stopQrPolling 刚自增过
+      const btn = $("btn-qr-start");
+      if (btn) btn.disabled = true;
       setQrStatus("正在申请二维码…");
       try {
         const data = await api("/api/quark/login/qr", { method: "POST", body: "{}" });
+        // 连点会并发申请两个会话：只认最后一次，否则「显示的码」和「轮询的会话」会错位
+        if (chain !== qrChain) return;
         const box = $("qr-canvas");
         if (data.qr_svg) {
           box.innerHTML = data.qr_svg;
@@ -392,9 +713,12 @@
         const ttlSec = Math.min(Number(data.expires_in || QR_COUNTDOWN_SEC) || QR_COUNTDOWN_SEC, QR_COUNTDOWN_SEC);
         const deadline = Date.now() + ttlSec * 1000;
         startCountdown("等待扫码…", deadline);
-        pollQr(data.session_id, deadline);
+        pollQr(data.session_id, deadline, chain);
       } catch (e) {
+        if (chain !== qrChain) return;
         setQrStatus(e.message, "err");
+      } finally {
+        if (btn && chain === qrChain) btn.disabled = false;
       }
     }
 
@@ -435,6 +759,7 @@
     };
 
     $("btn-save-config").onclick = async () => {
+      collectAria2();
       try {
         await api("/api/config", {
           method: "PUT",
@@ -445,17 +770,28 @@
               file_name_regex: $("file_name_regex").value,
             },
             aria2: {
-              aria2_host: $("aria2_host").value.trim(),
-              aria2_secret: $("aria2_secret").value,
-              aria2_download_dir: $("aria2_download_dir").value,
-              download_destination_dir: $("download_destination_dir").value,
-              aria2_queue_pause_threshold: Number($("aria2_queue_pause_threshold").value || 700),
-              aria2_queue_resume_threshold: Number($("aria2_queue_resume_threshold").value || 500),
+              aria2_profiles: aria2Profiles,
+              aria2_default: aria2Default,
+              aria2_queue_pause_threshold: intField("aria2_queue_pause_threshold", 700, 1),
+              aria2_queue_resume_threshold: intField("aria2_queue_resume_threshold", 500, 0),
             },
           }),
         });
-        setMsg($("cfg-msg"), "配置已保存", "ok");
         fillConfig(await api("/api/config"));
+        // 保存成功后自动把每套配置连一次：地址/令牌/远端目录填错，这里就能看到
+        setMsg($("cfg-msg"), "配置已保存，正在测试 Aria2 连接…", "ok");
+        const result = await testAllAria2Cards();
+        if (!result.total) {
+          setMsg($("cfg-msg"), "配置已保存", "ok");
+        } else if (result.bad) {
+          setMsg(
+            $("cfg-msg"),
+            "配置已保存；Aria2 测试：" + result.bad + " / " + result.total + " 套连不上（见卡片下方提示）",
+            "err"
+          );
+        } else {
+          setMsg($("cfg-msg"), "配置已保存；Aria2 测试：" + result.total + " 套全部连接正常", "ok");
+        }
       } catch (e) {
         setMsg($("cfg-msg"), e.message, "err");
       }

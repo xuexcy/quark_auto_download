@@ -1,6 +1,7 @@
 import html
 import os
 import posixpath
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -91,8 +92,11 @@ class FileApi:
         download_submit_max_retries: int = 10,
         download_submit_retry_interval: int = 30,
         job_id: str = "",
+        remote_download: bool = False,
     ):
         self.quark_client = quark_client
+        # 远端 aria2（朋友的机器）：文件不落在本机，本地移动/校验/扫描一律跳过
+        self.remote_download = bool(remote_download)
         self.aria2_client = aria2_client
         self.save_to_fid = save_to_fid
         self.aria2_download_dir = aria2_download_dir
@@ -107,10 +111,30 @@ class FileApi:
 
     @property
     def download_root(self) -> str:
-        """本任务实际的下载目录（临时目录 / <job_id>）。"""
+        """本任务下载中的暂存目录（<临时或完成目录>/<job_id>）；本机不知道落点时为空串。"""
+        if not self.local_verifiable:
+            return ""
         if self.job_id:
             return os.path.join(self.aria2_download_dir, self.job_id)
         return self.aria2_download_dir
+
+    @property
+    def local_verifiable(self) -> bool:
+        """本机是否知道文件落在哪。
+
+        远端 aria2 的文件在对方机器上；两个目录都没填时由 aria2 自己的默认目录决定——
+        这两种情况本机既不能扫描、也不能移动、更不能拿本地副本去决定要不要删云端副本。
+        """
+        return bool(self.aria2_download_dir) and not self.remote_download
+
+    @property
+    def local_copy_root(self) -> str:
+        """本地副本所在目录。
+
+        配了「完成后目录」（download_destination_dir）就是它；留空表示下载完不移动，
+        文件就留在 <下载临时目录>/<job_id>/<相对路径>，因此本地副本要从这里找。
+        """
+        return self.download_destination_dir or self.download_root
 
     @staticmethod
     def file_path(file_item: dict) -> str:
@@ -153,13 +177,18 @@ class FileApi:
             return self.quark_client.ensure_my_dir_path(self.save_to_fid, relative_dir)
         return self.quark_client.find_my_dir_fid(self.save_to_fid, relative_dir)
 
-    def _entries_by_name(self, parent_fid: str) -> dict[str, dict]:
-        """列出目录下的文件条目：{文件名: 条目}（不含文件夹，读失败记空）。"""
+    def _entries_by_name(self, parent_fid: str, strict: bool = False) -> dict[str, dict] | None:
+        """列出目录下的文件条目：{文件名: 条目}（不含文件夹）。
+
+        默认读失败记空（调用方按"什么都没有"继续）；
+        strict=True 时读失败返回 None，让调用方区分"目录是空的"和"没读到"——
+        删除网盘副本后回查必须用 strict，否则列举失败会被误判成"已删干净"。
+        """
         try:
             entries = self.quark_client.list_my_dir_entries(parent_fid)
         except Exception as e:
             self.log.warning(f"  读取网盘目录失败: {parent_fid} | {e}")
-            return {}
+            return None if strict else {}
         result: dict[str, dict] = {}
         for entry in entries:
             if not isinstance(entry, dict) or entry.get("dir"):
@@ -232,9 +261,9 @@ class FileApi:
         return set(FileApi.get_local_downloaded_file_sizes(download_dir))
 
     def get_local_downloaded_sizes_from_dirs(self) -> dict[str, int]:
-        if not self.download_destination_dir:
-            return {}
-        return self.get_local_downloaded_file_sizes(self.download_destination_dir)
+        if not self.local_verifiable:
+            return {}  # 不知道落点：本机没有可扫描的副本，是否已下载只能看 Aria2 状态
+        return self.get_local_downloaded_file_sizes(self.local_copy_root)
 
     def get_local_downloaded_file_names_from_dirs(self) -> set[str]:
         return set(self.get_local_downloaded_sizes_from_dirs())
@@ -325,7 +354,12 @@ class FileApi:
 
     def move_file_to_destination(self, relative_path: str) -> bool:
         relative_path = normalize_relative_path(relative_path)
+        if not self.local_verifiable:
+            return True  # 不知道文件落在哪：本机没有可移动的东西
         src_path = os.path.join(self.download_root, relative_path)
+        if not self.download_destination_dir:
+            # 没配完成后目录：不移动，文件就留在 <下载临时目录>/<job_id>/ 下
+            return os.path.isfile(src_path)
         dst_path = os.path.join(self.download_destination_dir, relative_path)
         if not os.path.isfile(src_path):
             return os.path.isfile(dst_path)
@@ -348,27 +382,80 @@ class FileApi:
             raise
         return True
 
-    def local_copy_is_intact(self, relative_path: str, expected_size: int = 0) -> bool:
-        """目标目录是否已有可信的本地副本（存在且大小匹配）。"""
-        if not self.download_destination_dir:
-            return False
+    @staticmethod
+    def _local_file_matches(path: str, expected_size: int = 0) -> bool:
         try:
-            dst_path = os.path.join(self.download_destination_dir, normalize_relative_path(relative_path))
-        except ValueError:
-            return False
-        try:
-            actual = os.path.getsize(dst_path)
+            actual = os.path.getsize(path)
         except OSError:
             return False
         if actual <= 0:
             return False
         expected = int(expected_size or 0)
-        if expected > 0 and actual != expected:
-            return False
-        return True
+        return expected <= 0 or actual == expected
+
+    def resolve_local_copy(self, relative_path: str, expected_size: int = 0) -> str:
+        """本地可信副本的真实路径；不存在/大小不符返回空串。
+
+        目标目录已有同名文件时，落盘会改名成 name_YYYYmmdd_HHMMSS[_n].ext
+        （见 _reserve_destination_path），所以先按原名找，再按改名规则兜底。
+        """
+        if not self.local_verifiable:
+            return ""
+        try:
+            relative_path = normalize_relative_path(relative_path)
+        except ValueError:
+            return ""
+        exact = os.path.join(self.local_copy_root, relative_path)
+        if self._local_file_matches(exact, expected_size):
+            return exact
+        relative_dir = self.relative_dir(relative_path)
+        base_name = relative_path.rsplit("/", 1)[-1]
+        target_dir = (
+            os.path.join(self.local_copy_root, relative_dir)
+            if relative_dir
+            else self.local_copy_root
+        )
+        stem, ext = os.path.splitext(base_name)
+        pattern = re.compile(rf"^{re.escape(stem)}_\d{{8}}_\d{{6}}(?:_\d+)?{re.escape(ext)}$")
+        try:
+            names = sorted(os.listdir(target_dir))
+        except OSError:
+            return ""
+        for name in names:
+            if not pattern.match(name):
+                continue
+            candidate = os.path.join(target_dir, name)
+            if self._local_file_matches(candidate, expected_size):
+                return candidate
+        return ""
+
+    def local_copy_is_intact(self, relative_path: str, expected_size: int = 0) -> bool:
+        """本地是否已有可信的副本（目标目录；没配完成后目录则是下载目录，存在且大小匹配）。"""
+        if not self.local_verifiable:
+            return False  # 不知道落点：本机无法校验，调用方按「无法校验」处理
+        return bool(self.resolve_local_copy(relative_path, expected_size))
 
     def finish_downloaded_file(self, filename: str) -> bool:
         """移动已下载完成的文件；返回 False 表示文件没有真正落到目标目录。"""
+        if self.remote_download:
+            # 远端：Aria2 报 complete 就算完成，本机既不知道也不该管文件落在哪
+            self.log.info(f"  → 远端 Aria2 下载完成（文件在远端，未做本地移动）: {filename}")
+            return True
+        if not self.local_verifiable:
+            # 两个目录都没填：落点由 aria2 自己决定，本机无法移动也无法核对
+            self.log.info(f"  → 未配置下载目录，按 Aria2 状态判定完成（本机不校验、不移动）: {filename}")
+            return True
+        if not self.download_destination_dir:
+            # 留空 = 不移动：只要文件在本任务下载目录里就算落盘成功
+            try:
+                keep_path = os.path.join(self.download_root, normalize_relative_path(filename))
+            except ValueError:
+                return False
+            if os.path.isfile(keep_path):
+                self.log.info(f"  → 未配置完成后目录，文件保留在下载目录: {filename}")
+                return True
+            self.log.warning(f"  → 未找到下载完成的文件: {filename}")
+            return False
         try:
             moved = self.move_file_to_destination(filename)
             if moved:
@@ -391,6 +478,8 @@ class FileApi:
 
     def cleanup_empty_download_dirs(self) -> list[str]:
         """全部任务结束后，清理本任务下载临时目录中残留的空文件夹。"""
+        if not self.local_verifiable:
+            return []
         if not self._should_prune_download_dir():
             return []
         try:
@@ -464,17 +553,23 @@ class FileApi:
         self,
         target_parent_fid: str,
         group_files: list[dict],
-        saved_fid_count: int,
+        saved_fids: list[str],
     ) -> tuple[list[dict], list[dict]]:
         """转存后回查目标目录，确认每个文件真的出现了。
 
         提交成功不等于转存成功（接口可能只回了 fid 而任务失败），所以按名字核对；
         核对接口本身失败时保持乐观，避免网络抖动把整批判死。
+
+        saved_fids 是本次转存真正写回自己网盘的 fid：目录里可能已经有同名旧文件，
+        只按名字认领会把旧文件的 fid 当成新副本，之后清理就会删掉用户原有的文件。
         """
+        saved = {str(fid).strip() for fid in (saved_fids or []) if str(fid or "").strip()}
         try:
             entries = self.quark_client.list_my_dir_entries(target_parent_fid)
         except Exception as e:
-            self.log.warning(f"  转存后回查目标目录失败，按接口返回的 {saved_fid_count} 个 fid 记成功: {e}")
+            self.log.warning(
+                f"  转存后回查目标目录失败，按接口返回的 {len(saved)} 个 fid 记成功: {e}"
+            )
             return list(group_files), []
         # 名字 → 条目：顺便把 fid 回填到 file_item，后面取直链/删副本都不用再查一次
         entries_by_name: dict[str, dict] = {}
@@ -495,6 +590,15 @@ class FileApi:
                 missing.append(item)
                 continue
             fid = str(entry.get("fid") or "").strip()
+            if saved and fid not in saved:
+                # 目录里已经有同名文件，但 fid 不是这次转存写回来的 → 很可能是用户原有的文件。
+                # 认领它会在清理阶段把用户原文件删掉，所以宁可判「未生效」。
+                self.log.error(
+                    "  目标目录已有同名文件且不是本次转存结果，按未生效处理（不接管旧 fid）: "
+                    f"{self.file_path(item)}"
+                )
+                missing.append(item)
+                continue
             if fid:
                 item["my_fid"] = fid
             succeeded.append(item)
@@ -564,7 +668,7 @@ class FileApi:
                     if not saved_fids:
                         raise RuntimeError("转存失败：未获得 fid")
                     succeeded, missing = self._verify_transferred_files(
-                        target_parent_fid, group_files, len(saved_fids)
+                        target_parent_fid, group_files, saved_fids
                     )
                     self.log.info(
                         f"  转存任务提交成功，确认落盘 {len(succeeded)}/{len(group_files)} 个文件 "
@@ -662,11 +766,14 @@ class FileApi:
                         self.log.info(f"  → {action}: {item['file_name']} 已不在网盘中，无需清理")
                         deleted_names.append(item["file_name"])
                     continue
-                entries = self._entries_by_name(parent_fid)
+                # 删除是不可逆的：这里必须 strict，读不到目录时不能假设「文件已经不在了」
+                entries = self._entries_by_name(parent_fid, strict=True)
+                if entries is None:
+                    raise RuntimeError("列举网盘目录失败，无法确认要删的文件")
                 targets: list[tuple[dict, str]] = []
                 for item in dir_tasks:
                     expected_size = int(item.get("size") or 0)
-                    if self.download_destination_dir and not self.local_copy_is_intact(
+                    if self.local_verifiable and not self.local_copy_is_intact(
                         item["file_name"], expected_size
                     ):
                         # 删除网盘副本是不可逆操作：本地没有可信副本就绝不动云端
@@ -688,7 +795,10 @@ class FileApi:
                     continue
                 self.quark_client.delete_my_fids([fid for _item, fid in targets])
                 # 删除是异步任务，回查一次确认真的没了，避免「报成功但还在」
-                remaining = self._entries_by_name(parent_fid)
+                # 回查失败必须算失败：否则会把还占着容量的副本记成「已释放」
+                remaining = self._entries_by_name(parent_fid, strict=True)
+                if remaining is None:
+                    raise RuntimeError("删除后回查目录失败，无法确认是否删干净")
                 for item, _fid in targets:
                     if self.file_name(item) in remaining:
                         self.log.error(

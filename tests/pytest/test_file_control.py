@@ -170,7 +170,7 @@ def test_read_override_tolerates_broken_yaml(env):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w", encoding="utf-8").write("paused: [\n  - oops\n")
     override = jobs_manager.read_file_override("j1")
-    assert override == {"paused": set(), "deleted": set(), "retry": set()}
+    assert override == {"paused": set(), "deleted": set(), "retry": set(), "deleted_map": {}}
     # 坏文件不能让整个文件列表接口 500
     assert jobs_manager.job_files("j1")["files"] == []
 
@@ -219,6 +219,8 @@ def test_op_aliases_and_errors(env):
 def test_start_job_passes_override_file_env(env, monkeypatch):
     add_job(selection={"file_fids": ["f1"]})
     captured = {}
+    # 启动前的 Aria2 预检在这里必须打桩：真去连本机 conf/aria2.yaml 里的配置会让用例依赖环境
+    monkeypatch.setattr(jobs_manager, "probe_aria2_profile", lambda name, timeout=5: {"version": "test"})
 
     class FakeProc:
         pid = 424242
@@ -238,3 +240,93 @@ def test_start_job_passes_override_file_env(env, monkeypatch):
     override = captured["env"]["QUARK_AUTO_DL_FILE_OVERRIDE_FILE"]
     assert override == jobs_manager.job_override_file("j1")
     assert override.endswith("file_override.yaml")
+
+
+def test_readd_after_delete_clears_marker(env):
+    """删掉的文件从目录树重新勾选时，必须撤掉「已删除」标记，否则子进程会一直过滤它。"""
+    add_job(selection={"file_fids": ["f1"]})
+    write_state("j1", [{"path": "a/b.mp4", "fid": "f1", "size": 1000, "state": "ready"}])
+
+    jobs_manager.apply_file_control("j1", "delete", ["a/b.mp4"], ["f1"])
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == {"a/b.mp4"}
+    # 删除只记了路径，额外记下 fid → 路径，供「只拿 fid 重新勾选」时撤标记
+    assert override["deleted_map"] == {"f1": "a/b.mp4"}
+
+    jobs_manager.add_job_selection("j1", {"file_fids": ["f1"]})
+
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == set()
+    assert override["deleted_map"] == {}
+    payload = json.loads(
+        open(jobs_manager.job_selection_file("j1"), encoding="utf-8").read()
+    )
+    assert payload["file_fids"] == ["f1"]
+
+
+def test_forget_deleted_paths_by_fid_only(env):
+    add_job()
+    jobs_manager.write_file_override(
+        "j1", {"paused": set(), "deleted": {"a/b.mp4", "c.mp4"}, "retry": set(),
+               "deleted_map": {"f1": "a/b.mp4", "f2": "c.mp4"}}
+    )
+
+    assert jobs_manager.forget_deleted_paths("j1", fids=["f1"]) == 1
+
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == {"c.mp4"}   # 只撤 f1 对应那条，c.mp4 的标记仍在
+    assert override["deleted_map"] == {"f2": "c.mp4"}
+
+
+def test_pause_after_delete_drops_mapping(env):
+    add_job()
+    jobs_manager.write_file_override(
+        "j1", {"paused": set(), "deleted": {"a/b.mp4"}, "retry": set(),
+               "deleted_map": {"f1": "a/b.mp4"}}
+    )
+
+    jobs_manager.apply_file_control("j1", "pause", ["a/b.mp4"], ["f1"])
+
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == set()
+    assert override["deleted_map"] == {}
+    assert override["paused"] == {"a/b.mp4"}
+
+
+def test_delete_without_state_records_fid_mapping(env):
+    """任务刚重启、pipeline_state 还没写时，删除也要记下 fid → 路径（靠一次操作的一一对应）。"""
+    add_job(selection={"file_fids": ["f1"]})
+
+    jobs_manager.apply_file_control("j1", "delete", ["a/b.mp4"], ["f1"])
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == {"a/b.mp4"}
+    assert override["deleted_map"] == {"f1": "a/b.mp4"}
+
+    assert jobs_manager.forget_deleted_paths("j1", fids=["f1"]) == 1
+    assert jobs_manager.read_file_override("j1")["deleted"] == set()
+
+
+def test_forget_deleted_paths_falls_back_to_state(env):
+    """deleted_map 丢了（老版本写的标记）也能靠 pipeline_state 把标记撤掉。"""
+    add_job(selection={"file_fids": ["f1"]})
+    write_state("j1", [{"path": "a/b.mp4", "fid": "f1", "state": "downloading"}])
+    override = {"paused": set(), "deleted": {"a/b.mp4"}, "retry": set(), "deleted_map": {}}
+    jobs_manager.write_file_override("j1", override)
+
+    assert jobs_manager.forget_deleted_paths("j1", fids=["f1"]) == 1
+    assert jobs_manager.read_file_override("j1")["deleted"] == set()
+
+
+def test_readd_existing_selection_also_clears_marker(env):
+    """文件还在 selection 里（already_in_job）时重新勾选，也要撤掉删除标记。"""
+    add_job(selection={"file_fids": ["f1"]})
+    write_state("j1", [{"path": "a/b.mp4", "fid": "f1", "state": "downloading"}])
+    jobs_manager.write_file_override(
+        "j1", {"paused": set(), "deleted": {"a/b.mp4"}, "retry": set(), "deleted_map": {"f1": "a/b.mp4"}}
+    )
+
+    result = jobs_manager.add_job_selection("j1", {"file_fids": ["f1"]})
+    assert result["already_in_job"] == 1
+    override = jobs_manager.read_file_override("j1")
+    assert override["deleted"] == set()
+    assert override["deleted_map"] == {}

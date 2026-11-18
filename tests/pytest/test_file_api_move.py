@@ -78,3 +78,54 @@ def test_local_copy_is_intact(tmp_path):
     assert api.local_copy_is_intact("movie/c.mp4", 999) is False
     assert api.local_copy_is_intact("movie/c.mp4", 0) is True
     assert api.local_copy_is_intact("movie/missing.mp4", 10) is False
+
+
+# ---------- 完成后目录留空：不移动，文件留在下载目录 ----------
+
+def make_file_api_no_destination(tmp_path) -> FileApi:
+    return FileApi(
+        quark_client=object(),
+        aria2_client=object(),
+        save_to_fid="0",
+        aria2_download_dir=str(tmp_path / "dl"),
+        download_destination_dir="",
+        aria2_max_retries=3,
+        download_log_interval=10,
+        logger=logging.getLogger("test"),
+        job_id="j1",
+    )
+
+
+def test_no_destination_move_keeps_file_in_place(tmp_path, monkeypatch):
+    # 曾经的坑：空目标目录被当成相对路径，文件被移动到进程当前目录（项目根）
+    workdir = tmp_path / "cwd"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    api = make_file_api_no_destination(tmp_path)
+    src = write(os.path.join(api.download_root, "movie", "a.mp4"), "new")
+    assert api.move_file_to_destination("movie/a.mp4") is True
+    assert os.path.isfile(src) is True
+    assert list(workdir.iterdir()) == []
+
+
+def test_no_destination_finish_counts_as_success(tmp_path):
+    api = make_file_api_no_destination(tmp_path)
+    write(os.path.join(api.download_root, "movie", "b.mp4"), "done")
+    assert api.finish_downloaded_file("movie/b.mp4") is True
+    assert api.finish_downloaded_file("movie/missing.mp4") is False
+
+
+def test_no_destination_local_copy_is_intact(tmp_path):
+    api = make_file_api_no_destination(tmp_path)
+    path = write(os.path.join(api.download_root, "movie", "c.mp4"), "0123456789")
+    assert api.local_copy_is_intact("movie/c.mp4", os.path.getsize(path)) is True
+    assert api.local_copy_is_intact("movie/c.mp4", 999) is False
+    assert api.local_copy_is_intact("movie/missing.mp4", 10) is False
+
+
+def test_no_destination_counts_files_in_download_dir(tmp_path):
+    api = make_file_api_no_destination(tmp_path)
+    write(os.path.join(api.download_root, "movie", "d.mp4"), "12345")
+    sizes = api.get_local_downloaded_sizes_from_dirs()
+    assert sizes == {"movie/d.mp4": 5}
+

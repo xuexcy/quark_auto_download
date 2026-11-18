@@ -76,11 +76,11 @@
     .add-form.hidden { display: none; }
     .add-form label { display: block; font-size: .72rem; color: var(--muted); margin: .45rem 0 .2rem; }
     .add-form label:first-child { margin-top: 0; }
-    .add-form input {
+    .add-form input, .add-form select {
       width: 100%; border: 1px solid var(--line); background: var(--bg); color: var(--text);
       border-radius: 8px; padding: .5rem .6rem; font: 500 .82rem/1.35 var(--mono); outline: none;
     }
-    .add-form input:focus { border-color: var(--accent-dim); }
+    .add-form input:focus, .add-form select:focus { border-color: var(--accent-dim); }
     .add-actions { display: flex; gap: .4rem; margin-top: .65rem; }
     /* 分享目录树：先看目录结构，再勾选要下载的文件/文件夹 */
     .tree-panel { margin-top: .5rem; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
@@ -429,6 +429,8 @@
         <input id="new_url" placeholder="https://pan.quark.cn/s/xxxx" />
         <label for="new_pwd">提取码（可选）</label>
         <input id="new_pwd" placeholder="可选" />
+        <label for="new_aria2">Aria2 配置</label>
+        <select id="new_aria2"></select>
         <div class="add-actions">
           <button class="btn-primary" id="btn-add" type="button">新增</button>
           <button class="btn-ghost" id="btn-cancel-add" type="button">取消</button>
@@ -726,6 +728,8 @@
       const selFiles = Array.isArray(selection.file_fids) ? selection.file_fids.length : 0;
       const selDirs = Array.isArray(selection.dir_fids) ? selection.dir_fids.length : 0;
       if (selFiles || selDirs) html += ` · 仅下载勾选：${selFiles} 文件 / ${selDirs} 文件夹`;
+      // 多 Aria2：只在任务显式选过配置时显示（空 = 用默认配置）
+      if (job.aria2_profile) html += ` · aria2=${escapeHtml(job.aria2_profile)}`;
       if (!hideMsg) html += ` · ${escapeHtml(msg)}`;
       return html;
     }
@@ -888,15 +892,18 @@
 
     async function fillJobLog({ scrollBottom = false } = {}) {
       if (!selectedId) return;
-      logState.id = selectedId;
-      logState.status = String(((jobCache.get(selectedId) || {}).status) || "");
+      const jobId = selectedId;
+      logState.id = jobId;
+      logState.status = String(((jobCache.get(jobId) || {}).status) || "");
       const pre = $("detail").querySelector('[data-role="log"]');
       const pathEl = $("detail").querySelector('[data-role="log-path"]');
       if (!pre) return;
       const prevScroll = pre.scrollTop;
       const nearBottom = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
       try {
-        const data = await api(`/api/jobs/${selectedId}/logs?lines=250`);
+        const data = await api(`/api/jobs/${jobId}/logs?lines=250`);
+        // 请求期间用户可能切到别的任务：旧任务的日志不能写进新任务的面板
+        if (selectedId !== jobId) return;
         if (pathEl) pathEl.textContent = data.path || "";
         const next = data.content || "(暂无日志)";
         if (pre.textContent !== next) {
@@ -905,7 +912,10 @@
           else pre.scrollTop = prevScroll;
         }
       } catch (e) {
+        if (selectedId !== jobId) return;
         pre.textContent = `读取日志失败: ${e.message}`;
+        // 失败要把「已是最新」标记清掉，否则再也不会自动重试，只能手动刷新
+        logState.id = null;
       }
     }
 
@@ -923,7 +933,7 @@
       failed: "失败",
     };
     const FILE_RENDER_LIMIT = 400; // 超大任务只渲染前 N 行，用过滤框缩小范围
-    const fileState = { id: null, files: [], filter: "", sig: "", loaded: false, lastActive: null, rows: new Map() };
+    const fileState = { id: null, files: [], filter: "", sig: "", loaded: false, lastActive: null, rows: new Map(), total: 0 };
 
     function fileSignature(data) {
       const files = Array.isArray(data.files) ? data.files : [];
@@ -1065,10 +1075,13 @@
         else if (f.state === "paused") paused += 1;
         else if (f.state !== "pending" && f.state !== "transfer_retry") running += 1;
       }
-      let text = `完成 ${done}/${files.length}`;
+      // 分母用后端给的总数：接口最多返回 2000 条，用 files.length 会把「完成 900/2000」说成 900/900
+      const total = Math.max(fileState.total || 0, files.length);
+      let text = `完成 ${done}/${total}`;
       if (running) text += ` · 进行中 ${running}`;
       if (paused) text += ` · 已暂停 ${paused}`;
       if (failed) text += ` · 失败 ${failed}`;
+      if (total > files.length) text += ` · 已加载 ${files.length}/${total}`;
       if (keyword && matched.length !== files.length) text += ` · 匹配 ${matched.length}`;
       if (matched.length > shown.length) text += ` · 仅显示前 ${FILE_RENDER_LIMIT}（可过滤）`;
       if (summaryEl.textContent !== text) summaryEl.textContent = text;
@@ -1084,6 +1097,7 @@
       }
       fileState.id = nextId;
       fileState.files = [];
+      fileState.total = 0;
       fileState.sig = "";
       fileState.loaded = false;
       fileState.lastActive = null;
@@ -1108,6 +1122,7 @@
         if (sig === fileState.sig) return; // 状态没变，不重排 DOM
         fileState.sig = sig;
         fileState.files = Array.isArray(data.files) ? data.files : [];
+        fileState.total = Number(data.file_total) || fileState.files.length;
         renderFileList();
       } catch (e) {
         if (selectedId !== jobId) return;
@@ -1190,6 +1205,11 @@
         jobCache.set(job.id, job);
       }
 
+      // 先清掉已经不存在的任务缓存，否则 jobCache.has() 恒真，
+      // 别处删掉的任务会永远占着详情面板（按钮点下去全是 404）
+      for (const id of [...jobCache.keys()]) {
+        if (!ids.has(id)) jobCache.delete(id);
+      }
       if (selectedId && !jobCache.has(selectedId)) {
         selectedId = null;
         openPauseMenu = false;
@@ -1216,7 +1236,48 @@
 
     function showAddForm(show) {
       $("add-form").classList.toggle("hidden", !show);
-      if (show) $("new_name").focus();
+      if (show) {
+        $("new_name").focus();
+        loadAria2Profiles();
+      }
+    }
+
+    // ---- 多 Aria2：新增任务时选一套（配置在设置页维护）----
+    async function loadAria2Profiles() {
+      const sel = $("new_aria2");
+      try {
+        const data = await api("/api/aria2/profiles");
+        const profiles = Array.isArray(data.profiles) ? data.profiles : [];
+        const previous = sel.value;
+        sel.textContent = "";
+        if (!profiles.length) {
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "未配置（去设置页添加）";
+          sel.appendChild(opt);
+          sel.disabled = true;
+          return;
+        }
+        sel.disabled = false;
+        for (const profile of profiles) {
+          const opt = document.createElement("option");
+          opt.value = profile.name || "";
+          const marks = [];
+          if (profile.name === data.default) marks.push("默认");
+          if (profile.aria2_remote) marks.push("远端");
+          opt.textContent = (profile.name || "未命名") + (marks.length ? "（" + marks.join(" · ") + "）" : "");
+          sel.appendChild(opt);
+        }
+        const wanted = previous || data.default || "";
+        if (wanted) sel.value = wanted;
+      } catch (e) {
+        sel.textContent = "";
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "读取 Aria2 配置失败";
+        sel.appendChild(opt);
+        sel.disabled = true;
+      }
     }
 
     $("btn-toggle-add").onclick = () => {
@@ -1297,6 +1358,8 @@
       return Object.keys(payload).length ? payload : null;
     }
 
+    let treeSubmitting = false;
+
     function treeSyncHeader(job) {
       const panel = treePanelEl();
       if (!panel) return;
@@ -1323,7 +1386,8 @@
       if (btn) {
         const running = jobIsActive(job);
         // 运行中也能追加：新勾选排队，当前批次下完自动接着下（受网盘容量限制仍是串行转存）
-        btn.disabled = !selFiles && !selDirs;
+        // 提交中要保持禁用：5s 轮询会反复调这里，否则能连点出两次「下载所选」
+        btn.disabled = (!selFiles && !selDirs) || treeSubmitting;
         btn.title = running
           ? "把勾选项追加到正在运行的任务（当前批次下完自动接着下）"
           : "把勾选项追加到任务并开始下载";
@@ -1556,12 +1620,15 @@
         children.hidden = false;
         return;
       }
+      const jobId = treeState.jobId;
       const box = document.createElement("div");
       box.dataset.owner = fid;
       box.append(treeHintEl("加载中…"));
       row.after(box);
       try {
         const data = await treeFetch(fid);
+        // 期间切了任务 / 这一行已经被重画掉：结果直接丢弃
+        if (treeState.jobId !== jobId || !box.isConnected) return;
         box.replaceChildren();
         if (!data.entries || !data.entries.length) {
           box.append(treeHintEl("（空目录）"));
@@ -1569,7 +1636,11 @@
         }
         treeRenderEntries(box, data.entries, depth + 1);
       } catch (e) {
+        if (treeState.jobId !== jobId || !box.isConnected) return;
         box.replaceChildren(treeHintEl(e.message, true));
+        // 展开失败要退回折叠态，否则再点只会切 hidden，永远等不到重试
+        treeState.expanded.delete(fid);
+        if (caret) caret.textContent = "▸";
       }
     }
 
@@ -1623,8 +1694,10 @@
     }
 
     async function treeDownloadSelected() {
+      if (treeSubmitting) return;
       const job = selectedId ? jobCache.get(selectedId) : null;
       if (!job) return;
+      const jobId = job.id;
       const payload = treeSelectionPayload();
       if (!payload) {
         setTreeMsg("先勾选要下载的文件或文件夹", "err");
@@ -1633,12 +1706,15 @@
       const wasRunning = jobIsActive(job);
       const panel = treePanelEl();
       const btn = panel ? panel.querySelector('button[data-act="tree-download"]') : null;
+      treeSubmitting = true;
       if (btn) btn.disabled = true;
       try {
         const data = await api("/api/jobs/" + job.id + "/selection/add", {
           method: "POST",
           body: JSON.stringify(payload),
         });
+        // 提交期间用户可能切到别的任务：旧任务的 fid 不能写进新任务的树状态
+        if (treeState.jobId !== jobId) return;
         // 本地打标要区分「真加进来了」和「被拦下的重复项」：
         // 重复项沿用后端给的归属任务，否则会显示成当前任务的「已勾选」。
         const duplicatesList = Array.isArray(data.duplicates) ? data.duplicates : [];
@@ -1720,6 +1796,7 @@
       } catch (e) {
         setTreeMsg(e.message, "err");
       } finally {
+        treeSubmitting = false;
         treeSyncHeader(selectedId ? jobCache.get(selectedId) : null);
       }
     }
@@ -1759,8 +1836,19 @@
       }
     }
 
+    // 后端 file_override.yaml 是「读-改-写」，并发会互相覆盖（删除指令丢了文件会被重新下回来），
+    // 所以逐文件操作用一条链串起来，一次只发一个请求。
+    let fileActionChain = Promise.resolve();
+
+    function fileAction(op, path, fid) {
+      fileActionChain = fileActionChain
+        .then(() => doFileAction(op, path, fid))
+        .catch(() => {});
+      return fileActionChain;
+    }
+
     // 逐文件操作：暂停 / 开始 / 删除（后端写 file_override.yaml，运行中约 1 秒内生效）
-    async function fileAction(op, path, fid) {
+    async function doFileAction(op, path, fid) {
       const jobId = selectedId;
       if (!jobId || !path) return;
       const verb = op === "pause" ? "暂停" : op === "resume" ? "开始" : "删除";
@@ -1875,6 +1963,7 @@
             name,
             share_url: shareUrl,
             share_pwd: $("new_pwd").value,
+            aria2_profile: $("new_aria2").value || "",
           }),
         });
         $("new_name").value = "";
@@ -1937,11 +2026,21 @@
       renderFileList();
     });
 
+    const jobActionBusy = new Set();
+
     $("detail").addEventListener("click", async (ev) => {
       const btn = ev.target.closest("button[data-act]");
       if (!btn || !selectedId) return;
       const id = selectedId;
       const act = btn.dataset.act;
+      // 连点保护：第二次点击在第一个请求回来前就发出去了，只会弹一条假错误
+      const guardable = act === "start" || act === "pause-soft" || act === "pause-hard" || act === "delete";
+      const busyKey = id + ":" + act;
+      if (guardable && jobActionBusy.has(busyKey)) return;
+      if (guardable) {
+        jobActionBusy.add(busyKey);
+        btn.disabled = true;
+      }
       try {
         if (act === "pause-menu") {
           openPauseMenu = !openPauseMenu;
@@ -1995,6 +2094,11 @@
       } catch (e) {
         setMsg($("jobs-msg"), e.message, "err");
         await refreshJobs({ silentLog: false });
+      } finally {
+        if (guardable) {
+          jobActionBusy.delete(busyKey);
+          btn.disabled = false;
+        }
       }
     });
 
@@ -2008,6 +2112,7 @@
 
     (async () => {
       await refreshJobs({ silentLog: false });
+      loadAria2Profiles();  // 预填下拉，打开新增表单就不用等接口
       setInterval(() => {
         refreshJobs().catch(() => {});
       }, 5000);

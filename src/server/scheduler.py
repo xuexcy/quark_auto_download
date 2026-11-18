@@ -95,21 +95,26 @@ class PipelineScheduler:
         按目录缓存，一个目录只列一次，避免逐文件一次 file/sort。
         """
         relative_dir = self.file_api.relative_dir(relative_path)
-        if relative_dir not in self._my_dir_cache:
-            cache: dict[str, str] = {}
-            try:
-                parent_fid = self.file_api._parent_fid_for(relative_dir)
-                if parent_fid:
-                    for name, entry in self.file_api._entries_by_name(parent_fid).items():
-                        fid = str(entry.get("fid") or "").strip()
-                        if fid:
-                            cache[name] = fid
-            except Exception as e:
-                if self.logger:
-                    self.logger.warning(f"  列举网盘目录失败，按未转存处理: /{relative_dir} | {e}")
-            self._my_dir_cache[relative_dir] = cache
         base_name = relative_path.rsplit("/", 1)[-1]
-        return self._my_dir_cache[relative_dir].get(base_name, "")
+        cached = self._my_dir_cache.get(relative_dir)
+        if cached is not None:
+            return cached.get(base_name, "")
+        cache: dict[str, str] = {}
+        try:
+            parent_fid = self.file_api._parent_fid_for(relative_dir)
+            if parent_fid:
+                for name, entry in self.file_api._entries_by_name(parent_fid).items():
+                    fid = str(entry.get("fid") or "").strip()
+                    if fid:
+                        cache[name] = fid
+        except Exception as e:
+            # 列举失败绝不能缓存：一次网络抖动就会把「已转存」判成「没转存」，
+            # 重复转存会把配额占满（旧实现正是这么缓存的）。
+            if self.logger:
+                self.logger.warning(f"  列举网盘目录失败，按未转存处理: /{relative_dir} | {e}")
+            return ""
+        self._my_dir_cache[relative_dir] = cache
+        return cache.get(base_name, "")
 
     def initialize(self, all_files: list[dict], logger) -> None:
         self.logger = logger
@@ -316,8 +321,19 @@ class PipelineScheduler:
         if job.state == "failed":
             if job.path in self.failed_files:
                 self.failed_files.remove(job.path)
-            job.state = "ready" if job.already_transferred else "pending"
-            job.note = "用户重新开始（此前失败）"
+            # 失败后云端副本可能已经被清理掉了（mark_failed 走 cleanup），
+            # 这时再回 ready 会拿着已失效的 my_fid 去取直链，必定失败且不会重新转存。
+            # 只有「网盘副本确实被清理掉了」才需要重新转存；keep_cloud 的失败仍留着副本
+            purged = "已清理网盘文件" in str(job.note or "")
+            if purged and job.already_transferred:
+                job.already_transferred = False
+                if isinstance(job.file_item, dict):
+                    job.file_item.pop("my_fid", None)
+                job.state = "pending"
+                job.note = "用户重新开始（云端副本已清理，将重新转存）"
+            else:
+                job.state = "ready" if job.already_transferred else "pending"
+                job.note = "用户重新开始（此前失败）"
             job.download_task = None
             return True
         return False

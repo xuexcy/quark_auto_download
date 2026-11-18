@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,7 @@ from config_loader import (
     load_web_settings,
     resolve_config_path,
 )
+import aria2_profiles as aria2cfg
 from log_util import dated_job_log_path, dated_web_log_path
 
 JOBS_INDEX = os.path.join(BASE_DIR, "state", "jobs.yaml")
@@ -87,17 +89,21 @@ def _write_private_text(path: str, text: str) -> None:
 def _atomic_yaml_write(path: str, payload: dict) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = f"{path}.{os.getpid()}.{time.time_ns()}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
-        # 不 fsync 的话断电后可能留下 0 字节的 jobs.yaml（rename 已可见但内容未落盘）
-        f.flush()
-        os.fsync(f.fileno())
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(payload, f, allow_unicode=True, sort_keys=False)
+            # 不 fsync 的话断电后可能留下 0 字节的 jobs.yaml（rename 已可见但内容未落盘）
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        # 序列化/写盘中途失败时别把 .tmp 留在 state/ 里
+        _remove_quietly(tmp)
     try:
         dir_fd = os.open(os.path.dirname(path) or ".", os.O_RDONLY)
     except OSError:
@@ -113,8 +119,15 @@ def _atomic_yaml_write(path: str, payload: dict) -> None:
 def _read_yaml(path: str) -> dict:
     if not os.path.isfile(path):
         return {}
-    with open(path, encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError) as e:
+        # 单个坏文件不能让 /api/jobs 整体 500（任务列表、暂停、删除全都得还能用）
+        logging.getLogger("jobs_manager").warning(
+            "读取 YAML 失败，按空处理: %s | %s", path, e
+        )
+        return {}
     return data if isinstance(data, dict) else {}
 
 
@@ -305,9 +318,16 @@ def get_job(job_id: str) -> dict | None:
     return None
 
 
-def upsert_job(job: dict) -> dict:
-    """按 id 合并写入：只覆盖传入的字段，避免把并发写入的 log_path/status 整条冲掉。"""
+def upsert_job(job: dict, *, only_keys: tuple[str, ...] | list[str] | None = None) -> dict:
+    """按 id 合并写入：只覆盖传入的字段，避免把并发写入的 log_path/status 整条冲掉。
+
+    only_keys 用于「锁外拿到整条快照、只想改其中几个字段」的调用方（子进程退出、
+    refresh 回写），避免拿旧快照把 Web 刚写进去的 selection 覆盖回去。
+    """
     incoming = {k: v for k, v in job.items() if v is not None}
+    if only_keys is not None:
+        allowed = set(only_keys)
+        incoming = {k: v for k, v in incoming.items() if k in allowed or k == "id"}
     with _index_lock():
         jobs = load_jobs_index()
         for i, item in enumerate(jobs):
@@ -350,14 +370,23 @@ def add_job(
     share_pwd: str = "",
     name: str = "",
     selection: dict | None = None,
+    aria2_profile: str = "",
 ) -> dict:
     share_url = str(share_url or "").strip()
     name = str(name or "").strip()
     selection = normalize_selection(selection)
+    profile = str(aria2_profile or "").strip()
     if not share_url:
         raise ValueError("分享链接不能为空")
     if not name:
         raise ValueError("任务名不能为空")
+    if profile:
+        try:
+            names = aria2cfg.profile_names(load_section("aria2"))
+        except Exception:
+            names = []
+        if profile not in names:
+            raise ValueError(f"Aria2 配置不存在: {profile}")
 
     with _index_lock():
         jobs = load_jobs_index()
@@ -386,6 +415,8 @@ def add_job(
             "selection": selection,
             # explicit = 勾选范围由用户决定（哪怕为空也不等于「下载全部」）
             "selection_mode": "explicit" if selection else "",
+            # 用哪套 Aria2 配置（conf/aria2.yaml 的 aria2_profiles）；空 = 默认配置
+            "aria2_profile": profile,
         }
         _atomic_yaml_write(job_control_file(job_id), {"command": "none", "updated_at": _now()})
         jobs.append(job)
@@ -445,9 +476,14 @@ def share_usage(job_id: str = "") -> dict[str, dict]:
             usage.setdefault(
                 fid, {"job_id": jid, "job_name": name, "state": "selected", "kind": "dir"}
             )
+        # 用户在「文件进度」里删掉的文件仍留在 pipeline_state 里（要等子进程下一拍才清），
+        # 但它已经不算「已在任务中」了：否则目录树会显示「已勾选」、重新勾选又被当成重复项挡掉。
+        deleted_paths = read_file_override(jid)["deleted"]
         state = _read_yaml(job_state_file(jid))
         for item in state.get("files") or []:
             if not isinstance(item, dict):
+                continue
+            if str(item.get("path") or "").strip() in deleted_paths:
                 continue
             fid = str(item.get("fid") or "").strip()
             if not fid:
@@ -505,6 +541,17 @@ def add_job_selection(job_id: str, selection: dict | None, force: bool = False) 
                         added[key].append(fid)
                 else:
                     duplicates.append(dict(owner, fid=fid, reason="other_job"))
+
+        # 用户这次提交上来的文件，如果之前被「文件进度」删过，先把删除标记撤掉，
+        # 否则子进程会把它们当已删除过滤掉（页面上表现为「勾了但没反应」）。
+        # 注意要覆盖**全部请求的 fid**，不只是新增的：删掉后重新勾选同一个文件时，
+        # 它可能还留在 selection 里（already_in_job），只撤「新增项」会漏掉这条标记。
+        requested_files = list(normalized.get("file_fids") or [])
+        if requested_files:
+            try:
+                forget_deleted_paths(job_id, fids=requested_files)
+            except OSError as e:
+                raise ValueError(f"撤销删除标记失败: {e}") from e
 
         merged = {k: v for k, v in merged.items() if v}
         job["selection"] = merged
@@ -629,28 +676,112 @@ _FILE_OP_ALIASES = {
 }
 
 
-def read_file_override(job_id: str) -> dict[str, set[str]]:
-    """读逐文件控制文件，返回 {"paused","deleted","retry"} 三个集合（读不出来按空处理）。"""
-    result: dict[str, set[str]] = {"paused": set(), "deleted": set(), "retry": set()}
+def read_file_override(job_id: str) -> dict:
+    """读逐文件控制文件（读不出来按空处理）。
+
+    返回 {"paused","deleted","retry"} 三个路径集合，外加 deleted_map（fid → 路径）：
+    删除是按路径记的，但用户之后可能只拿着 fid 重新勾选同一个文件，需要靠这张表把删除标记撤掉。
+    """
+    result: dict = {
+        "paused": set(),
+        "deleted": set(),
+        "retry": set(),
+        "deleted_map": {},
+    }
     try:
         data = _read_yaml(job_override_file(job_id))
     except Exception:
         return result
     if not isinstance(data, dict):
         return result
-    for key in result:
+    for key in ("paused", "deleted", "retry"):
         raw = data.get(key)
         if isinstance(raw, list):
             result[key] = {str(v).strip() for v in raw if str(v).strip()}
+    raw_map = data.get("deleted_map")
+    if isinstance(raw_map, dict):
+        result["deleted_map"] = {
+            str(k).strip(): str(v).strip()
+            for k, v in raw_map.items()
+            if str(k).strip() and str(v).strip()
+        }
     return result
 
 
-def write_file_override(job_id: str, override: dict[str, set[str]]) -> None:
+def write_file_override(job_id: str, override: dict) -> None:
     payload = {
         key: sorted(str(v) for v in (override.get(key) or set()) if str(v).strip())
         for key in ("paused", "deleted", "retry")
     }
+    raw_map = override.get("deleted_map") or {}
+    if isinstance(raw_map, dict) and raw_map:
+        payload["deleted_map"] = {
+            str(k): str(v) for k, v in sorted(raw_map.items()) if str(k) and str(v)
+        }
     _atomic_yaml_write(job_override_file(job_id), payload)
+
+
+def _state_fid_paths(job_id: str, fids: list[str]) -> dict[str, str]:
+    """从 pipeline_state 里查 fid → 相对路径（删除前调用，记下「哪个 fid 对应哪条路径」）。"""
+    wanted = {str(f).strip() for f in (fids or []) if str(f).strip()}
+    if not wanted:
+        return {}
+    state = _read_yaml(job_state_file(job_id))
+    files = state.get("files")
+    if not isinstance(files, list):
+        return {}
+    found: dict[str, str] = {}
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        fid = str(item.get("fid") or "").strip()
+        path = str(item.get("path") or "").strip()
+        if fid in wanted and path:
+            found[fid] = path
+    return found
+
+
+def forget_deleted_paths(job_id: str, *, paths: list[str] | None = None, fids: list[str] | None = None) -> int:
+    """把删除标记撤掉（重新勾选 / 点开始时用），返回撤掉的路径数。
+
+    删除是「按路径持久记」的：用户删掉文件后再从目录树勾回来，如果不撤这条标记，
+    子进程会把它当成「已删除」直接过滤掉（追加勾选看起来没反应）。
+    """
+    targets = {str(p).strip() for p in (paths or []) if str(p).strip()}
+    wanted_fids = {str(f).strip() for f in (fids or []) if str(f).strip()}
+    if not targets and not wanted_fids:
+        return 0
+    with _index_lock():
+        override = read_file_override(job_id)
+        removed: set[str] = set()
+        mapping = dict(override.get("deleted_map") or {})
+        for fid in list(wanted_fids):
+            path = mapping.get(fid)
+            if path:
+                removed.add(path)
+                mapping.pop(fid, None)
+        # 没记上 fid → 路径（例如删除时任务刚重启、pipeline_state 还没写）时，
+        # 用当前 pipeline_state 兜底，否则「删掉后再勾回来」会被永久挡住。
+        unresolved = [fid for fid in wanted_fids if fid not in mapping]
+        if unresolved:
+            for fid, path in _state_fid_paths(job_id, unresolved).items():
+                if path in override["deleted"]:
+                    removed.add(path)
+                mapping.pop(fid, None)
+        for path in list(targets):
+            if path in override["deleted"]:
+                removed.add(path)
+            else:
+                continue
+            for fid, mapped in list(mapping.items()):
+                if mapped == path:
+                    mapping.pop(fid, None)
+        if not removed:
+            return 0
+        override["deleted"] -= removed
+        override["deleted_map"] = mapping
+        write_file_override(job_id, override)
+    return len(removed)
 
 
 def _recount_state_files(state: dict) -> None:
@@ -780,21 +911,44 @@ def apply_file_control(
     runtime = refresh_job_runtime(job, persist=False)
     running = bool(runtime.get("running"))
 
-    override = read_file_override(job_id)
-    if action == "pause":
-        override["paused"] |= set(wanted_paths)
-        override["deleted"] -= set(wanted_paths)
-        override["retry"] -= set(wanted_paths)
-    elif action == "resume":
-        override["paused"] -= set(wanted_paths)
-        override["deleted"] -= set(wanted_paths)
-        override["retry"] |= set(wanted_paths)
-    else:
-        override["paused"] -= set(wanted_paths)
-        override["retry"] -= set(wanted_paths)
-        if wanted_paths:
-            override["deleted"] |= set(wanted_paths)
-    write_file_override(job_id, override)
+    # 读-改-写必须互斥：两个请求（连点两行、或两个标签页）各自读到同一份快照再
+    # 整份写回，后写者会把前一个的暂停/删除悄悄抹掉（删除丢了文件会被重新下载）。
+    with _index_lock():
+        override = read_file_override(job_id)
+        if action == "pause":
+            override["paused"] |= set(wanted_paths)
+            override["deleted"] -= set(wanted_paths)
+            override["retry"] -= set(wanted_paths)
+            mapping = dict(override.get("deleted_map") or {})
+            override["deleted_map"] = {
+                fid: p for fid, p in mapping.items() if p not in set(wanted_paths)
+            }
+        elif action == "resume":
+            override["paused"] -= set(wanted_paths)
+            override["deleted"] -= set(wanted_paths)
+            override["retry"] |= set(wanted_paths)
+            mapping = dict(override.get("deleted_map") or {})
+            override["deleted_map"] = {
+                fid: p for fid, p in mapping.items() if p not in set(wanted_paths)
+            }
+        else:
+            override["paused"] -= set(wanted_paths)
+            override["retry"] -= set(wanted_paths)
+            if wanted_paths:
+                override["deleted"] |= set(wanted_paths)
+            # 记下 fid → 路径：用户以后可能只拿着 fid 重新勾选同一个文件，
+            # 那时要靠这张表把「已删除」撤掉（见 forget_deleted_paths）
+            mapping = dict(override.get("deleted_map") or {})
+            resolved = _state_fid_paths(job_id, wanted_fids)
+            # pipeline_state 里查不到（刚重启、还没跑过一拍）时退化为按位置配对：
+            # 前端一次操作只发「一个路径 + 一个 fid」，两个列表天然一一对应。
+            if len(wanted_fids) == len(wanted_paths):
+                for fid, path_text in zip(wanted_fids, wanted_paths):
+                    resolved.setdefault(fid, path_text)
+            for fid, path_text in resolved.items():
+                mapping[fid] = path_text
+            override["deleted_map"] = mapping
+        write_file_override(job_id, override)
 
     result = {
         "job_id": job_id,
@@ -844,16 +998,20 @@ def delete_job(job_id: str, *, force_stop: bool = True) -> None:
     job = get_job(job_id)
     if not job:
         raise ValueError(f"任务不存在: {job_id}")
-    if force_stop:
-        try:
-            pause_job(job_id, mode="hard")
-        except Exception:
-            stop_job_process(job_id)
-    with _index_lock():
-        jobs = [j for j in load_jobs_index() if j.get("id") != job_id]
-        save_jobs_index(jobs)
-    # 清掉任务目录（pid / control / pipeline_state / 报告），避免同链接重建时继承旧状态
-    shutil.rmtree(job_dir(job_id), ignore_errors=True)
+    # 与 start_job 共用启动锁：否则「删目录」可以与「Popen + 写 pid」交错，
+    # 锁文件被 rmtree 掉以后新一次 start 会在新 inode 上重新加锁 → 双进程，
+    # 而 pid 文件因目录消失写不进去 → 索引里没有、页面上也停不掉的孤儿进程。
+    with _job_start_lock(job_id):
+        if force_stop:
+            try:
+                pause_job(job_id, mode="hard")
+            except Exception:
+                stop_job_process(job_id)
+        with _index_lock():
+            jobs = [j for j in load_jobs_index() if j.get("id") != job_id]
+            save_jobs_index(jobs)
+        # 清掉任务目录（pid / control / pipeline_state / 报告），避免同链接重建时继承旧状态
+        shutil.rmtree(job_dir(job_id), ignore_errors=True)
 
 
 def _job_file_stats(state: dict) -> dict:
@@ -1123,6 +1281,23 @@ def start_job(job_id: str) -> dict:
         elif os.path.isfile(selection_file):
             _remove_quietly(selection_file)
 
+        # 这套任务用哪套 Aria2 配置；配置被删了就退回默认，并在日志里写明
+        requested_profile = str(job.get("aria2_profile") or "").strip()
+        try:
+            profile_name = aria2cfg.resolve_name(load_section("aria2"), requested_profile)
+        except Exception:
+            profile_name = requested_profile
+        profile_note = ""
+        if requested_profile and profile_name and profile_name != requested_profile:
+            profile_note = f"警告：Aria2 配置「{requested_profile}」不存在，改用「{profile_name}」"
+
+        # 启动前预检：地址/令牌配错时立刻 400 说清楚，不让子进程把每个文件重试 10 次
+        if profile_name:
+            try:
+                probe_aria2_profile(profile_name)
+            except Exception as e:
+                raise ValueError(f"Aria2 配置「{profile_name}」连不上: {e}") from e
+
         env = os.environ.copy()
         env["PYTHONPATH"] = os.path.join(BASE_DIR, "src", "server") + (
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
@@ -1136,12 +1311,17 @@ def start_job(job_id: str) -> dict:
         env["QUARK_AUTO_DL_JOB_LOG_FILE"] = log_path
         env["QUARK_AUTO_DL_SELECTION_FILE"] = selection_file
         env["QUARK_AUTO_DL_FILE_OVERRIDE_FILE"] = job_override_file(job_id)
+        if profile_name:
+            env["QUARK_AUTO_DL_ARIA2_PROFILE"] = profile_name
 
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         out = open(log_path, "a", encoding="utf-8")
         try:
             out.write(f"\n===== start {_now()} job={job_id} share={job.get('share_url', '')} =====\n")
             out.write(f"===== python={_python_bin()} =====\n")
+            out.write(f"===== aria2={profile_name or '(未配置)'} =====\n")
+            if profile_note:
+                out.write(f"===== {profile_note} =====\n")
             out.flush()
             proc = subprocess.Popen(
                 [_python_bin(), MAIN_SCRIPT],
@@ -1153,12 +1333,20 @@ def start_job(job_id: str) -> dict:
             )
         finally:
             out.close()  # 父进程关闭；子进程已继承 fd
-        _write_private_text(job_pid_file(job_id), str(proc.pid))
-
-        job["status"] = "running"
-        job["message"] = "运行中"
-        job["updated_at"] = _now()
-        upsert_job(job)
+        try:
+            os.makedirs(job_dir(job_id), exist_ok=True)
+            _write_private_text(job_pid_file(job_id), str(proc.pid))
+            job["status"] = "running"
+            job["message"] = "运行中"
+            job["updated_at"] = _now()
+            upsert_job(job)
+        except Exception:
+            # 目录被删 / 磁盘满时不能把刚拉起的进程丢在后台（索引里没有它，页面上停不掉）
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            raise
         return refresh_job_runtime(job)
 
 
@@ -1198,25 +1386,34 @@ def _job_paths_from_state(job_id: str) -> set[str]:
 
 
 def _aria2_client_from_config(job_id: str = ""):
+    """按任务选中的 Aria2 配置建客户端（多配置时各任务可以连不同的 aria2）。"""
     from aria2_api import Aria2Client
     import logging
 
     try:
-        aria2 = load_config(resolve_config_path("", "aria2"))
+        config = load_section("aria2")
     except Exception as e:
         raise RuntimeError(f"读取 aria2 配置失败: {e}") from e
 
+    job = get_job(job_id) if job_id else None
+    profile_name = aria2cfg.resolve_name(config, (job or {}).get("aria2_profile"))
+    aria2 = aria2cfg.options_for(config, profile_name)
+
     logger = logging.getLogger("jobs_manager")
+    remote = bool(aria2.get("aria2_remote"))
     return Aria2Client(
         host=str(aria2.get("aria2_host") or ""),
         secret=str(aria2.get("aria2_secret") or ""),
-        download_dir=str(aria2.get("aria2_download_dir") or "/tmp"),
+        # 这里只用于 pause / 清理，按路径对齐任务名；目录留空也无所谓（不再拼 /tmp 兜底）
+        download_dir="" if remote else str(aria2.get("aria2_download_dir") or ""),
         request_timeout=int(aria2.get("request_timeout") or 10),
         download_headers=None,  # 只用于 pause/清理，不提交下载，无需直链请求头
         poll_interval=int(aria2.get("poll_interval") or 30),
         download_timeout=int(aria2.get("download_timeout") or 7200),
         logger=logger,
         job_id=job_id,
+        remote=remote,
+        remote_dir=str(aria2.get("aria2_remote_dir") or ""),
     )
 
 
@@ -1234,6 +1431,7 @@ def pause_job(job_id: str, mode: str = "soft") -> dict:
     write_control(job_id, "hard_pause" if mode == "hard" else "soft_pause")
 
     aria2_result: dict = {}
+    aria2_error = ""
     paths = _job_paths_from_state(job_id)
     try:
         client = _aria2_client_from_config(job_id)
@@ -1247,25 +1445,31 @@ def pause_job(job_id: str, mode: str = "soft") -> dict:
                     paths, remove_active=False, remove_waiting=True
                 )
     except Exception as e:
+        aria2_error = str(e)
         job["message"] = f"暂停已下发，但 Aria2 处理失败: {e}"
 
     if mode == "hard":
         stop_job_process(job_id, timeout_sec=15)
         job["status"] = "paused"
-        job["message"] = (
+        message = (
             f"硬暂停完成：已暂停排队 {len(aria2_result.get('paused_waiting', []))}，"
             f"已暂停下载中 {len(aria2_result.get('paused_active', []))}（可下次恢复）"
         )
     else:
         if runtime["running"]:
             job["status"] = "soft_pausing"
-            job["message"] = (
+            message = (
                 f"软暂停中：已清排队 {len(aria2_result.get('removed_waiting', []))}，"
                 f"等待活跃任务完成"
             )
         else:
             job["status"] = "paused"
-            job["message"] = "已暂停（进程未运行）"
+            message = "已暂停（进程未运行）"
+    if aria2_error:
+        # 不能只显示「硬暂停完成」：aria2 里还在跑的话，下次开始会重复下载同一文件
+        job["aria2_error"] = aria2_error
+        message = f"{message}；Aria2 处理失败: {aria2_error}"
+    job["message"] = message
     job["updated_at"] = _now()
     # 重新读一遍再合并：期间 start_job/refresh 可能写过 log_path、status
     with _index_lock():
@@ -1296,6 +1500,108 @@ def load_section(basename: str) -> dict:
     return load_config(path)
 
 
+def list_aria2_profiles(*, mask_secrets: bool = True) -> dict[str, Any]:
+    """设置页 / 新增任务下拉用：全部 Aria2 配置 + 默认配置名。"""
+    config = load_section("aria2")
+    profiles = aria2cfg.profiles_of(config)
+    return {
+        "profiles": aria2cfg.public_profiles(profiles) if mask_secrets else profiles,
+        "default": aria2cfg.default_name(config),
+    }
+
+
+def aria2_target(name: str = "") -> dict[str, str]:
+    """按配置名取 RPC 地址与 secret（名字为空 / 已删除时用默认配置）。"""
+    config = load_section("aria2")
+    profile_name = aria2cfg.resolve_name(config, name)
+    options = aria2cfg.options_for(config, profile_name)
+    return {
+        "name": profile_name,
+        "host": str(options.get("aria2_host") or "").strip(),
+        "secret": str(options.get("aria2_secret") or ""),
+        # 远端标记与远端目录一起带回去：调用方（测试接口）没显式给的时候可以沿用
+        "remote": bool(options.get("aria2_remote")),
+        "remote_dir": str(options.get("aria2_remote_dir") or ""),
+    }
+
+
+def test_aria2_connection(
+    host: str,
+    secret: str = "",
+    timeout: int = 8,
+    *,
+    remote: bool = False,
+    remote_dir: str = "",
+) -> dict[str, Any]:
+    """连一次 aria2 RPC（getVersion + getGlobalStat + getGlobalOption），设置页「测试」用。"""
+    from aria2_api import Aria2Client
+    import logging
+
+    client = Aria2Client(
+        host=str(host or "").strip(),
+        secret=str(secret or ""),
+        download_dir="",
+        request_timeout=int(timeout or 8),
+        download_headers=None,
+        poll_interval=30,
+        download_timeout=60,
+        logger=logging.getLogger("aria2_test"),
+        remote=bool(remote),
+        remote_dir=str(remote_dir or ""),
+    )
+    version = client.aria2_get_version()
+    stat = client.aria2_get_global_stat()
+    # 对方默认下载目录：远端模式下最常出问题的地方（目录只读 → 每个文件 errorCode=16）
+    default_dir = ""
+    try:
+        option = client.aria2_get_global_option()
+        default_dir = str(option.get("dir") or "").strip()
+    except Exception:
+        default_dir = ""
+    return {
+        # 回显真正请求的地址：用户少写 /jsonrpc 时能看出被补成了什么
+        "host": client.host,
+        "version": str(version.get("version") or ""),
+        "enabled_features": version.get("enabledFeatures") or [],
+        "num_active": int(stat.get("numActive") or 0),
+        "num_waiting": int(stat.get("numWaiting") or 0),
+        "download_speed": int(stat.get("downloadSpeed") or 0),
+        # 远端：对方 aria2 的默认 dir（本机目录对远端没有意义）；本机：实际下载目录
+        "dir": str(client.remote_dir or default_dir or ""),
+        "server_dir": default_dir,
+    }
+
+
+def probe_aria2_profile(profile_name: str, timeout: int = 5) -> dict[str, Any]:
+    """按配置名探测一次 Aria2 RPC（启动任务前的预检）。
+
+    启动后才发现的连接错误要靠子进程逐文件重试（10 次）才暴露，
+    日志里只剩 501/400，用户看不出是「地址填成了 AriaNg 网页」。
+    这里花一次 getVersion 的时间把话说清楚，连不上就不启动任务。
+    """
+    from aria2_api import Aria2Client
+    import logging
+
+    config = load_section("aria2")
+    options = aria2cfg.options_for(config, profile_name)
+    client = Aria2Client(
+        host=str(options.get("aria2_host") or ""),
+        secret=str(options.get("aria2_secret") or ""),
+        download_dir="",
+        request_timeout=max(int(timeout or 5), 1),
+        download_headers=None,
+        poll_interval=30,
+        download_timeout=60,
+        logger=logging.getLogger("aria2_probe"),
+        remote=bool(options.get("aria2_remote")),
+        remote_dir=str(options.get("aria2_remote_dir") or ""),
+    )
+    # 目录不再参与预检：两个目录都可选，都留空时提交任务不带 dir，
+    # 由 aria2 自己的默认目录决定（本机不校验、不移动），不需要提前读 getGlobalOption。
+    version = client.aria2_get_version()
+    return version if isinstance(version, dict) else {}
+
+
 def _mask_secret(value: Any) -> str:
     text = str(value or "")
     if not text:
@@ -1307,14 +1613,29 @@ def _mask_secret(value: Any) -> str:
 
 def get_all_configs(*, mask_secrets: bool = True) -> dict[str, Any]:
     sections: dict[str, dict] = {}
+    raw_aria2: dict = {}
     for basename in ("quark", "aria2"):
         data = dict(load_section(basename))
+        if basename == "aria2":
+            # 先留一份未脱敏的，供「旧版单配置 → 多配置」迁移使用
+            raw_aria2 = dict(data)
         if mask_secrets:
             for key in SECRET_KEYS.get(basename, set()):
                 if key in data and data[key]:
                     data[key] = _mask_secret(data[key])
                     data[f"{key}__masked"] = True
         sections[basename] = data
+
+    aria2_section = sections["aria2"]
+    profiles = aria2cfg.profiles_of(raw_aria2)
+    aria2_section["aria2_profiles"] = (
+        aria2cfg.public_profiles(profiles) if mask_secrets else profiles
+    )
+    aria2_section["aria2_default"] = aria2cfg.default_name(raw_aria2)
+    if "aria2_profiles" in raw_aria2:
+        # 已经是多配置形态：旧版单配置字段不再回显，免得页面上填两遍
+        for key in aria2cfg.PROFILE_KEYS:
+            aria2_section.pop(key, None)
     return {
         "quark": sections["quark"],
         "aria2": sections["aria2"],
@@ -1337,36 +1658,91 @@ LOCAL_WRITE_PATH_KEYS = {
 }
 
 
+def _real_path(path: str) -> str:
+    """逐级 realpath：末级目录可能还不存在，把已存在的祖先解成真实路径再拼回去。"""
+    current = os.path.abspath(path)
+    suffix: list[str] = []
+    while current and not os.path.exists(current):
+        parent, name = os.path.split(current)
+        if not name or parent == current:
+            break
+        suffix.append(name)
+        current = parent
+    base = os.path.realpath(current) if current else os.path.realpath(path)
+    for name in reversed(suffix):
+        base = os.path.join(base, name)
+    return os.path.abspath(base)
+
+
+def _check_write_path(label: str, value: Any, roots: list[str]) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if not os.path.isabs(text):
+        raise ValueError(f"配置项 `{label}` 必须是绝对路径: {text}")
+    # 必须用 realpath：abspath 只做字符串归一，allowed_roots 里放一个软链就能写到任意位置
+    normalized = _real_path(text)
+    real_roots = [_real_path(root) for root in roots if root]
+    if any(
+        normalized == root or normalized.startswith(root.rstrip(os.sep) + os.sep)
+        for root in real_roots
+    ):
+        return
+    raise ValueError(
+        f"配置项 `{label}` 不在允许的目录内（允许: {', '.join(roots)}）: {text}"
+    )
+
+
 def _validate_write_paths(merged: dict) -> None:
     """本机写入路径只能指向白名单根目录，避免把下载目录改到 ~/.ssh、/etc 等位置。"""
     roots = allowed_roots(load_web_settings())
     for key, value in merged.items():
         if key not in LOCAL_WRITE_PATH_KEYS:
             continue
-        text = str(value or "").strip()
-        if not text:
+        _check_write_path(key, value, roots)
+    # 多 Aria2 时下载目录写在每条配置里，同样要过白名单
+    for profile in merged.get("aria2_profiles") or []:
+        if not isinstance(profile, dict):
             continue
-        if not os.path.isabs(text):
-            raise ValueError(f"配置项 `{key}` 必须是绝对路径: {text}")
-        normalized = os.path.abspath(text)
-        if any(root and (
-            normalized == root or normalized.startswith(root.rstrip(os.sep) + os.sep)
-        ) for root in roots):
-            continue
-        raise ValueError(
-            f"配置项 `{key}` 不在允许的目录内（允许: {', '.join(roots)}）: {text}"
-        )
+        name = str(profile.get("name") or "").strip() or "未命名"
+        for key in aria2cfg.PROFILE_PATH_KEYS:
+            _check_write_path(f"aria2_profiles[{name}].{key}", profile.get(key), roots)
 
 
 def save_section(basename: str, updates: dict) -> str:
+    # 读-改-写要互斥：设置页保存与扫码登录回调可能同时写 conf/quark.yaml，
+    # 各自读到旧文件再整份写回会丢掉对方刚写的项。
+    with _index_lock():
+        return _save_section_locked(basename, updates)
+
+
+def _save_section_locked(basename: str, updates: dict) -> str:
     path = config_path(basename)
     current = load_section(basename) if os.path.exists(path) else {}
     merged = dict(current)
+    updates = dict(updates or {})
+
+    if basename == "aria2" and isinstance(updates.get("aria2_profiles"), (list, tuple)):
+        # 多配置一次性整体替换：先合并掩码 secret，再校验，最后把旧版单配置字段清掉
+        incoming = updates.pop("aria2_profiles")
+        profiles = aria2cfg.merge_incoming(current, list(incoming))
+        aria2cfg.validate_profiles(profiles)
+        for key in aria2cfg.PROFILE_KEYS:
+            merged.pop(key, None)
+        merged["aria2_profiles"] = profiles
+        names = [profile["name"] for profile in profiles]
+        wanted = str(
+            updates.get("aria2_default") or current.get("aria2_default") or ""
+        ).strip()
+        merged["aria2_default"] = wanted if wanted in names else (names[0] if names else "")
+        updates.pop("aria2_default", None)  # 已按配置列表校正过，别再被通用循环覆盖
+
     secret_keys = SECRET_KEYS.get(basename, set())
     for key, value in updates.items():
         if key.endswith("__masked"):
             continue
-        if key in secret_keys and (value is None or value == "" or _is_masked_placeholder(value)):
+        # 只有「掩码占位」才算未修改；空串是显式清空（例如把带令牌的 aria2 改成无令牌）
+        if key in secret_keys and (value is None or _is_masked_placeholder(value)):
             continue
         # 分享链接改由 jobs 管理，高级配置不再覆盖
         if basename == "quark" and key in ("share_url", "share_pwd"):

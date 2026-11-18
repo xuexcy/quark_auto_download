@@ -1029,3 +1029,477 @@ retry:   []                      # 一次性意图：点「开始」/失败重�
   它会按 `ready` 重新取直链提交（相当于重下），而不是续传——因为 Aria2 那边的任务已经没了。
 
 
+
+## 二十一、2.6.0：多套 Aria2 配置 + 任务级选择（2026-11-17）
+
+### 21.1 需求与旧行为
+
+用户要求（m04107）：设置页里能配多个 aria2（点加号添加），创建下载任务时能选用哪一套配置。
+
+| 环节 | 2.5.4 的行为 | 后果 |
+| --- | --- | --- |
+| 配置 | `conf/aria2.yaml` 顶层 `aria2_host` / `aria2_secret` / `aria2_download_dir` / `download_destination_dir` | 只有一套，换 aria2 要改文件 |
+| 子进程 | `quark_main.py` 模块级常量 `ARIA2_HOST` 等，`init_clients()` 用它构造 `Aria2Client` | 一个进程只能连一台 |
+| Web 侧 | `jobs_manager._aria2_client_from_config()` 直接读顶层键 | 暂停 / 清理也固定那一台 |
+
+### 21.2 设计取舍
+
+| 问题 | 选择 | 为什么 |
+| --- | --- | --- |
+| 配置存哪 | 单文件 + `aria2_profiles` 列表 + `aria2_default` | 若按 `<name>.yaml` 拆文件，Web 要枚举目录、每条都要重做一遍掩码与白名单；而且「全局项只有一份」在结构上就成立了（轮询间隔 / 超时 / 队列水位不该每台重复填） |
+| 哪些键属于「一套配置」 | 只有 `aria2_host` / `aria2_secret` / `aria2_download_dir` / `download_destination_dir` | 这四项是「连哪台、写到哪」；其余是调度策略，属于部署而不是某台机器 |
+| 任务怎么引用 | 存**名字**（`jobs.yaml` 的 `aria2_profile`），不存下标 | 删掉中间一条时下标会整体错位、静默指向另一台；名字失配可以明确退回默认并写日志 |
+| 老配置怎么办 | 读时迁移（`profiles_of()` 把顶层四键包成一条「默认」），只在**保存时**改写文件 | 启动时不改用户文件；读写路径复用同一套函数 |
+| secret 掩码 | 按**名字**沿用旧值（`merge_incoming`） | 设置页是整表回传，掩码原样保存必须不动真实值；改名等于新建（否则「改个名就继承旧 secret」很意外） |
+| 删除配置 | 只改内存，点「保存配置」才落盘 | 误删一条不至于立刻让运行中的任务失去 host（配置在 `start_job` 时才解析） |
+
+### 21.3 后端改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_profiles.py`（新，200 行） | `profiles_of` / `profile_names` / `default_name` / `resolve_name` / `options_for` / `public_profiles` / `merge_incoming` / `validate_profiles`；常量 `PROFILE_KEYS`、`PROFILE_PATH_KEYS`、`DEFAULT_PROFILE_NAME` |
+| `src/server/jobs_manager.py` | `add_job(..., aria2_profile="")` 校验存在性并写进 job；`start_job` 解析配置名、设 `QUARK_AUTO_DL_ARIA2_PROFILE`、日志头写 `===== aria2=<名> =====`；`_aria2_client_from_config(job_id)` 按任务的配置名取 host/secret；新增 `list_aria2_profiles` / `aria2_target` / `test_aria2_connection`；`get_all_configs` 掩码 profiles 并隐藏旧四键；`_validate_write_paths` 抽 `_check_write_path` 并逐条校验 profiles 目录；`save_section` 在 `basename=="aria2"` 且带 `aria2_profiles` 时合并 → 校验 → 清旧四键 → 校正默认名 |
+| `src/server/aria2_api.py` | 新增 `aria2_get_version()`（`aria2.getVersion`，非 dict 返回 `{}`），供「测试」按钮用 |
+| `src/server/quark_main.py` | `ARIA2_PROFILE = resolve_name(ARIA2_FILE_CONFIG, getenv("QUARK_AUTO_DL_ARIA2_PROFILE", ""))`、`ARIA2_CONFIG = options_for(ARIA2_FILE_CONFIG, ARIA2_PROFILE)`，后面的常量逐项取 `ARIA2_CONFIG`；启动日志多一行 `Aria2 配置: X → host` |
+| `src/server/web_app.py` | `GET /api/aria2/profiles`、`POST /api/aria2/test`（掩码 / 空 host 用已保存值补全，失败 400「连接失败: …」）、`JobCreateRequest.aria2_profile`、`APP_VERSION = "2.6.0"` |
+
+### 21.4 前端
+
+- 设置页 Aria2 面板改成**卡片列表**：卡头一行是「配置名 input / 默认 radio / 测试 / 删除」，下面是 host、secret、临时目录、完成后目录。卡片全部用 DOM API 构建（`textContent` 赋值），避免把名字或 secret 塞进 `innerHTML` 时被引号打断。
+- 「测试」把卡片当前值发给 `POST /api/aria2/test`；host 空、secret 含 `*`（掩码）时后端用已保存的同名配置补全，所以「刚改完还没保存」和「改了名字」两种情况都能测出真实结果（后者会提示连接失败）。
+- 删除：先 `collectAria2()` 收回内存，再 splice；删掉的如果是默认，默认自动落到第一条；提示「已删除配置「x」，点「保存配置」后生效」。
+- 首页「新增任务」表单加了「Aria2 配置」下拉：打开表单时拉 `/api/aria2/profiles`，选项文字 `名字（默认）`，保留上次选择；没有配置时插入「未配置（去设置页添加）」并 `disabled`，提交时值是空串（= 用默认配置）。
+- 任务详情 `metaHtml` 在勾选统计之后加 `· aria2=<配置名>`，只在任务显式选过时显示。
+
+### 21.5 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 新增 `tests/pytest/test_aria2_profiles.py` | 20 个用例首跑全绿（迁移 / 空配置 / 重名去重 / 默认回退 / `options_for` 合并 / 掩码 / `merge_incoming` / 校验报错 / 保存清理旧四键 / 掩码保留 + 非法默认纠正 / profile 目录越界 / `get_all_configs` / `add_job` 三态 / 四个接口） |
+| 全仓 `pytest` | **169 passed**（2.5.4 基线 149 + 20） |
+| `compileall` / `node --check` | `src/server` 编译通过；两个页面的 `<script>` 各 1 块（index 55873 字符、settings 15798 字符）语法通过 |
+| 设置页真机 | 「＋ 添加」→ 卡片出现且 focus 到 host；填 `http://192.168.1.100:6800/jsonrpc` + token 后点「测试」→「连接成功：aria2 1.36.0，活动 0 / 等待 0」（真连 NAS 的 aria2）；保存后 `conf/aria2.yaml` 只剩 `aria2_profiles` + 全局项，`.bak` 留了旧的单配置 |
+| 掩码路径 | 刷新后 secret 显示 `********`，再点「测试」仍成功（后端用已保存的 secret 补全），说明掩码没被当成真值写回 |
+| 默认切换 / 删除 | 选另一条为默认 → 保存后 `aria2_default: NAS`；删掉「默认」那条 → 默认自动变 NAS，保存后文件里只剩一条 |
+| 建任务带配置 | 首页下拉选 `NAS` → `POST /api/jobs` 落盘 `aria2_profile: NAS`，任务详情显示 `· aria2=NAS`；删除任务后 `state/jobs.yaml` 回空 |
+
+### 21.6 边界与未验证
+
+- **配置是「任务启动时读一次」**：改 host/secret 或换默认对正在跑的任务不生效，必须重新「开始」；`start_job` 把配置名写进环境变量，子进程再解析成具体值。
+- **改名等于新建**：`merge_incoming` 按名字沿用 secret，改名后匹配不上，需要在页面上重填 token（否则 aria2 侧鉴权失败会以「连接失败」形式暴露在测试按钮里）。
+- **配置名被删后不主动迁移**：任务里仍是旧名，`resolve_name` 在下次 `start_job` 时退回默认并在任务日志写警告；Web 侧的暂停 / 清理同样走 `resolve_name`，不会因为旧名报错。
+- **全局项的取舍**：队列水位、并发、超时都是全局一份，多台 aria2 共用同一策略；如果以后要按机器限速，得把 `aria2_queue_*` 也搬进 profile，那会和「一台机器水位过了就停转存」的现有语义冲突。
+- **未真机验证「两台 aria2 同时跑不同任务」**：本机只有 NAS 那一台可用，验证的是「一台上配置多套 + 选择生效」；两台真机并发下载需要第二个 aria2 实例。
+- **没有做配置排序 / 复制**：卡片按保存顺序排列，删除不支持撤销（只能重新添加并重填 secret）。
+
+### 21.7 2.6.1：完成后目录留空的处理（2026-11-17）
+
+回答「下载临时目录不填会怎样」时发现的相邻问题：
+
+| 字段 | 留空时的旧行为 | 现在 |
+| --- | --- | --- |
+| `aria2_download_dir`（下载临时目录） | 保存被 `validate_profiles` 拦下（400「Aria2 配置「x」缺少下载临时目录」）；手改文件后子进程启动即 `_require()` 抛「配置项 `aria2_download_dir` 不能为空」 | 不变（这是必须的：没有落盘位置整条流水线没意义） |
+| `download_destination_dir`（完成后目录） | 能保存；`os.path.join("", rel)` 得到相对路径，`shutil.move` 把文件挪到**进程 cwd**（部署后是项目根），还会建同名目录；`local_copy_is_intact` 恒 False、清理前「本地没有可信副本就不删云端」的守卫被 `and` 短路跳过 | 留空 = **不移动**，文件留在 `<aria2_download_dir>/<job_id>/`；`FileApi.local_copy_root` 统一给「本地副本在哪」，移动/完成判定/本地已有副本统计/清理守卫都用它 |
+
+改动点（`src/server/file_api.py`）：
+
+- 新增 `local_copy_root` 属性：`self.download_destination_dir or self.download_root`。
+- `move_file_to_destination`：目标目录为空时直接 `os.path.isfile(src_path)` 返回，不再做 `shutil.move`。
+- `finish_downloaded_file`：目标目录为空时走单独分支，日志写「未配置完成后目录，文件保留在下载目录: …」，返回是否真的存在。
+- `local_copy_is_intact` / `get_local_downloaded_sizes_from_dirs`：改用 `local_copy_root`（原来空目标目录直接返回 `False` / `{}`）。
+- `cleanup_files_batch` 的删除守卫：`if self.download_destination_dir and not intact` → `if not intact`，没配目标目录也要有本地副本才删云端。
+
+验证：`tests/pytest/test_file_api_move.py` 新增 4 个用例（含 `monkeypatch.chdir` 断言进程目录里不出现文件），全仓 173 passed；NAS 部署后 `/api/health` = 2.6.1、`pytest` 同样 173 passed。
+
+
+## 二十二、2.7.0：远端 Aria2（2026-11-17）
+
+### 22.1 需求
+
+「朋友有公网 IP 和自己的 Aria2，想共用这个应用下载」。要求按原设计走：远端模式不填下载临时目录、完成后目录留空，
+不用单独处理落盘；提交下载时的 UA 与 Cookie 由应用负责（本来就在 `aria2.addUri` 的 `header` 里）。
+
+### 22.2 为什么只改这几处
+
+先划清「本机」与「远端」的边界：本机原来在这条链路上做四件事——
+① 给 `addUri` 指定 `dir`；② 用 `tellStatus` 的 `files[].path` 反算相对路径来认领任务；③ 下载完 `shutil.move` 到完成后目录；
+④ 清理云端副本前用本地副本大小做「删了不亏」的守卫。远端模式下 ①③④ 都不成立（不知道对方目录、文件不在本机），
+② 也不成立（对方返回的是它自己的绝对路径），所以判断点集中在「任务认领键」和「文件完成后的动作」两处，
+其余（转存、取直链、队列、暂停、容量闸门）与远端无关，一律不动。
+
+### 22.3 改动表
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_profiles.py` | `PROFILE_FLAGS = ("aria2_remote",)` + `_truthy()`；`profiles_of` / `merge_incoming` / `options_for` 把标记带进带出（旧单配置形态补 `False`）；`validate_profiles` 对远端跳过「缺少下载临时目录」，`aria2_host` 仍必填 |
+| `src/server/aria2_api.py` | `Aria2Client(..., remote=False)`；`aria2_add_url` 远端只发 `{"out": 文件名}`；新增 `_match_key()`，远端按 `basename` 匹配，本机仍按归一化相对路径；`_extract_task_filename` 远端直接取 basename；`aria2_find_task_by_path` / `_remove_by_paths` / `_pause_by_paths` 统一走 `_match_key` |
+| `src/server/file_api.py` | `FileApi(..., remote_download=False)`；远端下 `move_file_to_destination` → `True`、`finish_downloaded_file` 只记日志、`local_copy_is_intact` → `False`、`get_local_downloaded_sizes_from_dirs` → `{}`、`cleanup_empty_download_dirs` → `[]`；`cleanup_files_batch` 的本地副本守卫在远端跳过 |
+| `src/server/verify_download.py` | 新增 `verify_remote_downloads()`：按 `state in ("done","cleanup")` 且不在 `failed_files` 判成功，`destination_dir` / `local_path` 写「(远端 aria2)」，`actual_size` / `local_exists` 为 `None` |
+| `src/server/pipeline.py` | `verify_completed()` 按 `file_api.remote_download` 选报告实现 |
+| `src/server/quark_main.py` | `ARIA2_REMOTE = _as_bool(_CONFIG.get("aria2_remote"), False)`；远端不 `_require("aria2_download_dir")`、完成后目录置空；`init_clients` 把 `remote` / `remote_download` 传下去；启动与收尾日志换成远端口径 |
+| `src/server/jobs_manager.py` | `_aria2_client_from_config()` 读 `aria2_remote`，远端时 `download_dir=""` |
+| `src/web/static/settings.html` | 卡片新增「远端 aria2（只提交下载请求，不管理落盘目录）」勾选框；`syncRemote()` 置灰两个目录、占位改「远端，不用填」、卡片加 `.remote` 描边；`collectAria2()` 提交 `aria2_remote` |
+| `src/web/static/index.html` | 任务下拉标注「（默认 · 远端）」 |
+| `src/server/web_app.py` | `APP_VERSION = "2.7.0"` |
+| `conf/example/aria2.example.yaml` | 增加远端配置示例（只剩 host + secret） |
+
+### 22.4 验证
+
+- 新增 `tests/pytest/test_aria2_remote.py` 7 个：远端 `addUri` 只带 `out` 且 `header` 含 Cookie/UA、本机仍带 `dir`、远端取 basename、本机只认自己目录、远端 `pause_by_paths` 按 basename 命中、`FileApi` 远端五个方法、`verify_remote_downloads` 的 `{total,ok,failed}`。
+- `tests/pytest/test_aria2_profiles.py` +3：远端不要求目录、本机仍要求、`aria2_remote` 经 `save_section` 落盘后 `get_all_configs` 回读为 `True`。
+- 全仓 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -o addopts= -q` → **183 passed**；`compileall -q src/server` 通过；两个页面的 `<script>` 块 `node --check` 通过。
+- 本机浏览器（`http://127.0.0.1:8787/settings`）新增一条远端配置：勾选后 `aria2_download_dir` / `download_destination_dir` 均 `disabled`、占位「远端，不用填」、卡片加 `.remote`；只填 name/host/secret 保存成功，`conf/aria2.yaml` 里该条 `aria2_download_dir: ''`、`download_destination_dir: ''`、`aria2_remote: true`；刷新后回显勾选态；首页下拉显示「朋友的（远端）」；删掉该条再保存，文件回到两条配置。
+
+### 22.5 边界与未验证
+
+- **没有真机连远端**：本机与 NAS 都只有自己的 Aria2，验证停在「配置能存、代码分支正确、报告结构一致」这一层；真正的远端下载需要朋友那台机器。
+- **远端看到的直链就是你的账号直链**：`header` 里带着 `Cookie` / `Referer` / `UA`，对方可以在自己机器上重放这个请求，共用前要先接受这一点。
+- **直链时效**：夸克直链过期后远端 Aria2 会 403；长时间暂停后再继续，应用不会自动刷新直链，需要先「删除」该文件再重新勾选。
+- **远端不给进度以外的东西**：没有本地副本，「已下载过」的判断只存在于 Aria2 侧（应用按名字匹配任务）；对方手工删了文件，应用仍认为已完成。
+- **远端模式的清理**：`cleanup_files_batch` 跳过本地副本守卫，意味着「云端副本删不删」只看流水线状态，因此不要在远端模式下把 `download_destination_dir` 当保险绳用——它本来就是空的。
+
+## 二十三、2.8.0：Aria2 地址填错的诊断 + 一轮 review 修复（2026-11-18）
+
+### 23.1 现象
+
+NAS 上新建任务 `j67bc357015`（分享 `https://pan.quark.cn/s/5ba874e85746#/list/share/a970af00fec64d5195a867c7733e9f19`，
+勾 3 个文件 `198/199/200 4K.mp4`，共 6796 MB）：转存全部成功（`确认落盘 3/3`），
+但每个文件提交下载都打：
+
+```
+[下载主] 临时失败，进入重试旁路: 198 4K.mp4 | 1/10 | 501 Server Error: Not Implemented for url: https://dl.660888.xyz/
+```
+
+同时三个 Worker 每几秒刷一次 `查询 Aria2 排队数量失败…`、`读取 Aria2 任务快照失败…`，任务永远停在「运行中」。
+
+### 23.2 根因：填的是 AriaNg 网页地址，不是 RPC 地址
+
+在 NAS 上直接打配置里的 host（`aria2_profiles` 的「灰机nas」）：
+
+| 请求 | 结果 |
+| --- | --- |
+| `GET https://dl.660888.xyz/` | `200`，`<title>AriaNg</title>`（nginx 反代的静态控制台） |
+| `POST https://dl.660888.xyz/` / `/jsonrpc` / `/rpc` … | `501`，`text/html`，`Generated by darkhttpd/1.15` |
+| `POST https://dl.660888.xyz:6800/jsonrpc`（无 token） | `{"error":{"code":1,"message":"Unauthorized"}}` |
+| `POST https://dl.660888.xyz:6800/jsonrpc`（带配置里的 secret） | `{"result":{"version":"1.36.0",…}}` |
+
+即：443 是 AriaNg 网页，RPC 在 6800 端口的 `/jsonrpc`。旧代码把 HTML 501 当普通 HTTP 错误，
+`error_classify` 的 `5\d{2}` 又把它判成**临时错误**，于是重试 10 次、每轮再刷一堆查询失败日志——
+现象看着像「Aria2 挂了」，实际是地址错，重试多少次都不会好。
+
+### 23.3 修复：让配错误一次就说清楚，并且不要启动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_api.py` | 新增 `normalize_rpc_url()`（补 `/jsonrpc`）、`Aria2Error` / `Aria2ConfigError`；`_aria2_call()` 先判 JSON-RPC 再判状态码，HTML 返回抛「RPC 地址不对…AriaNg 网页地址不能当 RPC 用」，`error.code==1` 抛「令牌（rpc-secret）不对」 |
+| `src/server/error_classify.py` | 永久错误补 `rpc\s*地址不对` / `不是\s*json-rpc` / `rpc\s*未授权` / `rpc\s*令牌` |
+| `src/server/jobs_manager.py` | 新增 `probe_aria2_profile()`；`start_job` 在 Popen **之前**探一次 `aria2.getVersion`（5s），失败抛 `ValueError("Aria2 配置「x」连不上: …")` → 接口 400，页面直接显示 |
+| `src/server/web_app.py` | `/api/aria2/test` 成功时回传实际使用的 `host`（前端显示，便于核对是不是刚改的地址） |
+| `src/server/pipeline.py` | `_log_aria2_problem()`：同一错误 60 秒只打一条，重复时附「过去 60 秒同错误 N 次，已抑制」 |
+| `src/web/static/settings.html` | 测试成功文案带 host |
+
+### 23.4 本轮 review 修掉的问题
+
+四个只读子代理分别看 pipeline/scheduler/verify、web_app/jobs_manager、网络层、两个页面，逐条复核后修复：
+
+数据安全 / 一致性
+
+| 问题 | 后果 | 修复 |
+| --- | --- | --- |
+| 清理一直失败时 `cleanup` 闸门永久挡住转存（`pipeline.py` 清理分支 + `file_api` 拒绝删云端） | 所有 pending 不再转存，任务永不结束 | `_cleanup_failed_since` + `CLEANUP_GIVE_UP_SEC=600` 后标失败并保留云端副本 |
+| 转存回查只按 basename 认领 fid | 目标目录已有同名文件时，清理会删掉**用户原有文件** | 与 `saved_fids` 取交集，认不上按「未生效」处理 |
+| 远端 `complete` 就删云端副本 | 远端模式无本地副本，大小不对也照删 | 比对 `totalLength` 与任务登记大小 |
+| 提交下载期间用户暂停/删除 | 状态被覆盖回 `downloading`，Aria2 留下无人跟踪任务 | 提交回来锁内复核，必要时 `_discard_submitted_task()` 撤销 |
+| `_apply_file_override` 被三个线程并发调用 | 同一次删除发两遍、暂停与恢复交错 | 独立 `self._override_lock` |
+| `file_override.yaml` 读-改-写无锁（Web 侧） | 连点/两标签页丢指令，删掉的文件被重新下载 | `apply_file_control` 进 `_index_lock`；前端再把逐文件操作串成一条链 |
+| `resume_file` 带着过期 `my_fid` 回 `ready` | 取直链必失败 | note 含「已清理网盘文件」时退回 `pending` 重新转存 |
+| `_drop_file` 对 `cleanup` 态跳过删云端 | 云端副本只能等下次启动补删 | 只有 `done` 跳过 |
+| `verify_download` 三种正常情况判失败（空完成后目录 / 改名副本 / `cleanup` 收尾） | 下完的文件被写进失败报告，任务标 failed | 传 `local_copy_root` + `resolve_local_copy` resolver；`cleanup` 计入成功 |
+| 下载超时从提交时刻算，`waiting`/`paused` 也算 | 队列深或暂停 2 小时后，大批没开始的判超时 | 只对 `active` 计时（`active_at`） |
+
+安全
+
+| 问题 | 修复 |
+| --- | --- |
+| `delete_job` 不取启动锁 | 与 `start_job` 共用 `_job_start_lock(job_id)`，`rmtree` 放最后；Popen 后任何失败 `proc.kill()` |
+| `/api/aria2/test` 允许「用已保存的令牌测试请求体里的陌生地址」 | 换 host 必须重新填令牌；host 必须 `http(s)://` |
+| `hmac.compare_digest` 传 str | 改 bytes（非 ASCII 口令不再全站 500） |
+| 写路径白名单用 `abspath` | 改逐级 `realpath`（软链绕不出去） |
+| `save_section` 无锁、secret 空串无法清空 | 加锁；只有掩码占位算「未修改」 |
+| `api_share_tree` 的 `int(size)` 无保护 | `try/except` → 0 |
+
+协议正确性
+
+| 问题 | 修复 |
+| --- | --- |
+| 远端 `out` 只有 basename | 改传相对路径 `Show/S01E01.mkv`；`_match_key` 保留完整相对路径，`_path_matches()` 兼容早期只给文件名的任务 |
+| `list_share_files` 是唯一没 `_is_ok` 的分页接口 | 失败即抛，不再静默返回半截列表 |
+| `save_as` 为 `null` 时 `AttributeError` | `or {}` + isinstance |
+| `_entries_by_name` 读失败当空目录 | `strict=True` 返回 `None`，清理判失败 |
+| `cloud_fid_for` 把失败写进缓存 | 失败不缓存 |
+| 阈值可能是 `null`/`1e999` | `quark_main._as_int()` + 前端 `intField()` |
+| `_atomic_yaml_write` 残留 `.tmp`；`_read_yaml` 不容错 | finally 清理；坏 YAML 记 warning 返回 `{}` |
+
+前端
+
+- 日志：请求回来校验任务未切换；失败回退「未缓存」标记（原先失败一次就永不重试）
+- `jobCache` 同步删除（删掉的任务不再占着详情面板）；「文件进度」分母改用 `file_total`
+- 目录树：「下载所选」提交中禁用；切任务丢弃晚到分页；展开失败退回折叠态可重试
+- 任务级 开始/暂停/删除 连点保护；逐文件操作串行
+- 扫码轮询：世代令牌 `qrChain` + 连续失败退避（3 次才停） + 「生成二维码」禁用与只认最后一次会话
+
+### 23.5 验证
+
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -o addopts= -q` → **204 passed**
+  （新增 `test_verify_download.py` 6 条、`test_aria2_test_api.py` 4 条、`test_pipeline_cleanup.py` 2 条，
+  `test_aria2_rpc.py` 9 条覆盖 URL 归一化 / HTML 501 / 令牌错 / 预检拦截；远端 `out` 断言按新语义改写）
+- `compileall -q src` 通过；`index.html` / `settings.html` 的 `<script>` 块 `node --check` 通过
+- 过程中发现并修掉一处自己引入的缩进错误：`_wait_task_and_get_fids` 的 `save_as` 判空掉出 `if status == 2:`，
+  触发 `UnboundLocalError`（4 个用例当场变红，已恢复缩进）
+
+### 23.6 边界与未验证
+
+- **/api/aria2/test 的 SSRF 只挡了「改 host」这条路径**：如果已保存配置本身就是内网地址，测试按钮仍会打过去，
+  这是产品语义允许的（用户自己配的地址）。
+- **`delete_job` 的锁是进程内锁**：多 worker 部署（`uvicorn --workers N`）仍然挡不住跨进程竞态，
+  目前只支持单进程。
+- **远端 `out` 语义变了**：2.8.0 之前提交的远端任务只有 basename，`_path_matches()` 用 basename 兜底兼容，
+  但两个不同目录的同名文件仍然会互相覆盖（这是 2.8.0 才修的历史遗留）。
+- **前端 5s 轮询仍没有单飞 / `visibilitychange`**，多标签页时请求会叠加；只做了「旧响应不覆盖新数据」的守卫。
+- **设置页 `fillConfig()` 仍会全量重建 Aria2 卡片**：扫码成功、保存配置后，别的卡片上未保存的编辑会被冲掉。
+- **Aria2 RPC 地址本身没有自动纠正**：`normalize_rpc_url()` 只补路径，不会把 443 改 6800——
+  端口是用户配置，误判比不判更糟。**NAS 上那条「灰机nas」仍需把 host 改成 `https://dl.660888.xyz:6800/jsonrpc`。**
+
+### 23.7 2.8.1：远端 Aria2「速度一直 0」的真因与远端目录（2026-11-18）
+
+23.6 里那条「NAS 上『灰机nas』仍需把 host 改成 `:6800/jsonrpc`」在 2.8.0 部署时已改完并复测通过
+（`POST /api/aria2/test` → `{"ok":true,"host":"https://dl.660888.xyz:6800/jsonrpc","version":"1.36.0"}`）。
+改完 host 后用户重开任务，出现新症状：
+
+**现象** 任务 `j67bc357015`（「凡人修仙」，3 个 4K.mp4）转存成功、Aria2 提交成功（三个 gid 都有），
+但日志里每个文件固定 `↓ 198 4K.mp4  0.0%  速度: 0 KB/s`，30 秒后
+`✗ 下载失败，准备重试 … | Download aborted. | 重试 1/3`，三轮后判失败。
+
+**取证**（NAS 上直连远端 RPC，secret 从 `conf/aria2.yaml` 读、不打印）
+
+| 观察点 | 结果 |
+| --- | --- |
+| `aria2.getGlobalOption` | `dir=/downloads`、split=64、max-connection-per-server=32、continue=true、save-session=/config/aria2.session |
+| `tellActive` | 2 条 `active`，但 `completedLength=0 / totalLength=0`（一个字节都没写） |
+| `tellStopped` | 4 条全 `error / code 16 / Download aborted. / len 0 / 2324135706 / dir=/downloads/198 4K.mp4` |
+| addUri 探针（每个目录一个 11 KB 页面） | `/downloads` `/mnt` `/media` `/home` `/root` `/` → error 16；`/data` `/download` → error 18；`/var/tmp` `/tmp/quark` `/config` → complete |
+
+即：**对方 aria2 容器里的默认下载目录 `/downloads` 不可写**（只读挂载或无权限）。aria2 拿到直链后
+立刻失败，只留下 `errorCode=16 Download aborted.`；而 2.8.0 之前 pipeline 把这个 message 当临时错误，
+白重试 3 轮，页面上就是「提交成功但速度一直 0」。与本机直链、Cookie、UA 无关。
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_profiles.py` | 新增 `PROFILE_OPTIONAL_KEYS = ("aria2_remote_dir",)` / `PROFILE_ALL_KEYS`，读写、合并、`options_for` 都带上它（远端目录不过本机白名单） |
+| `src/server/aria2_api.py` | `Aria2Client(remote_dir=…)`；远端 `dir = posixpath.join(remote_dir, relative_dir)`；新增 `_ARIA2_ERROR_HINTS`（9/13/16/17/18/19/22/24）与 `describe_task_error()`（附 `errorCode` 原文与 `files[0].path`）、`PERMANENT_ARIA2_ERROR_CODES=(16,18)`、`aria2_get_global_option()` |
+| `src/server/pipeline.py` | 下载 `error` 分支先翻译错误，再 `classify_error() == "permanent"` → 直接 `apply_download_to_cleanup(failed=True, keep_cloud=True)`，不重试 |
+| `src/server/error_classify.py` | 永久错误补 `aria2 errorcode 16/18`、「无法在下载目录创建/写入」「无法创建下载子目录」 |
+| `src/server/jobs_manager.py` | 传 `remote_dir`；`test_aria2_connection` 返回 `dir`（远端目录或对方 `getGlobalOption.dir`）与 `server_dir` |
+| `src/server/web_app.py` | `Aria2TestRequest.remote / remote_dir`；`APP_VERSION = "2.8.1"` |
+| `src/web/static/settings.html` | 远端卡片多一个「远端下载目录」输入；改 host/令牌/远端目录、勾选远端后 800ms 防抖**自动测试**；保存成功后自动测全部卡片并在 `#cfg-msg` 汇总 |
+
+**测试**
+
+- 新增 `tests/pytest/test_aria2_task_error.py` 10 条：16/18 文案含路径、未知码原样、16/18 → permanent、
+  6 与裸 `Download aborted.` 仍 temporary、远端 `dir` 拼接（含子目录 / 空目录 / 尾斜杠）、
+  `aria2_remote_dir` 在 `profiles_of/options_for/merge_incoming` 往返（掩码 secret 保留）
+- 既有 3 个 fake 补 `**kwargs`（`tests/pytest/test_aria2_profiles.py:311/341`、`tests/pytest/test_aria2_test_api.py:39/69`）
+- 全仓 **214 passed**；`compileall -q src` 通过；两个页面 `node --check` 通过
+
+**部署与真机验证（NAS）**
+
+- `rsync` + `sudo -n systemctl restart quark_auto_download` → `/api/health` = 2.8.1 / pid 860070 / python 3.11.2
+- 远端目录探针：`/var/tmp/quark` 与 `/config/quark` 都能被 aria2 自动创建并 `complete`，故「默认 `/downloads` 只读、子目录可写」；
+  选 `/var/tmp/quark`（真实磁盘；`/config` 是 aria2 的配置卷，怕小）
+- 给「灰机nas」填上 `aria2_remote_dir=/var/tmp/quark` 后重启任务：子进程日志出现 `远端下载目录: /var/tmp/quark`，
+  三个文件提交成功（gid 45471d6ff3db6558 / 2180d6e19b7abc01 / b048c3dc590f825b）；
+  `tellActive` 显示 `len 2099249152 / 2324135706 speed 23299891 path /var/tmp/quark/198 4K.mp4`，
+  页面 `198 4K.mp4` 90.3% / 约 28 MB/s，**此前固定 0%**
+- 观察：`/api/jobs/{id}/files` 的 `progress/speed` 来自 5 秒一次的 state 落盘，轮询太密会看到 0.0（不是没在下）
+
+**验证时顺带修掉的两个链路缺陷**
+
+| 缺陷 | 根因 | 修法 |
+| --- | --- | --- |
+| 填了远端目录，实际仍提交 `/downloads` | `src/server/quark_main.py` 构造 `Aria2Client(... remote=ARIA2_REMOTE)` 时没传 `remote_dir`，配置只到界面为止 | 新增 `ARIA2_REMOTE_DIR`、`Aria2Client(remote_dir=…)`，启动日志加 `远端下载目录: …`（空则「(用对方默认目录)」） |
+| `POST /api/aria2/test {name}` 返回 `dir=/downloads` | `Aria2TestRequest.remote/remote_dir` 默认 False/""，接口把 `bool(body.remote)` 直接传下去，已保存的远端设置被丢掉 | 两个字段改成 `None` 缺省；同 host 时沿用同名配置，换 host 不继承；`aria2_target()` 一并暴露 `remote/remote_dir` |
+
+**删除后重新勾选不生效（验证中发现的真 bug）**
+
+- 现象：把三个文件在「文件进度」里删掉、再从目录树勾回来并 `/start`，进程 21 秒就报「所有文件下载成功」，
+  `/api/jobs/{id}/files` 为空 —— 子进程用 `_applied_deleted` 把它们全过滤了
+- 根因：`deleted` 按路径**持久**记在 `file_override.yaml`；`add_job_selection()` 只把 fid 加回 `jobs.yaml`/`selection.json`，
+  没撤删除标记；子进程 `self._applied_deleted |= deleted` 又是只增不减，于是「删掉 → 重勾」永远被挡
+- 修法：删除时同时记 `deleted_map`（fid → 路径，来自 `pipeline_state.yaml` 的 `files[]`）；
+  新增 `forget_deleted_paths(job_id, paths=…, fids=…)`，`add_job_selection()` 对新增的 fid 调用它撤标记；
+  子进程 `_apply_file_override_once` 改成 `self._applied_deleted = set(deleted)`（以文件为准，而不是累积）
+- 测试：`test_readd_after_delete_clears_marker`、`test_forget_deleted_paths_by_fid_only`、`test_pause_after_delete_drops_mapping`、
+  `test_readded_file_is_not_blocked_by_deleted_marker`（用 `_maybe_reload_selection` 走真流程）→ 全仓 **222 passed**
+
+**真机复验又挖出两处「删了勾不回来」（当轮修掉）**
+
+真机序列：`POST /api/jobs/{id}/files/action {"op":"delete",…}` → `POST /api/jobs/{id}/selection/add {"file_fids":[…]}`，
+返回 `added={"files":0}` + `duplicates=[{reason:"in_job_done", state:"downloading"}]`，删除标记原样保留 —— 用户视角就是「删了以后勾不回来」。
+
+| # | 根因 | 修法 |
+| --- | --- | --- |
+| 1 | `share_usage()` 只看 `jobs.yaml` 的 selection 与 `pipeline_state.yaml` 的 `files[]`；删除只摘了 selection，state 里那条 `state=downloading` 要等子进程下一拍才清，于是被 `add_job_selection()` 当成「已在任务中」挡下，`forget_deleted_paths()` 永远走不到 | `share_usage()` 先读该任务的 `read_file_override(jid)["deleted"]`，遍历 state 时跳过这些路径（目录树也不再显示「已勾选」） |
+| 2 | 只撤「新增项」的标记：文件删掉后仍留在 selection 里，重新勾选走 `already_in_job` 分支；且 task 刚重启时 `pipeline_state` 为空，`deleted_map` 建不出来（fid 无从对应路径） | `add_job_selection()` 对**本次请求的全部 fid** 撤标记（不只是新增项）；`apply_file_control()` 的 delete 分支在 state 查不到时按「一次操作一个路径 + 一个 fid」一一配对兜底写 `deleted_map`；`forget_deleted_paths()` 找不到映射时回退查 `pipeline_state` |
+
+新增测试 4 条：`test_share_usage_skips_files_deleted_in_progress`、`test_delete_without_state_records_fid_mapping`、
+`test_forget_deleted_paths_falls_back_to_state`、`test_readd_existing_selection_also_clears_marker` → 全仓 **226 passed**。
+NAS 真机复验：delete → `deleted_map` 正确写入；`selection/add` → `added={"files":1}`，`file_override.yaml` 里 `deleted` 与 `deleted_map` 都已清空。
+
+**边界**
+
+- 远端目录填错（例如 `/data` 存在但不可写）只会在**提交后**由 aria2 报 16/18，现在能一眼看懂，但**没有预检**：
+  aria2 的 RPC 没有「测试写权限」的方法，只能靠试下一个小文件。
+- 探针在对方机器的 `/tmp`、`/var/tmp`、`/config`、`/tmp/quark` 留下 `__probe_w.html`（11 KB），
+  aria2 RPC 删不掉本地文件，需要对方手动清理。
+- 远端模式仍然没有本地副本，完成判定只有 `tellStatus` 的 `totalLength` 比对（23.4），
+  对方磁盘写满（errorCode=9）现在也会直接判失败并保留云端副本。
+
+
+### 23.8 2.8.2：本机配置的下载目录也可以留空（2026-11-18）
+
+**需求**（用户 m05833 第 2 点）：「下载路径是不是可以不要考虑是否是远端，简单来说本地也可以不配置下载路径，
+也就是用 aria2 服务默认的下载路径」。此前只有远端配置能留空，本机配置留空会在保存时被
+`validate_profiles()` 拦下（「Aria2 配置「X」缺少下载临时目录」）。
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_api.py` | 新增 `resolve_download_dir(client, download_dir, *, remote=False)`：远端或已填 → 原样返回；留空 → `aria2.getGlobalOption()["dir"]`；RPC 异常 → `ValueError("没配置下载目录，且读取 Aria2 默认目录失败: …")`；取到空 → `ValueError("没配置下载目录，Aria2 也没有默认目录（aria2.conf 的 dir）")` |
+| `src/server/aria2_profiles.py` | `validate_profiles()` 去掉「非远端必须有 `aria2_download_dir`」，只剩 `缺少 RPC Host`；docstring 同步 |
+| `src/server/quark_main.py` | 模块级不再 `_require`；`init_clients()` 里 `ARIA2_DOWNLOAD_DIR = resolve_download_dir(...)`，变化时日志「未配置下载临时目录，改用 Aria2 默认目录: …」 |
+| `src/server/jobs_manager.py` | `probe_aria2_profile()` 也调 `resolve_download_dir`，失败包成 `Aria2 配置「X」…`，即启动任务前就拦下 |
+| `src/web/static/settings.html` | 标签「下载临时目录（留空 = 用 Aria2 默认目录）」、面板说明与远端勾选文案同步 |
+
+**为什么不直接退回相对路径**：`os.path.join("", "a/b.mkv")` 是相对路径，`shutil.move` 与
+`os.path.isfile` 都会按**进程当前目录**解析 —— 2.6.1 修的就是这个坑（文件被挪到 `cwd`）。
+所以「留空」必须解析成一个真实绝对目录，拿不到就报错，而不是静默降级。
+
+**语义变化**：`DOWNLOAD_DESTINATION_DIR` 在模块级用 `ARIA2_CONFIG.get("download_destination_dir", ARIA2_DOWNLOAD_DIR)`
+计算，下载目录留空后默认值变成 `""`，即「下载完不移动、文件留在下载根目录」——与 2.6.1 的「完成后目录留空 = 不移动」一致。
+
+**验证**：新增 5 条用例（已填不动 / 远端不需要 / 留空取默认 / 默认也为空 / 读 RPC 抛错）；
+原 `test_local_profile_still_requires_download_dir` 改名 `test_local_profile_may_omit_download_dir` 并反转断言；
+`test_validate_profiles_reports_missing_fields` 去掉「缺少下载临时目录」分支；另加 2 条预检用例
+（`test_probe_accepts_empty_download_dir`、`test_probe_reports_profile_when_no_default_dir`）→ 全仓 **233 passed**，`compileall` OK。
+
+**NAS 真机验证**（2.8.2 部署后，pid 910946）
+
+| 配置 | probe | `resolve_download_dir(client, "")` |
+| --- | --- | --- |
+| 飞牛本机（local） | ok / 1.36.0 | `/vol2/@team/家庭共享_薛成韵/下载/aria2`（来自 `aria2.conf` 的 `dir`） |
+| 灰机nas（remote） | ok / 1.36.0 | `""`（远端不需要本机目录） |
+
+顺带发现：`飞牛本机` 的 `aria2_secret` 在 `conf/aria2.yaml` 里是**空**的（`len=0`），所以预检一直报
+「RPC 未授权」。用 `/var/apps/aria2/var/aria2.conf` 里的 `rpc-secret`（8 字符，仅 `sudo` 可读）验证可用后，
+通过 `save_section` 写回该配置（掩码回显为 `****`），两侧 probe 均通过。
+
+**边界**
+
+- 只有本机 aria2 才需要默认目录；远端配置留空仍然是「用对方默认」，不读也不校验。
+- 默认目录由 aria2 的 `aria2.conf` 决定，`getGlobalOption` 读到的是**当前运行值**（命令行 `--dir` 覆盖也生效）。
+- 下载根目录若在 `allowed_roots` 之外，只影响设置页保存（白名单只管显式填写的值）；默认目录不经过白名单校验，
+  与远端模式一致 —— 它由 aria2 自己的配置决定，本应用只读。
+
+### 23.9 2.8.3：临时目录与完成目录都可选（2026-11-18）
+
+2.8.2 只做了「临时目录留空 → 用 aria2 默认目录」，把「完成目录」当成了独立开关。用户澄清真实语义是**两个目录的
+组合**（m05989 原文）：「1. 如果有临时目录，就下载到临时目录，此时如果有完成目录，则下载完成后挪到完成目录
+2. 如果没有临时目录，且有完成目录，就直接下载到完成目录 3. 如果两个目录都没有，提交任务时就不用管目录的问题
+另外，关于远端的问题，和之前保持一致，远端不校验文件，只通过 aria2 接口看文件是否下载了」。
+
+**语义表**（`plan_download_dirs()` 的返回值）
+
+| 临时目录 | 完成目录 | aria2 提交的 `dir` | `mode` | 下完是否移动 | 最终落点 |
+| --- | --- | --- | --- | --- | --- |
+| 填了 | 填了 | `<临时>/<job_id>` | `temp` | 是 | `<完成>/<相对路径>` |
+| 填了 | 空 | `<临时>/<job_id>` | `temp` | 否 | `<临时>/<job_id>/<相对路径>` |
+| 空 | 填了 | `<完成>/<job_id>` | `dest` | 是（原地挪一层） | `<完成>/<相对路径>` |
+| 空 | 空 | `getGlobalOption.dir` | `default` | 否 | `<aria2 默认目录>/<相对路径>` |
+| 任意 | 任意（远端） | 不提交 | `remote` | 否（本机不碰） | 对方机器 |
+
+「完成目录」单独填时之所以还要 `<job_id>` 这一层：`FileApi` 的判定根是 `download_root`，不隔离 job_id 时
+两个任务下同名文件会互相认成「本地已存在」。
+
+**本轮修掉的隐藏 bug（2.8.2 引入）**：`Aria2Client.__init__` 会把传入的 `download_dir` 固化成
+`self._download_dir`，`download_dir` 属性在 `job_id` 非空时返回 `<base>/<job_id>`。2.8.2 的顺序是
+「建客户端 → 读默认目录 → 回写全局」，客户端里已经固化了空串，之后 `addUri` 提交的 `dir` 会退化成相对路径
+（相对进程 cwd，正是 2.6.1 修过的坑）。现在 `init_clients()` 先建**不带 job_id 的探针客户端**把目录定下来，
+再建带 `job_id` 的真客户端。
+
+**改动**
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_api.py` | 新增 `plan_download_dirs(client, download_dir, destination_dir, *, remote=False)`，返回 `{download_dir, destination_dir, mode}`；只有 `default` 分支才调 `resolve_download_dir` |
+| `src/server/quark_main.py` | `DOWNLOAD_DESTINATION_DIR` 不再默认等于临时目录；`init_clients()` 探针→plan→回写→建真客户端，并记 `DOWNLOAD_DIR_MODE`；`main()` 按 mode 打不同的目录日志 |
+| `src/server/jobs_manager.py` | `probe_aria2_profile()` 改调 `plan_download_dirs`：只填完成目录时不再读 aria2 默认目录（原先会白报错） |
+| `src/web/static/settings.html` | 面板说明与字段标签改成「可选」，明确三种组合 |
+
+**验证**：`test_aria2_rpc.py` 新增 6 条 —— 四种组合、远端忽略两个目录、
+`test_probe_does_not_need_aria2_default_when_dest_set`（FakeClient 的 `getGlobalOption` 直接 `raise AssertionError`，
+证明只填完成目录时根本不会去读默认目录）→ 全仓 **239 passed**，`compileall` OK，设置页 `node --check` 通过。
+
+### 23.10 2.8.4：目录语义收口（`<job_id>` 只当暂存、双空不提交 dir）（2026-11-18）
+
+**需求**（用户 m06081 逐字，三个疑问）：
+「`<临时>/<job_id>` 应用不用 job_id 吧」
+「临时目录和完成目录都没有填，是不是就不提交，不用管是否是本机。」
+「是否是远端只涉及到是否去最终落点校验文件，对吗」
+
+三条全部成立，于是把 2.8.3 的「组合」再收一层语义。
+
+**23.10.1 语义**
+
+| 组合 | 提交给 aria2 的 dir | 最终落点 | 本机行为 |
+| --- | --- | --- | --- |
+| 有临时目录 | `<临时>/<job_id>/<相对目录>` | 完成目录 `<完成>/<相对>`；没填完成目录则 `<临时>/<相对>` | 下完搬文件、校验本地副本、据此决定能否删云端副本 |
+| 只有完成目录 | `<完成>/<job_id>/<相对目录>` | `<完成>/<相对>` | 同上（同一目录内挪一层去掉 job_id） |
+| 两个都不填 | **不带 dir**（用 aria2 自己的默认目录） | 由 aria2 决定，本机不知道 | 不扫描、不移动、不校验，完成只看 aria2 状态 |
+| 远端 aria2 | 不带 dir（`aria2_remote_dir` 有值则带） | 对方机器 | 同上（本机不参与） |
+
+`<job_id>` 之所以还留着：同一分享加成两个任务时同名文件会互相覆盖（aria2 还会自动改名成 `.1`），
+且 `prune_empty_local_dirs(download_root)` 递归清理空目录时可能删掉共享临时目录里用户自己的空文件夹。
+它只是「下载中的暂存区」，下完就挪走。
+
+**23.10.2 代码**
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/aria2_api.py` | `plan_download_dirs(download_dir, destination_dir, *, remote=False)` 去掉 client 参数，mode ∈ temp/dest/none/remote；删除 `resolve_download_dir()`（不再需要读 `getGlobalOption`）；`Aria2Client.download_dir` 在根目录为空时返回 `""`（不再拼出裸 job_id 相对路径）；`aria2_add_url` 无目录时提交 `{"out": <相对路径>}` |
+| `src/server/file_api.py` | 新增 `local_verifiable` 属性（`bool(aria2_download_dir) and not remote_download`）；`download_root` / `get_local_downloaded_sizes_from_dirs` / `move_file_to_destination` / `resolve_local_copy` / `local_copy_is_intact` / `cleanup_empty_download_dirs` 按它短路；`finish_downloaded_file` 新增「未配置下载目录，按 Aria2 状态判定完成」分支；`cleanup_files_batch` 的本地副本守卫改成 `if self.local_verifiable and not ...` |
+| `src/server/pipeline.py` | `verify_completed()` 与「complete 后大小校验」的 `remote_download` 判断改成 `not local_verifiable`；日志/备注措辞去掉「远端」（同一分支也覆盖本机不知道落点的情况） |
+| `src/server/verify_download.py` | `verify_remote_downloads` 文档改为「文件不在本机时（远端，或未配置目录）」 |
+| `src/server/quark_main.py` | 删掉 probe_client；`plan_download_dirs(...)` 直接算；mode 日志改 temp / dest / none / remote（temp 且完成目录为空时提示「下完挪到 <临时>/」） |
+| `src/server/jobs_manager.py` | `probe_aria2_profile()` 只探 `getVersion`（目录不参与预检）；`_aria2_client_from_config()` 的 `or "/tmp"` 兜底去掉 |
+| `src/web/static/settings.html` | 面板说明改成「两个目录都可不填」，标签「下载临时目录（可选）」「完成后目录（可选，留空 = 留在临时目录根下）」 |
+
+**23.10.3 验证**
+
+- 新增 `tests/pytest/test_local_verifiable.py` 4 条：无目录时 `local_verifiable` 为假、`download_root` 为空、
+  扫盘为空、`move_file_to_destination` 直接 True、`finish_downloaded_file` 直接 True、
+  `cleanup_files_batch` 不再被「本地副本缺失」拦住（仍然先删再回查）、
+  只填临时目录时文件从 `<临时>/<job_id>/movie/a.mkv` 挪到 `<临时>/movie/a.mkv`
+- `tests/pytest/test_aria2_remote.py` 加 2 条：无目录时 `aria2.addUri` 的 options 没有 `dir` 且 `out` 保留子目录；
+  `Aria2Client.download_dir` 不会拼出裸 job_id
+- `tests/pytest/test_aria2_rpc.py`：删掉 5 条 `resolve_download_dir` 用例与「没有默认目录」预检用例，
+  plan 用例改成无 client 签名，新增「plan 不该连 Aria2」「预检不该读 getGlobalOption」
+- 全仓 **239 passed**，`compileall -q src` OK
+
+**23.10.4 边界**
+
+- 两个都不填时，本机确实不知道文件落在哪：清理云端副本只能信 aria2 的 `complete`（与远端模式同一风险等级）；
+  `totalLength` 与文件大小不符时仍判失败并保留云端副本。
+- 下载目录为空时 `<临时>/<job_id>` 这层暂存不存在，因此「下完再挪」也做不了——最终文件由 aria2 直接写在默认目录里。

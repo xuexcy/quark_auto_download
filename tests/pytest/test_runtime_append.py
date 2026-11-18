@@ -190,3 +190,23 @@ def test_add_job_selection_writes_selection_file(tmp_path, monkeypatch):
     path = tmp_path / "j1" / "selection.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload == {"file_fids": ["f1", "f2"], "dir_fids": ["d1"]}
+
+
+def test_share_usage_skips_files_deleted_in_progress(tmp_path, monkeypatch):
+    """删掉的文件即使还在 pipeline_state 里，也不能再算「已在任务中」（否则重新勾选被挡）。"""
+    jobs = [{"id": "j1", "name": "任务一", "share_url": "https://pan.quark.cn/s/abc",
+             "selection": {"file_fids": ["f2"]}}]
+    # 注意：不能用 _patch_jobs_world，它会把 share_usage 本身替换成空实现。
+    monkeypatch.setattr(jobs_manager, "load_jobs_index", lambda: jobs)
+    monkeypatch.setattr(jobs_manager, "job_state_file", lambda job_id: str(tmp_path / "state.yaml"))
+    monkeypatch.setattr(jobs_manager, "read_file_override", lambda job_id: {"deleted": {"a.mp4"}})
+    (tmp_path / "state.yaml").write_text(
+        "files:\n"
+        "- {path: a.mp4, fid: f1, state: downloading}\n"
+        "- {path: b.mp4, fid: f2, state: done}\n",
+        encoding="utf-8",
+    )
+
+    usage = jobs_manager.share_usage("j1")
+    assert "f1" not in usage            # 已删除
+    assert usage["f2"]["state"] == "done"

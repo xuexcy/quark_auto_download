@@ -22,9 +22,28 @@ STRICT_SIZE_CHECK = os.environ.get("QUARK_AUTO_DL_STRICT_SIZE", "1").strip().low
 )
 
 
-def _local_file_info(destination_dir: str, relative_path: str) -> tuple[bool, int | None, str]:
+def _local_file_info(
+    destination_dir: str,
+    relative_path: str,
+    resolver: Any = None,
+) -> tuple[bool, int | None, str]:
+    """定位本地副本。
+
+    resolver 由调用方传入（FileApi.resolve_local_copy），能认出落盘时被改名的副本
+    （目标目录重名 → name_YYYYmmdd_HHMMSS.ext）；没有 resolver 时按原名拼接。
+    """
     relative_path = normalize_relative_path(relative_path)
     abs_path = os.path.join(destination_dir, relative_path)
+    if resolver is not None:
+        try:
+            found = resolver(relative_path)
+        except Exception:
+            found = ""
+        if found:
+            try:
+                return True, int(os.path.getsize(found)), found
+            except OSError:
+                return False, None, found
     if not os.path.isfile(abs_path):
         return False, None, abs_path
     try:
@@ -33,9 +52,14 @@ def _local_file_info(destination_dir: str, relative_path: str) -> tuple[bool, in
         return False, None, abs_path
 
 
-def inspect_job(job: Job, destination_dir: str, failed_paths: set[str]) -> dict[str, Any]:
-    """检查单个任务是否在 completed 目录成功落盘。"""
-    exists, actual_size, abs_path = _local_file_info(destination_dir, job.path)
+def inspect_job(
+    job: Job,
+    destination_dir: str,
+    failed_paths: set[str],
+    resolver: Any = None,
+) -> dict[str, Any]:
+    """检查单个任务是否在本地成功落盘。"""
+    exists, actual_size, abs_path = _local_file_info(destination_dir, job.path, resolver)
     expected_size = int(job.size or 0)
     reasons: list[str] = []
     size_note = ""
@@ -45,7 +69,8 @@ def inspect_job(job: Job, destination_dir: str, failed_paths: set[str]) -> dict[
     if pipeline_failed:
         reasons.append(pipeline_note or "流水线标记为失败")
 
-    if job.state not in ("done", "failed"):
+    # cleanup 也算成功：文件已经落盘完，只是在等「删云端副本」这一步收尾
+    if job.state not in ("done", "cleanup", "failed"):
         suffix = f"（{pipeline_note}）" if pipeline_note else ""
         reasons.append(f"流水线未正常结束，当前状态: {job.state}{suffix}")
 
@@ -68,10 +93,10 @@ def inspect_job(job: Job, destination_dir: str, failed_paths: set[str]) -> dict[
     if empty_file:
         reasons.append("本地文件大小为 0（疑似占位或写入失败）")
 
-    # 成功：本地存在 + 流水线 done + 非 0 字节 + size 校验通过
+    # 成功：本地存在 + 流水线 done/cleanup + 非 0 字节 + size 校验通过
     ok = (
         exists
-        and job.state == "done"
+        and job.state in ("done", "cleanup")
         and not pipeline_failed
         and not empty_file
         and not (size_mismatch and STRICT_SIZE_CHECK)
@@ -104,8 +129,9 @@ def inspect_job(job: Job, destination_dir: str, failed_paths: set[str]) -> dict[
 def verify_completed_downloads(
     scheduler: PipelineScheduler,
     destination_dir: str,
+    resolver: Any = None,
 ) -> dict[str, Any]:
-    """对照调度任务列表，校验 completed 目录。"""
+    """对照调度任务列表，校验本地落盘（完成后目录，未配置则是下载目录）。"""
     destination_dir = str(destination_dir or "").rstrip("/")
     failed_paths = set(scheduler.failed_files)
     results: list[dict[str, Any]] = []
@@ -114,7 +140,7 @@ def verify_completed_downloads(
         job = scheduler.jobs.get(path)
         if not job:
             continue
-        results.append(inspect_job(job, destination_dir, failed_paths))
+        results.append(inspect_job(job, destination_dir, failed_paths, resolver))
 
     failures = [item for item in results if not item["ok"]]
     ok_count = len(results) - len(failures)
@@ -143,6 +169,65 @@ def verify_completed_downloads(
         "all_results": results,
     }
 
+
+def verify_remote_downloads(scheduler: PipelineScheduler) -> dict[str, Any]:
+    """文件不在本机时（远端 aria2，或未配置目录由 aria2 决定落点）：只能按流水线状态给结论。"""
+    failed_paths = set(scheduler.failed_files)
+    results: list[dict[str, Any]] = []
+    for path in scheduler.ordered_paths:
+        job = scheduler.jobs.get(path)
+        if not job:
+            continue
+        note = (job.note or "").strip()
+        failed = job.state == "failed" or path in failed_paths
+        ok = job.state in ("done", "cleanup") and not failed
+        if ok:
+            reason = ""
+        elif failed:
+            reason = note or "流水线标记为失败"
+        else:
+            reason = f"流水线未正常结束，当前状态: {job.state}"
+        results.append(
+            {
+                "path": job.path,
+                "local_path": "(远端 aria2)",
+                "expected_size": int(job.size or 0),
+                "actual_size": None,
+                "local_exists": None,
+                "pipeline_state": job.state,
+                "pipeline_note": note,
+                "detail": note,
+                "ok": ok,
+                "reason": reason,
+                "reasons": [reason] if reason else [],
+                "size_note": "",
+            }
+        )
+    failures = [item for item in results if not item["ok"]]
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "destination_dir": "(远端 aria2)",
+        "summary": {
+            "total": len(results),
+            "ok": len(results) - len(failures),
+            "failed": len(failures),
+        },
+        "failures": [
+            {
+                "path": item["path"],
+                "local_path": item["local_path"],
+                "expected_size": item["expected_size"],
+                "actual_size": item["actual_size"],
+                "local_exists": item["local_exists"],
+                "pipeline_state": item["pipeline_state"],
+                "pipeline_note": item["pipeline_note"],
+                "detail": item["detail"],
+                "reason": item["reason"],
+            }
+            for item in failures
+        ],
+        "all_results": results,
+    }
 
 def write_verify_report(report: dict[str, Any], report_path: str) -> str:
     """写入失败校验报告（YAML）。成功时也写摘要。"""

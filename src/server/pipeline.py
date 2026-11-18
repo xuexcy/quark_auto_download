@@ -13,6 +13,7 @@ import time
 
 import yaml
 
+from error_classify import classify_error
 from file_api import ACTIVE_ARIA2_STATUSES, FileApi
 from scheduler import Job, PipelineScheduler
 
@@ -22,6 +23,9 @@ class DownloadPipeline:
     STATUS_FAIL_LIMIT = 5
     # 同一文件自动 unpause 的次数上限，避免与外部暂停互相拉扯
     UNPAUSE_LIMIT = 10
+    # 清理云端副本失败后最多等多久：清理态文件会阻塞所有转存（plan_* 看到 cleanup
+    # 就只返回清理计划），一直失败就等于整个任务卡死，所以超时后放弃删除、保留云端副本。
+    CLEANUP_GIVE_UP_SEC = 600
 
     def __init__(
         self,
@@ -64,6 +68,12 @@ class DownloadPipeline:
         # 已经就地删过网盘副本的路径，启动补删时跳过（避免对同一 fid 删两次）
         self._cloud_purged: set[str] = set()
         self.lock = threading.RLock()
+        # 逐文件控制的读-改-写锁：主循环 / 下载 Worker / 重试 Worker 都会调
+        # _apply_file_override，不加锁会让同一次删除发两遍 delete_my_fids，
+        # 还会让「取消暂停」与「压暂停」交错。
+        self._override_lock = threading.Lock()
+        # 清理失败（本地无可信副本 / 删后回查仍可见）的起始时间，按路径记
+        self._cleanup_failed_since: dict[str, float] = {}
         self.scheduler = PipelineScheduler(file_api, prefer_path_order=strict_download_order)
 
         pause = max(int(aria2_queue_pause_threshold), 1)
@@ -74,6 +84,8 @@ class DownloadPipeline:
         self.aria2_queue_resume_threshold = resume
         self._aria2_ingest_paused = False
         self._last_aria2_waiting = 0
+        # Aria2 连不上时三个 Worker 每 tick 都会失败：同一错误 60 秒只打一条
+        self._aria2_error_log: dict[str, dict] = {}
         # state 文件全量重写很贵：默认最多 5s 一次，收尾时强制写
         self.state_persist_interval = max(float(state_persist_interval or 0), 0.0)
         self._state_persisted_at = 0.0
@@ -156,6 +168,10 @@ class DownloadPipeline:
 
     def _apply_file_override(self, *, force: bool = False) -> None:
         """文件指纹变了才解析一次；顺序 = 删除 → 恢复 → 取消暂停 → 强制暂停。"""
+        with self._override_lock:
+            self._apply_file_override_once(force=force)
+
+    def _apply_file_override_once(self, *, force: bool = False) -> None:
         if not self.override_file:
             return
         stamp = self._file_stamp(self.override_file)
@@ -167,10 +183,13 @@ class DownloadPipeline:
         paused, deleted, retry = parsed
         self._override_stamp = stamp
 
-        # 1) 删除先做，避免紧接着又去暂停一个马上要消失的文件
+        # 1) 删除先做，避免紧接着又去暂停一个马上要消失的文件。
+        # 注意这里是「以文件为准」而不是累积：用户在「文件进度」里删掉一个文件、之后又从目录树
+        # 重新勾选同一个文件时，Web 会把这个路径从 deleted 里撤掉（见 add_job_selection），
+        # 只有跟着撤销缓存，追加勾选才不会被「已删除」永久挡在门外。
         for path in sorted(deleted - self._applied_deleted):
             self._drop_file(path)
-        self._applied_deleted |= deleted
+        self._applied_deleted = set(deleted)
 
         # 2) 一次性「开始」意图（幂等：state 已不是 paused/failed 时无副作用）
         for path in sorted(retry):
@@ -235,7 +254,7 @@ class DownloadPipeline:
             gid = str(job.gid or "").strip()
             fid = str(job.file_item.get("my_fid") or "").strip()
         # my_fid 由 initialize/转存成功时写入；重启或追加勾选后可能还没解析，按目录缓存再查一次
-        if not fid and state not in ("done", "cleanup"):
+        if not fid and state != "done":
             try:
                 fid = self.scheduler.cloud_fid_for(path)
             except Exception as e:
@@ -246,7 +265,7 @@ class DownloadPipeline:
                 self.file_api.aria2_client.aria2_remove(gid)
             except Exception as e:
                 self.log.warning(f"  [文件] 移除 Aria2 任务失败 gid={gid}: {e}")
-        if fid and state not in ("done", "cleanup"):
+        if fid and state != "done":
             try:
                 self.file_api.quark_client.delete_my_fids([fid])
                 self._cloud_purged.add(path)
@@ -386,6 +405,19 @@ class DownloadPipeline:
         # 上次没在跑的时候删掉的文件，云端副本这时补清一次（占配额）
         self._purge_deleted_cloud_copies()
 
+    def _log_aria2_problem(self, message: str, *, level: str = "error") -> None:
+        """Aria2 不可用时限流日志：首次立即打印，同一条 60 秒内只再打一次并带上抑制次数。"""
+        now = time.time()
+        entry = self._aria2_error_log.get(message)
+        emit = self.log.error if level == "error" else self.log.warning
+        if entry is None or now - entry["last"] >= 60:
+            suppressed = entry["suppressed"] if entry else 0
+            suffix = f"（过去 60 秒同错误 {suppressed} 次，已抑制）" if suppressed else ""
+            self._aria2_error_log[message] = {"last": now, "suppressed": 0}
+            emit(f"{message}{suffix}")
+            return
+        entry["suppressed"] += 1
+
     def _refresh_aria2_backpressure(self) -> bool:
         """
         根据 Aria2 waiting 数量更新滞回暂停状态。
@@ -394,7 +426,7 @@ class DownloadPipeline:
         try:
             waiting = self.file_api.aria2_client.aria2_get_waiting_count()
         except Exception as e:
-            self.log.error(f"  查询 Aria2 排队数量失败，本轮暂不暂停: {e}")
+            self._log_aria2_problem(f"  查询 Aria2 排队数量失败，本轮暂不暂停: {e}")
             return self._aria2_ingest_paused
 
         self._last_aria2_waiting = waiting
@@ -526,14 +558,21 @@ class DownloadPipeline:
         from verify_download import (
             log_verify_report,
             verify_completed_downloads,
+            verify_remote_downloads,
             write_verify_report,
         )
 
         with self.lock:
-            report = verify_completed_downloads(
-                self.scheduler,
-                self.file_api.download_destination_dir,
-            )
+            if not self.file_api.local_verifiable:
+                # 文件不在本机（远端 aria2，或两个目录都没填由 aria2 决定落点）：
+                # 没有文件可校验，只按流水线状态出报告
+                report = verify_remote_downloads(self.scheduler)
+            else:
+                report = verify_completed_downloads(
+                    self.scheduler,
+                    self.file_api.local_copy_root,
+                    resolver=self.file_api.resolve_local_copy,
+                )
         write_verify_report(report, report_path)
         log_verify_report(self.log, report, report_path)
         return report
@@ -642,8 +681,27 @@ class DownloadPipeline:
         with self.lock:
             failed_jobs = [job for job in jobs if job.path in failed_paths]
             self.scheduler.apply_cleanup_result(deleted_names, failed_jobs)
+            now = time.time()
+            for path in deleted_names:
+                self._cleanup_failed_since.pop(path, None)
             if failed_jobs:
+                for job in failed_jobs:
+                    self._cleanup_failed_since.setdefault(job.path, now)
                 self.log.warning("  [调度] 存在清理未确认成功的文件，暂停转存")
+            # 清理态会挡住所有转存：迟迟删不掉（本地无可信副本 / 权限 / 删除后回查仍可见）
+            # 就认输——标记失败并保留云端副本，让后面的文件继续转存，别整任务卡死。
+            for path in [p for p, ts in self._cleanup_failed_since.items()
+                         if now - ts > self.CLEANUP_GIVE_UP_SEC]:
+                job = self.scheduler.jobs.get(path)
+                if job is not None and job.state == "cleanup":
+                    self.scheduler.mark_failed(
+                        job,
+                        "清理云端副本多次失败（本地副本缺失或删除后仍可见），"
+                        "已放弃删除并保留云端副本，请手动清理网盘",
+                        keep_cloud=True,
+                    )
+                    self.log.error(f"  [调度] 清理超时，放弃删除并保留云端副本: {path}")
+                self._cleanup_failed_since.pop(path, None)
         if deleted_names:
             freed = sum(size_by_path.get(path, 0) for path in deleted_names)
             # 增量回补可用容量；无缓存时 no-op，下次 get_available_space 再全盘算
@@ -778,14 +836,33 @@ class DownloadPipeline:
             return
 
         with self.lock:
-            self.scheduler.apply_download_started(job, task)
+            # 锁外提交期间可能被用户暂停/删除：不能把状态硬拉回 downloading，
+            # 否则已摘除的文件会重新出现在队列里，而 aria2 留下没人跟踪的任务。
+            current = self.scheduler.jobs.get(job.path)
+            if current is not None and current.state in ("ready", "retry"):
+                self.scheduler.apply_download_started(current, task)
+                return
+            # 其余情况：把刚提交/接管的任务收掉（暂停的保留进度），再让控制文件下一轮处理
+            self._discard_submitted_task(task, pause=bool(current and current.state == "paused"))
+
+    def _discard_submitted_task(self, task: dict, *, pause: bool = False) -> None:
+        gid = str(task.get("gid") or "").strip()
+        if not gid:
+            return
+        try:
+            if pause:
+                self.file_api.aria2_client.aria2_pause(gid)
+            else:
+                self.file_api.aria2_client.aria2_remove(gid)
+        except Exception as e:
+            self.log.warning(f"  [下载] 撤销刚提交的 Aria2 任务失败 gid={gid}: {e}")
 
     def _aria2_task_snapshot(self) -> dict[str, dict] | None:
         """一次性取 Aria2 现有任务（active/waiting/stopped），避免每个文件 3 次 RPC。"""
         try:
             return self.file_api.aria2_client.aria2_get_existing_task_infos_by_name()
         except Exception as e:
-            self.log.warning(f"  读取 Aria2 任务快照失败，回退为逐文件查询: {e}")
+            self._log_aria2_problem(f"  读取 Aria2 任务快照失败，回退为逐文件查询: {e}", level="warning")
             return None
 
     def _download_submit_tick(self) -> None:
@@ -886,10 +963,14 @@ class DownloadPipeline:
 
         state = status.get("status")
 
-        # 下载超时：download_timeout 内没完成就收手，保留网盘副本供下次续传
+        # 下载超时：只统计「真正在下载(active)」的时间。旧实现从提交时刻算，
+        # aria2 队列深、或任务被暂停超过 download_timeout 时，一堆还没开始的文件会被判超时。
         timeout = self._download_timeout()
-        started_at = float(task.get("start_at") or 0.0)
-        if timeout and started_at and state not in ("complete", "error", "removed"):
+        if state == "active" and not task.get("active_at"):
+            task["active_at"] = time.time()
+            job.download_task = task
+        started_at = float(task.get("active_at") or 0.0)
+        if timeout and started_at and state == "active":
             if time.time() - started_at > timeout:
                 self.log.error(f"  ⏰ 下载超时（>{timeout} 秒）: {job.path} | state={state}")
                 with self.lock:
@@ -905,6 +986,31 @@ class DownloadPipeline:
                 return
 
         if state == "complete":
+            if not getattr(self.file_api, "local_verifiable", False):
+                # 文件不在本机（远端，或没配置目录由 aria2 决定落点）：本地无法校验落盘；
+                # aria2 的 totalLength 是唯一防线。
+                # 长度不符说明下的是别的东西（同名撞车 / 截断），绝不能删云端副本。
+                try:
+                    total_bytes = int(status.get("totalLength") or 0)
+                except (TypeError, ValueError):
+                    total_bytes = 0
+                expected = int(job.size or 0)
+                if total_bytes > 0 and expected > 0 and total_bytes != expected:
+                    self.log.error(
+                        f"  ✗ Aria2 报完成但大小不符（{total_bytes} != {expected}），本机无法核对落盘，"
+                        f"已保留网盘副本: {job.path}"
+                    )
+                    with self.lock:
+                        self.scheduler.apply_download_to_cleanup(
+                            job,
+                            failed=True,
+                            keep_cloud=True,
+                            note=(
+                                f"Aria2 报完成但大小不符（{total_bytes} != {expected} 字节），"
+                                "可能撞名或被截断；已保留网盘副本"
+                            ),
+                        )
+                    return
             moved = self.file_api.finish_downloaded_file(job.path)
             if not moved:
                 # 关键：没真正落盘就绝不能进 cleanup，否则云端副本会被删掉
@@ -950,7 +1056,20 @@ class DownloadPipeline:
                 self.log.warning(f"  恢复 Aria2 暂停任务失败: {job.path} | {e}")
         elif state == "error":
             retry_count = int(task.get("retry_count", 0))
-            error_message = str(status.get("errorMessage") or "未知错误").strip()
+            # aria2 的 errorMessage 常常只有 "Download aborted."，必须翻译错误码才看得出
+            # 是「对方下载目录不可写」这种改配置才能好的错（详见 aria2_api.describe_task_error）
+            error_message = self.file_api.aria2_client.describe_task_error(status).strip()
+            if classify_error(error_message) == "permanent":
+                # 目录不可写这类错误重试 3 次也是同样的结果，只会拖慢队列
+                self.log.error(f"  ✗ 下载失败（不可重试）: {job.path} | {error_message}")
+                with self.lock:
+                    self.scheduler.apply_download_to_cleanup(
+                        job,
+                        failed=True,
+                        keep_cloud=True,
+                        note=f"下载失败（不可重试）: {error_message}",
+                    )
+                return
             if retry_count < self.file_api.aria2_max_retries:
                 self.log.warning(
                     f"  ✗ 下载失败，准备重试: {job.path} | "

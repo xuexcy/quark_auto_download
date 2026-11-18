@@ -11,6 +11,8 @@ import os
 import re
 import time
 
+import aria2_api
+import aria2_profiles as aria2cfg
 from aria2_api import Aria2Client
 from config_loader import (
     BASE_DIR,
@@ -48,6 +50,20 @@ def _require(config: dict, key: str):
     return value
 
 
+def _as_int(config: dict, key: str, default: int, minimum: int = 0) -> int:
+    """安全读取整数配置。
+
+    网页把数字框留空 / 填 1e999 时会变成 null / 字符串，直接 int() 会让子进程
+    启动即抛 TypeError，整个任务卡在 running 却没有进程。这里一律退回默认值。
+    """
+    raw = config.get(key, default)
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if value >= minimum else default
+
+
 def load_all_configs() -> tuple[dict, dict]:
     """读取 quark / aria2 配置；旧版单文件 conf/config.yaml 仍兼容。"""
     if os.path.exists(QUARK_CONFIG_PATH) and os.path.exists(ARIA2_CONFIG_PATH):
@@ -65,7 +81,13 @@ def load_all_configs() -> tuple[dict, dict]:
     )
 
 
-QUARK_CONFIG, ARIA2_CONFIG = load_all_configs()
+QUARK_CONFIG, ARIA2_FILE_CONFIG = load_all_configs()
+
+# 多 Aria2：按任务选中的配置名解析；名字被删/没选就退回默认配置
+ARIA2_PROFILE = aria2cfg.resolve_name(
+    ARIA2_FILE_CONFIG, os.getenv("QUARK_AUTO_DL_ARIA2_PROFILE", "")
+)
+ARIA2_CONFIG = aria2cfg.options_for(ARIA2_FILE_CONFIG, ARIA2_PROFILE)
 
 # 任务级覆盖（Web 多分享链接）
 JOB_ID = os.getenv("QUARK_AUTO_DL_JOB_ID", "").strip()
@@ -84,18 +106,31 @@ FILE_NAME_REGEX = QUARK_CONFIG.get("file_name_regex", "").strip()
 
 ARIA2_HOST = _require(ARIA2_CONFIG, "aria2_host")
 ARIA2_SECRET = ARIA2_CONFIG.get("aria2_secret", "")
-ARIA2_DOWNLOAD_DIR = _require(ARIA2_CONFIG, "aria2_download_dir")
-DOWNLOAD_DESTINATION_DIR = ARIA2_CONFIG.get("download_destination_dir", ARIA2_DOWNLOAD_DIR)
-POLL_INTERVAL = int(ARIA2_CONFIG.get("poll_interval", 60))
-DOWNLOAD_TIMEOUT = int(ARIA2_CONFIG.get("download_timeout", 7200))
-ARIA2_REQUEST_TIMEOUT = int(ARIA2_CONFIG.get("request_timeout", 10))
-ARIA2_MAX_RETRIES = int(ARIA2_CONFIG.get("aria2_max_retries", 3))
-DOWNLOAD_LOG_INTERVAL = int(ARIA2_CONFIG.get("download_log_interval", 300))
-DOWNLOAD_SUBMIT_MAX_RETRIES = int(ARIA2_CONFIG.get("download_submit_max_retries", 10))
-DOWNLOAD_SUBMIT_RETRY_INTERVAL = int(ARIA2_CONFIG.get("download_submit_retry_interval", 30))
+# 远端 aria2（朋友提供的 RPC）：只提交下载请求 + 查进度，对方落盘到哪与本机无关
+ARIA2_REMOTE = _as_bool(ARIA2_CONFIG.get("aria2_remote"), False)
+# 远端下载目录：对方 aria2 的默认目录可能只读（errorCode=16），远端配置可以指定一个可写目录
+ARIA2_REMOTE_DIR = str(ARIA2_CONFIG.get("aria2_remote_dir") or "").strip()
+# 两个目录都可选（init_clients 里按组合定下来，见 aria2_api.plan_download_dirs）：
+# 填了临时目录 → 先下到 <临时>/<job_id>/，下完挪到最终位置（完成目录，没配就挪到 <临时>/ 根下）；
+# 只填完成目录 → 直接下到 <完成>/<job_id>/，下完去掉 job_id 这一层；
+# 两个都空 → 提交时不指定 dir，用 aria2 自己的默认目录，本机不校验、不移动。远端两个都不提交。
+ARIA2_DOWNLOAD_DIR = "" if ARIA2_REMOTE else str(ARIA2_CONFIG.get("aria2_download_dir") or "").strip()
+# 完成后目录（最终落点）：留空 = 临时目录根下 / 不移动（远端与双空模式都不移动）
+DOWNLOAD_DESTINATION_DIR = "" if ARIA2_REMOTE else str(
+    ARIA2_CONFIG.get("download_destination_dir") or ""
+).strip()
+POLL_INTERVAL = _as_int(ARIA2_CONFIG, "poll_interval", 60, minimum=1)
+DOWNLOAD_TIMEOUT = _as_int(ARIA2_CONFIG, "download_timeout", 7200, minimum=0)
+ARIA2_REQUEST_TIMEOUT = _as_int(ARIA2_CONFIG, "request_timeout", 10, minimum=1)
+ARIA2_MAX_RETRIES = _as_int(ARIA2_CONFIG, "aria2_max_retries", 3, minimum=0)
+DOWNLOAD_LOG_INTERVAL = _as_int(ARIA2_CONFIG, "download_log_interval", 300, minimum=0)
+DOWNLOAD_SUBMIT_MAX_RETRIES = _as_int(ARIA2_CONFIG, "download_submit_max_retries", 10, minimum=1)
+DOWNLOAD_SUBMIT_RETRY_INTERVAL = _as_int(ARIA2_CONFIG, "download_submit_retry_interval", 30, minimum=1)
 STRICT_DOWNLOAD_ORDER = _as_bool(ARIA2_CONFIG.get("strict_download_order"), True)
-ARIA2_QUEUE_PAUSE_THRESHOLD = int(ARIA2_CONFIG.get("aria2_queue_pause_threshold", 700))
-ARIA2_QUEUE_RESUME_THRESHOLD = int(ARIA2_CONFIG.get("aria2_queue_resume_threshold", 500))
+ARIA2_QUEUE_PAUSE_THRESHOLD = _as_int(ARIA2_CONFIG, "aria2_queue_pause_threshold", 700, minimum=1)
+ARIA2_QUEUE_RESUME_THRESHOLD = _as_int(ARIA2_CONFIG, "aria2_queue_resume_threshold", 500, minimum=0)
+# init_clients() 定下来的目录组合：temp / dest / none / remote
+DOWNLOAD_DIR_MODE = "remote" if ARIA2_REMOTE else "none"
 STATE_FILE = str(
     os.getenv("QUARK_AUTO_DL_STATE_FILE")
     or ARIA2_CONFIG.get("state_file")
@@ -141,6 +176,7 @@ log = logging.getLogger(__name__)
 
 def init_clients():
     """初始化 Quark 与 Aria2 客户端。"""
+    global ARIA2_DOWNLOAD_DIR, DOWNLOAD_DESTINATION_DIR, DOWNLOAD_DIR_MODE
     quark_client = QuarkClient(
         cookie=QUARK_COOKIE,
         request_timeout=QUARK_REQUEST_TIMEOUT,
@@ -154,17 +190,34 @@ def init_clients():
         user_agent=QUARK_CLIENT_UA,
     )
     quark_client.resolve_save_to_dir()
+    # 直链下载要带 Cookie/Referer/UA，否则夸克 CDN 会 403
+    download_headers = quark_client.download_headers()
+    # Aria2Client 在构造时固化 download_dir，所以先按目录组合定下来再建客户端
+    # （双空模式会得到空串，提交任务时不带 dir，由 aria2 用自己的默认目录）。
+    plan = aria2_api.plan_download_dirs(
+        ARIA2_DOWNLOAD_DIR, DOWNLOAD_DESTINATION_DIR, remote=ARIA2_REMOTE
+    )
+    ARIA2_DOWNLOAD_DIR = plan["download_dir"]
+    DOWNLOAD_DESTINATION_DIR = plan["destination_dir"]
+    DOWNLOAD_DIR_MODE = plan["mode"]
+    if plan["mode"] == "dest":
+        log.info(f"未配置下载临时目录，直接下载到完成目录: {ARIA2_DOWNLOAD_DIR}")
+    elif plan["mode"] == "none":
+        log.info("未配置下载目录：提交任务时不指定 dir，由 Aria2 用自己的默认目录（本机不校验、不移动）")
+    elif plan["mode"] == "temp" and not str(ARIA2_CONFIG.get("download_destination_dir") or "").strip():
+        log.info(f"未配置完成后目录：下载完从 {ARIA2_DOWNLOAD_DIR}/<job_id>/ 挪到 {ARIA2_DOWNLOAD_DIR}/")
     aria2_client = Aria2Client(
         host=ARIA2_HOST,
         secret=ARIA2_SECRET,
         download_dir=ARIA2_DOWNLOAD_DIR,
         request_timeout=ARIA2_REQUEST_TIMEOUT,
-        # 直链下载要带 Cookie/Referer/UA，否则夸克 CDN 会 403
-        download_headers=quark_client.download_headers(),
+        download_headers=download_headers,
         poll_interval=POLL_INTERVAL,
         download_timeout=DOWNLOAD_TIMEOUT,
         logger=log,
         job_id=JOB_ID,
+        remote=ARIA2_REMOTE,
+        remote_dir=ARIA2_REMOTE_DIR,
     )
     return quark_client, aria2_client
 
@@ -282,6 +335,7 @@ def main():
         download_submit_max_retries=DOWNLOAD_SUBMIT_MAX_RETRIES,
         download_submit_retry_interval=DOWNLOAD_SUBMIT_RETRY_INTERVAL,
         job_id=JOB_ID,
+        remote_download=ARIA2_REMOTE,
     )
 
     log.info("═" * 60)
@@ -291,8 +345,24 @@ def main():
     log.info("═" * 60)
     log.info(f"本次日志文件: {LOG_PATH}")
     log.info(f"分享链接: {SHARE_URL}")
-    log.info(f"下载临时目录: {file_api.download_root}")
-    log.info(f"下载完成目录: {DOWNLOAD_DESTINATION_DIR}")
+    log.info(f"Aria2 配置: {ARIA2_PROFILE or '(未配置)'} → {ARIA2_HOST}")
+    if ARIA2_REMOTE:
+        log.info(f"  远端下载目录: {ARIA2_REMOTE_DIR or '(用对方默认目录)'}")
+        log.info("落盘位置: 远端 aria2（本机不管理落盘、不移动、不校验）")
+    elif DOWNLOAD_DIR_MODE == "dest":
+        log.info(
+            f"下载目录: {DOWNLOAD_DESTINATION_DIR}"
+            f"（未配置临时目录，先下到 {file_api.download_root}，完成后去掉 job_id 这一层）"
+        )
+    elif DOWNLOAD_DIR_MODE == "none":
+        log.info("下载目录: 未配置 —— 不指定 dir，由 Aria2 用自己的默认目录")
+        log.info("落盘位置: 本机不知道（不校验、不移动，只按 Aria2 状态判定完成）")
+    else:
+        log.info(f"下载临时目录: {file_api.download_root}")
+        if DOWNLOAD_DESTINATION_DIR and DOWNLOAD_DESTINATION_DIR != ARIA2_DOWNLOAD_DIR:
+            log.info(f"下载完成目录: {DOWNLOAD_DESTINATION_DIR}")
+        else:
+            log.info(f"下载完成目录: (未配置，下载完挪到 {ARIA2_DOWNLOAD_DIR}/)")
     log.info(f"网盘配额(用于估算剩余空间): {QUARK_TOTAL_SPACE_GB:g} GB")
 
     stoken, share_id, target_fid, all_files = load_share_files(quark_client)
@@ -375,7 +445,11 @@ def main():
             f"流水线失败列表 {len(failed_files)} 个；详见报告 {VERIFY_REPORT_FILE}"
         )
     else:
-        log.info("所有文件下载成功，completed 目录校验通过 🎉")
+        log.info(
+            "所有文件下载成功（远端 Aria2 口径，未做本地校验）🎉"
+            if ARIA2_REMOTE
+            else "所有文件下载成功，completed 目录校验通过 🎉"
+        )
 
     if JOB_ID:
         try:

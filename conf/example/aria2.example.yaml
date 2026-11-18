@@ -1,17 +1,48 @@
 # Aria2 下载配置
+#
+# 支持配置多套 Aria2 RPC（2.6.0 起）：
+#   - 设置页 -> Aria2 面板点「＋ 添加」可维护多套，点「测试」验证连通、选「默认」决定新任务预选项
+#   - 新增下载任务时可选择用哪一套，任务列表会显示 aria2=<配置名>
+#   - 四个「每套配置」键：aria2_host / aria2_secret / aria2_download_dir / download_destination_dir
+#   - 其余键都是全局项，所有配置共用（轮询间隔、超时、重试、队列水位等）
+# 旧版单配置（顶层直接写 aria2_host 等四键）仍可启动，第一次在设置页保存后
+# 会自动迁移成一条名为「默认」的配置；迁移后顶层四键不再写回。
 
-# Aria2 JSON-RPC 地址
-aria2_host: "http://127.0.0.1:6800/jsonrpc"
+aria2_profiles:
+  - name: "默认"
+    # Aria2 JSON-RPC 地址
+    aria2_host: "http://127.0.0.1:6800/jsonrpc"
+    # Aria2 RPC Secret（未设置则留空）
+    aria2_secret: ""
+    # 下载临时目录（可选）。实际落盘为 <aria2_download_dir>/<job_id>/<相对路径>：
+    # job_id 只是「下载中的暂存区」，下完就挪走，最终落点里看不到它。
+    aria2_download_dir: "/downloads"
+    # 完成后目录（可选）。留空 = 下完挪到 <aria2_download_dir>/ 根下
+    download_destination_dir: "/downloads_done"
+    # 两个都留空 = 提交任务时不带 dir，由 aria2 自己的默认目录决定；
+    # 此时本机不扫描、不移动、不校验，完成与否只看 aria2 状态。
 
-# Aria2 RPC Secret（未设置则留空）
-aria2_secret: ""
+  # 第二套（整段取消注释即可用；name 不能重复）
+  # - name: "备机"
+  #   aria2_host: "http://192.168.1.101:6800/jsonrpc"
+  #   aria2_secret: "your-token"
+  #   aria2_download_dir: "/downloads"
+  #   download_destination_dir: "/downloads_done"
 
-# Aria2 下载临时目录（实际落盘为 <aria2_download_dir>/<job_id>/<相对路径>，
-# 每个任务独占子目录，避免多任务同名文件互相覆盖）
-aria2_download_dir: "/downloads"
+  # 远端 aria2（朋友提供的 RPC）：只有地址和令牌，文件落在对方机器上，
+  # 本机不管落盘目录（aria2_remote: true 时两个目录都可以留空）。
+  # 这种配置下：提交 addUri 只带 out=<相对路径>（保留子目录防撞名）、不带 dir，
+  # 不做本地移动/校验，进度与是否完成都来自 aria2.tellStatus。
+  # 对方默认目录常不可写时，可以填 aria2_remote_dir 指定一个可写目录（如 "/data/downloads"）。
+  # - name: "朋友的"
+  #   aria2_remote: true
+  #   aria2_host: "http://friend.example.com:6800/jsonrpc"
+  #   aria2_secret: "friend-token"
 
-# 下载完成后移动到的目标目录
-download_destination_dir: "/downloads_done"
+# 新增任务时默认选中的配置名（省略或指向已删除的配置时取第一条）
+aria2_default: "默认"
+
+# ---- 以下为全局项，所有 Aria2 配置共用 ----
 
 # 主循环轮询间隔（秒）
 poll_interval: 60

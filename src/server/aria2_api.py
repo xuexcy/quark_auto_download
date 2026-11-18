@@ -1,8 +1,94 @@
 import os
 import posixpath
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
+
+
+class Aria2Error(RuntimeError):
+    """Aria2 RPC 调用失败（网络/协议/业务错误）。"""
+
+
+class Aria2ConfigError(Aria2Error):
+    """地址、令牌或协议层面的错误：重试不可能成功，应直接让用户改配置。"""
+
+
+def normalize_rpc_url(host: str) -> str:
+    """把用户填的地址补成 aria2 的 JSON-RPC 端点。
+
+    最常见的错是只填 http://主机:6800（缺 /jsonrpc）：aria2 对任何路径都返回
+    JSON-RPC 错误或 404，逐个文件重试也永远失败。这里只补路径、不猜端口——
+    端口填错（例如填成 AriaNg 的 443）由启动前预检报错，文案里会给出应有的形状。
+    """
+    text = str(host or "").strip()
+    if not text:
+        return ""
+    parts = urlsplit(text)
+    path = parts.path or ""
+    if path in ("", "/"):
+        path = "/jsonrpc"
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
+
+
+# aria2 的错误码决定「换个时间重试有没有用」。只看 errorMessage 没用：
+# 远端 aria2 的下载目录不可写时，aria2 只回一句 "Download aborted."（errorCode=16），
+# 页面上看起来就是「任务提交成功但速度一直 0」。
+_ARIA2_ERROR_HINTS = {
+    9: "aria2 所在机器磁盘空间不足",
+    13: "目标文件已存在，且 aria2 未允许覆盖",
+    16: "aria2 无法在下载目录创建/写入文件（目录只读、不存在，或文件被占用）",
+    17: "aria2 文件系统错误（磁盘异常或路径不可用）",
+    18: "aria2 无法创建下载子目录（父目录不可写或不存在）",
+    19: "下载地址的域名解析失败",
+    22: "HTTP 响应异常（直链可能已过期，或对方拦截了请求）",
+    24: "HTTP 鉴权失败（直链需要 Cookie/User-Agent）",
+}
+# 目录写不进去这类错误改配置才能好，重试没有意义（否则同一文件白白重试 3 轮）
+PERMANENT_ARIA2_ERROR_CODES = (16, 18)
+
+
+def plan_download_dirs(download_dir: str, destination_dir: str, *, remote: bool = False) -> dict[str, str]:
+    """决定这次任务怎么用目录（远端一律留空）。
+
+    两个目录都可选，组合出三种本机模式：
+    1. 有临时目录：临时目录只当「下载中的暂存区」（提交时带 <job_id>）；下完挪到最终位置——
+       配了完成目录就挪过去，没配就从 `<临时>/<job_id>/` 挪到 `<临时>/` 根下（最终目录里看不到 job_id）
+    2. 没有临时目录、有完成目录：直接下到 `<完成>/<job_id>/`，下完在同一目录内挪一层去掉 job_id
+    3. 两个都没有：提交任务时不指定 dir，交给 aria2 自己的默认目录；本机不知道落点，所以不校验、不移动
+
+    返回 `{"download_dir", "destination_dir", "mode"}`，mode ∈ temp / dest / none / remote。
+    download_dir 是「暂存根目录」（Aria2Client/FileApi 会再拼 job_id），destination_dir 是最终落点。
+    """
+    temp = str(download_dir or "").strip()
+    dest = str(destination_dir or "").strip()
+    if remote:
+        return {"download_dir": "", "destination_dir": "", "mode": "remote"}
+    if temp:
+        return {"download_dir": temp, "destination_dir": dest or temp, "mode": "temp"}
+    if dest:
+        return {"download_dir": dest, "destination_dir": dest, "mode": "dest"}
+    return {"download_dir": "", "destination_dir": "", "mode": "none"}
+
+
+def describe_task_error(task: dict) -> str:
+    """把 aria2 的任务错误翻译成人话；看不懂的错误码原样返回 errorMessage。"""
+    if not isinstance(task, dict):
+        return "未知错误"
+    message = str(task.get("errorMessage") or "").strip() or "未知错误"
+    try:
+        code = int(task.get("errorCode") or 0)
+    except (TypeError, ValueError):
+        code = 0
+    hint = _ARIA2_ERROR_HINTS.get(code, "")
+    if not hint:
+        return message
+    files = task.get("files")
+    path = ""
+    if isinstance(files, list) and files and isinstance(files[0], dict):
+        path = str(files[0].get("path") or "").strip()
+    target = f"；目标路径: {path}" if path else ""
+    return f"{hint}（aria2 errorCode={code}: {message}）{target}"
 
 
 class Aria2Client:
@@ -17,9 +103,16 @@ class Aria2Client:
         download_timeout: int,
         logger,
         job_id: str = "",
+        remote: bool = False,
+        remote_dir: str = "",
     ):
-        self.host = host
+        self.host = normalize_rpc_url(host)
         self.secret = secret
+        # 远端 aria2（朋友提供的 RPC）：只提交下载请求 + 查进度，不知道也不该管对方的落盘目录
+        self.remote = bool(remote)
+        # 远端目录：可选。对方 aria2 的默认目录常常不可写（实测 /downloads 只读 → errorCode=16），
+        # 填了就用它当 dir；留空则完全交给对方配置。
+        self.remote_dir = str(remote_dir or "").strip().rstrip("/")
         # 下载根目录；若指定 job_id，则该任务独占 <root>/<job_id>，避免多任务同名文件互相覆盖
         self._base_download_dir = str(download_dir or "").rstrip("/")
         self.job_id = str(job_id or "").strip()
@@ -33,29 +126,64 @@ class Aria2Client:
 
     @property
     def download_dir(self) -> str:
+        # 没有暂存根目录（远端 / 两个目录都没填）时返回空：提交任务时不带 dir，
+        # 交给 aria2 自己的默认目录 —— 绝对不能拼出相对路径（会落到 aria2 的 cwd）。
+        if not self._base_download_dir:
+            return ""
         if self.job_id:
-            return f"{self._base_download_dir}/{self.job_id}" if self._base_download_dir else self.job_id
+            return f"{self._base_download_dir}/{self.job_id}"
         return self._base_download_dir
 
     def _aria2_call(self, method: str, params: list):
-        import time
         self._id += 1
         secret_param = f"token:{self.secret}" if self.secret else ""
         full_params = ([secret_param] + params) if secret_param else params
         payload = {"jsonrpc": "2.0", "id": str(self._id), "method": method, "params": full_params}
 
         start_time = time.time()
-        r = requests.post(self.host, json=payload, timeout=self.request_timeout)
+        try:
+            r = requests.post(self.host, json=payload, timeout=self.request_timeout)
+        except requests.RequestException as e:
+            raise Aria2Error(f"连接 Aria2 失败（{self.host}）: {e}") from e
         elapsed = time.time() - start_time
 
-        r.raise_for_status()
-        result = r.json()
-        if "error" in result:
-            raise RuntimeError(f"Aria2 RPC 错误: {result['error']}")
+        # 先解析再判状态码：aria2 的令牌错误是 HTTP 400 + JSON-RPC error，
+        # 先 raise_for_status() 只会得到 "400 Client Error"，看不出是 rpc-secret 不对。
+        content_type = (r.headers.get("Content-Type") or "").lower()
+        text = (r.text or "").strip()
+        data = None
+        if "json" in content_type or text.startswith("{"):
+            try:
+                data = r.json()
+            except ValueError:
+                data = None
+        if not isinstance(data, dict):
+            # 典型场景：把 AriaNg 网页地址、静态文件站或 501 的目录当成 RPC 地址
+            snippet = text[:120].replace("\n", " ")
+            raise Aria2ConfigError(
+                f"Aria2 RPC 地址不对（{self.host}）: HTTP {r.status_code}"
+                f" {content_type or '未知 Content-Type'}，返回的不是 JSON-RPC。"
+                f"RPC 地址形如 http://主机:6800/jsonrpc；"
+                f"AriaNg 网页地址（网页控制台）不能当 RPC 用。响应片段: {snippet}"
+            )
+
+        error = data.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = str(error.get("message") or "")
+            if code in (1, "1") or "unauthorized" in message.lower():
+                raise Aria2ConfigError(
+                    f"Aria2 RPC 未授权（{self.host}）: 令牌（rpc-secret）不对，或对方没配 secret"
+                )
+            raise Aria2Error(f"Aria2 RPC 错误（{method}）: {error}")
+        if r.status_code >= 400:
+            raise Aria2Error(f"Aria2 RPC HTTP {r.status_code}（{self.host}）: {text[:120]}")
+        if "result" not in data:
+            raise Aria2Error(f"Aria2 RPC 响应缺少 result（{self.host}）: {text[:120]}")
 
         # 记录请求耗时
         self.log.debug(f"Aria2 API 请求耗时: {method} - {elapsed:.3f}s")
-        return result["result"]
+        return data["result"]
 
     @staticmethod
     def _normalize_relative_path(path: str) -> str:
@@ -70,7 +198,21 @@ class Aria2Client:
         relative_path = self._normalize_relative_path(filename)
         relative_dir = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
         output_name = relative_path.rsplit("/", 1)[-1]
-        options = {"dir": os.path.join(self.download_dir, relative_dir), "out": output_name}
+        if self.remote:
+            # 远端：默认不指定 dir（落在对方 aria2 自己的目录）；配置里填了「远端下载目录」
+            # 就用它，否则对方默认目录不可写时每个文件都只会得到 errorCode=16。
+            # 无论哪种都要保留子目录，否则不同子目录下的同名文件会在对方机器上互相覆盖。
+            options = {"out": relative_path}
+            if self.remote_dir:
+                options["dir"] = (
+                    posixpath.join(self.remote_dir, relative_dir) if relative_dir else self.remote_dir
+                )
+        elif self.download_dir:
+            options = {"dir": os.path.join(self.download_dir, relative_dir), "out": output_name}
+        else:
+            # 两个目录都没填：不指定 dir（用 aria2 自己的默认目录），但保留子目录，
+            # 否则不同子目录下的同名文件会互相覆盖。
+            options = {"out": relative_path}
         if self.download_headers:
             options["header"] = list(self.download_headers)
         gid = self._aria2_call("aria2.addUri", [[url], options])
@@ -78,6 +220,27 @@ class Aria2Client:
 
     def aria2_get_status(self, gid: str) -> dict:
         return self._aria2_call("aria2.tellStatus", [gid])
+
+    def describe_task_error(self, task: dict) -> str:
+        """tellStatus 的 error 结果 → 能照着修的说明（见 describe_task_error）。"""
+        return describe_task_error(task)
+
+    def _match_key(self, path: str) -> str:
+        """按路径对齐 Aria2 任务时用的键：完整相对路径（远端也带子目录）。"""
+        return self._normalize_relative_path(path)
+
+    @staticmethod
+    def _path_matches(rel: str, wanted: set[str]) -> bool:
+        """判断 aria2 任务还原出来的相对路径是否在目标集合里。
+
+        兼容历史任务：早期远端提交只给 out=文件名，还原出来就是裸文件名，
+        这类键没有子目录，只能按文件名比一次（可能撞名，仅作兜底）。
+        """
+        if rel in wanted:
+            return True
+        if "/" in rel:
+            return False
+        return any(key.rsplit("/", 1)[-1] == rel for key in wanted)
 
     def _extract_task_filename(self, task: dict) -> str:
         """把 aria2 任务的文件绝对路径还原为相对路径；不属于本任务下载目录的返回空串。"""
@@ -89,6 +252,14 @@ class Aria2Client:
             path = str(first.get("path", "")).strip()
             if path:
                 normalized_path = path.replace("\\", "/").rstrip("/")
+                # tellStatus 会带 dir：用它精确还原相对路径（远端同样适用，
+                # 否则不同子目录的同名文件会撞成一个键）
+                task_dir = str(task.get("dir") or "").replace("\\", "/").rstrip("/")
+                if task_dir and normalized_path.startswith(f"{task_dir}/"):
+                    return normalized_path[len(task_dir) + 1 :]
+                if self.remote:
+                    # 远端拿不到 dir（老任务/对方省略）：退回文件名，兼容历史任务
+                    return normalized_path.rsplit("/", 1)[-1] if normalized_path else ""
                 normalized_download_dir = self.download_dir.replace("\\", "/").rstrip("/")
                 if normalized_path == normalized_download_dir:
                     return ""
@@ -104,6 +275,16 @@ class Aria2Client:
     def aria2_get_global_stat(self) -> dict:
         """返回 aria2.getGlobalStat 结果（含 numActive/numWaiting/numStopped）。"""
         result = self._aria2_call("aria2.getGlobalStat", [])
+        return result if isinstance(result, dict) else {}
+
+    def aria2_get_version(self) -> dict:
+        """返回 aria2.getVersion 结果（version/enabledFeatures），设置页「测试」用。"""
+        result = self._aria2_call("aria2.getVersion", [])
+        return result if isinstance(result, dict) else {}
+
+    def aria2_get_global_option(self) -> dict:
+        """返回 aria2.getGlobalOption 结果；设置页用它的 dir 说明文件会落到哪。"""
+        result = self._aria2_call("aria2.getGlobalOption", [])
         return result if isinstance(result, dict) else {}
 
     def aria2_get_waiting_count(self) -> int:
@@ -167,6 +348,11 @@ class Aria2Client:
                         "gid": str(task.get("gid", "")).strip(),
                         "status": task_status,
                     }
+        if self.remote:
+            # 远端老任务是按裸文件名提交的：补一个文件名别名，避免每次都被当成新任务重复提交。
+            # 仅在完整路径键不存在时补，新任务仍以完整相对路径为准。
+            for key in [k for k in info_by_name if "/" in k]:
+                info_by_name.setdefault(key.rsplit("/", 1)[-1], info_by_name[key])
         return info_by_name
 
     def aria2_wait_done(self, gid: str, filename: str) -> bool:
@@ -210,11 +396,15 @@ class Aria2Client:
 
         只做完整相对路径精确匹配：不同目录下的同名文件（如 cover.jpg）不会被误认领。
         """
-        wanted = self._normalize_relative_path(relative_path)
+        wanted = self._match_key(relative_path)
         if not wanted:
             return None
         infos = self.aria2_get_existing_task_infos_by_name()
-        return infos.get(wanted)
+        found = infos.get(wanted)
+        if found is None and "/" in wanted:
+            # 历史任务可能只按文件名提交
+            found = infos.get(wanted.rsplit("/", 1)[-1])
+        return found
 
     def aria2_list_tasks(self, *, include_stopped: bool = False) -> list[dict]:
         tasks: list[dict] = []
@@ -241,7 +431,7 @@ class Aria2Client:
         按相对路径移除 Aria2 任务。
         返回 {"removed_waiting": [...], "removed_active": [...]}。
         """
-        wanted = {self._normalize_relative_path(p) for p in paths if p}
+        wanted = {self._match_key(p) for p in paths if p}
         removed_waiting: list[str] = []
         removed_active: list[str] = []
         if not wanted:
@@ -254,7 +444,7 @@ class Aria2Client:
             if not gid or not name:
                 continue
             rel = self._normalize_relative_path(name)
-            if rel not in wanted:
+            if not self._path_matches(rel, wanted):
                 continue
             if status == "waiting" and remove_waiting:
                 self.aria2_remove(gid, force=True)
@@ -272,7 +462,7 @@ class Aria2Client:
         pause_waiting: bool = True,
     ) -> dict[str, list[str]]:
         """按相对路径暂停 Aria2 任务（保留进度，便于下次 unpause）。"""
-        wanted = {self._normalize_relative_path(p) for p in paths if p}
+        wanted = {self._match_key(p) for p in paths if p}
         paused_waiting: list[str] = []
         paused_active: list[str] = []
         if not wanted:
@@ -285,7 +475,7 @@ class Aria2Client:
             if not gid or not name:
                 continue
             rel = self._normalize_relative_path(name)
-            if rel not in wanted:
+            if not self._path_matches(rel, wanted):
                 continue
             if status == "paused":
                 if pause_waiting or pause_active:

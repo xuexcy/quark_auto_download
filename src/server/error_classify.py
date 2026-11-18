@@ -27,8 +27,27 @@ _PERMANENT_PATTERNS = (
     # 夸克 23018：单文件超过账号可下载上限，重试无用
     r"\b23018\b",
     r"download\s+file\s+size\s+limit",
+    # 分享链接 / stoken 失效：换多少次重试都拿不到文件，直接出局让人换链接
+    r"分享已?(?:失效|过期|取消)",
+    r"分享不存在",
+    r"链接已?(?:失效|过期|取消)",
+    r"已失效",
+    r"已过期",
+    r"\bstoken\b",
+    r"\bexpired\b",
+    r"\bnot\s+exist\b",
+    r"\bshare\b[^|]{0,40}\b(?:expired|invalid)\b",
     r"\bhttp\s*(?:error\s*)?(?:status\s*)?[=:]?\s*(?:401|403|404)\b",
     r"\bstatus(?:_code)?\s*[=:]\s*(?:401|403|404)\b",
+    # Aria2 RPC 地址/令牌/协议配错：换个时间重试多少次都一样，直接出局让人改配置
+    r"rpc\s*地址不对",
+    r"不是\s*json-rpc",
+    r"rpc\s*未授权",
+    r"rpc\s*令牌",
+    # Aria2 任务错误码 16/18：下载目录不可写 / 子目录建不出来，改配置才能好
+    r"aria2\s*errorcode\s*[=:]\s*(?:16|18)\b",
+    r"无法在下载目录创建",
+    r"无法创建下载子目录",
 )
 
 _TEMPORARY_PATTERNS = (

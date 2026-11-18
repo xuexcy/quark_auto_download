@@ -213,6 +213,32 @@ def test_deleted_file_cloud_copy_purged_on_start(tmp_path):
     assert pipe.file_api.quark_client.deleted == [["mine1"]]
 
 
+def test_readded_file_is_not_blocked_by_deleted_marker(build, tmp_path):
+    """删除标记以文件为准：Web 撤掉标记后，同一个文件重新勾选要能进队列。"""
+    pipe, override_path = build({"paused": [], "deleted": ["a/b.mp4"], "retry": []})
+    pipe.initialize([])
+    assert pipe._applied_deleted == {"a/b.mp4"}
+
+    selection = tmp_path / "selection.json"
+    selection.write_text('{"file_fids": ["f1"]}', encoding="utf-8")
+    pipe.selection_file = str(selection)
+    pipe.reload_selection = lambda: [file_item("a/b.mp4")]
+
+    pipe._maybe_reload_selection()
+    assert "a/b.mp4" not in pipe.scheduler.jobs
+
+    # Web 侧重新勾选时会把这条从 deleted 里撤掉（add_job_selection → forget_deleted_paths）
+    override_path.write_text(
+        yaml.safe_dump({"paused": [], "deleted": [], "retry": []}), encoding="utf-8"
+    )
+    pipe._tick_file_controls()
+    assert pipe._applied_deleted == set()
+
+    selection.write_text('{"file_fids": ["f1", "f1"]}', encoding="utf-8")
+    pipe._maybe_reload_selection()
+    assert "a/b.mp4" in pipe.scheduler.jobs
+
+
 def test_broken_override_file_does_not_break_tick(build):
     pipe, override_path = build()
     pipe.initialize([file_item("a.mp4")])

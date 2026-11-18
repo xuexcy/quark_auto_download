@@ -445,7 +445,14 @@ class QuarkClient:
             )
             req_elapsed = time.monotonic() - started
             _stats["requests"] += 1
-            items = data.get("data", {}).get("list", [])
+            # 这是全文件唯一没做成功判定的分页接口：以前 code!=0 会被当成
+            # 「这页没内容」，静默产出空/半截文件列表，任务看起来「0 个文件」。
+            if not _is_ok(data):
+                raise RuntimeError(
+                    f"列举分享目录失败（{dir_label} page={page}）: {_payload_brief(data)}"
+                )
+            node = data.get("data")
+            items = node.get("list", []) if isinstance(node, dict) else []
             if not items:
                 break
             page_files = 0
@@ -801,7 +808,9 @@ class QuarkClient:
             abnormal = 0
 
             if status == 2:
-                save_as = data_node.get("save_as", {})
+                save_as = data_node.get("save_as") or {}
+                if not isinstance(save_as, dict):
+                    save_as = {}
                 save_list = save_as.get("save_as_top_fids", []) or save_as.get("save_as_fids", [])
                 return save_list
             if status == 3:
