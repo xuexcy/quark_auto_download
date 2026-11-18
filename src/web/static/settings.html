@@ -120,8 +120,7 @@
     .aria2-remote { display: flex; align-items: center; gap: .35rem; margin: .35rem 0 0; font-size: .76rem; color: var(--muted); }
     .aria2-remote input { width: auto; margin: 0; }
     .aria2-card.remote { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
-    .aria2-card.remote input[data-field="aria2_download_dir"]:disabled,
-    .aria2-card.remote input[data-field="download_destination_dir"]:disabled { opacity: .45; }
+    /* 远端 / 本机两套目录互斥，切换时用 hidden 收起另一组 */
     .aria2-default { display: inline-flex; align-items: center; gap: .3rem; margin: 0; font-size: .78rem; color: var(--muted); white-space: nowrap; }
     .aria2-default input { width: auto; margin: 0; }
     .aria2-card-actions { display: flex; gap: .35rem; margin-left: auto; }
@@ -375,23 +374,9 @@
       );
       card.appendChild(remoteLabel);
 
-      // 远端目录：对方机器上的绝对路径。对方默认目录常不可写（实测 /downloads 只读时
-      // 每个文件都只得到 errorCode=16「Download aborted.」，页面上就是速度一直 0）
-      const remoteDirLabel = document.createElement("label");
-      remoteDirLabel.textContent = "远端下载目录（留空 = 用对方的默认目录）";
-      const remoteDirInput = document.createElement("input");
-      remoteDirInput.dataset.field = "aria2_remote_dir";
-      remoteDirInput.placeholder = "/downloads 或 /data/downloads";
-      remoteDirInput.value = profile.aria2_remote_dir || "";
-      remoteDirLabel.hidden = true;
-      remoteDirInput.hidden = true;
-      card.append(remoteDirLabel, remoteDirInput);
-
       const fields = [
         ["aria2_host", "RPC Host", "http://127.0.0.1:6800/jsonrpc"],
         ["aria2_secret", "Secret（掩码不改）", "RPC secret，没有可留空"],
-        ["aria2_download_dir", "下载临时目录（可选）", "/vol2/1000/downloads"],
-        ["download_destination_dir", "完成后目录（可选，留空 = 留在临时目录根下）", "/vol2/1000/completed"],
       ];
       for (const [key, labelText, placeholder] of fields) {
         const label = document.createElement("label");
@@ -404,20 +389,46 @@
         card.append(label, input);
       }
 
-      // 远端模式下两个本机目录没有意义：置灰、清掉占位提示
+      // 目录字段只有两套、互斥：
+      //  - 远端 aria2：填「下载目录」（对方机器上的绝对路径；对方默认目录常不可写，
+      //    实测 /downloads 只读时每个文件都只得到 errorCode=16「Download aborted.」）
+      //  - 本机 aria2：填「临时下载目录」+「下载目录（完成后移入）」
+      // 切换时整组（label + input）一起藏，页面上最多同时看到两个目录输入框。
+      const dirFields = {};
+      const addDirField = (key, labelText, placeholder) => {
+        const label = document.createElement("label");
+        label.textContent = labelText;
+        const input = document.createElement("input");
+        input.dataset.field = key;
+        input.placeholder = placeholder;
+        input.dataset.placeholder = placeholder;
+        input.value = profile[key] || "";
+        card.append(label, input);
+        dirFields[key] = { label, input };
+      };
+      addDirField(
+        "aria2_remote_dir",
+        "下载目录（对方机器上的绝对路径；留空 = 用对方的默认目录）",
+        "/downloads 或 /data/downloads",
+      );
+      addDirField("aria2_download_dir", "临时下载目录（可选）", "/vol2/1000/downloads");
+      addDirField(
+        "download_destination_dir",
+        "下载目录（完成后移入；留空 = 留在临时目录根下）",
+        "/vol2/1000/completed",
+      );
+
+      // 两套目录互斥：远端不用本机的临时/完成目录，本机也不用对方的远端目录
       const syncRemote = () => {
         const remote = remoteBox.checked;
         card.classList.toggle("remote", remote);
         for (const key of ["aria2_download_dir", "download_destination_dir"]) {
-          const el = card.querySelector('[data-field="' + key + '"]');
-          if (!el) continue;
-          el.disabled = remote;
-          el.placeholder = remote ? "远端，不用填" : (el.dataset.placeholder || "");
+          const field = dirFields[key];
+          field.label.hidden = remote;
+          field.input.hidden = remote;
         }
-        // 远端目录只在远端模式下有意义：本机 aria2 的目录由上面两个字段管
-        remoteDirLabel.hidden = !remote;
-        remoteDirInput.hidden = !remote;
-        remoteDirInput.disabled = !remote;
+        dirFields.aria2_remote_dir.label.hidden = !remote;
+        dirFields.aria2_remote_dir.input.hidden = !remote;
       };
       remoteBox.addEventListener("change", () => {
         syncRemote();

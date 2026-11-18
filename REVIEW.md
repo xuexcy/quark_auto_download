@@ -1549,3 +1549,49 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
   改的时候要一起改。
 - 「0 字节」判定用 aria2 的 `completedLength`：远端 aria2 报了 completed 但文件其实没落盘（errorCode 16）
   也能标出来，因为此时 `completedLength` 仍是 0。
+
+### 23.12 2.8.6：设置页的目录字段收成两套（远端 / 本机互斥）（2026-11-18）
+
+**23.12.1 现象与诉求**
+
+用户：「1. aria2是远端：可以填下载目录 2. aria2不是远端：可以填临时下载目录和下载目录 我现在可以看到三个输入框，
+理论上最多只有两个」。截图里一张远端卡片同时出现「远端下载目录」「下载临时目录」「完成后目录」三个输入框。
+
+**23.12.2 根因**
+
+`src/web/static/settings.html` 的 `aria2Card()` 把三个目录字段都 append 进卡片 DOM，远端模式只做两件事：
+给两个本机目录 `input.disabled = true`（配合 `.aria2-card.remote input[...]:disabled { opacity: .45 }` 置灰）、
+把 `aria2_remote_dir` 的 label/input 设 `hidden`。也就是说「本机目录在远端模式下仍然占位」——`disabled` 只挡输入，
+不挡显示，于是三个框都看得见。
+
+**23.12.3 改动（纯前端，后端与 yaml 格式未变）**
+
+| 位置 | 改动 |
+| --- | --- |
+| `settings.html` CSS | 删掉两条只为置灰服务的 `.aria2-card.remote input[data-field="aria2_download_dir"]:disabled, … { opacity: .45 }` |
+| `aria2Card()` | host/secret 的 `fields` 循环提到前面；新增 `dirFields` + `addDirField(key, label, placeholder)`，三个目录字段都走它，label 与 input 一起登记 |
+| 目录标签 | 远端：`下载目录（对方机器上的绝对路径；留空 = 用对方的默认目录）`；本机：`临时下载目录（可选）`、`下载目录（完成后移入；留空 = 留在临时目录根下）` |
+| `syncRemote()` | 改成按组 `hidden`：远端时藏起 `aria2_download_dir` / `download_destination_dir` 的 label+input，只留 `aria2_remote_dir`；本机时反之 |
+| 值保留 | 隐藏字段仍被 `collectAria2()` 读到并保存，切回原模式还能看到原来的目录，不会因为藏起来被清空 |
+
+**23.12.4 为什么不是「隐藏本机两个、只显示远端一个」一刀切**
+
+两种模式的目录语义不同，不能共用一个输入框：远端目录是**对方机器上的绝对路径**，且不过本机 `allowed_roots`
+（`aria2_profiles.PROFILE_PATH_KEYS` 只含两个本机目录）；本机的「临时目录 / 完成目录」是两个阶段。
+所以只能「同一组字段、按模式整组显示」，用一个字段承载三种含义会回到「留空到底等于什么」的老问题。
+
+**23.12.5 验证**
+
+| 场景 | 结果 |
+| --- | --- |
+| 本机模式的卡片（本机 conf 两条都是本机） | 可见目录输入框 **2** 个：`临时下载目录（可选）`=/downloads、`下载目录（完成后移入…）`=/downloads_done，`aria2_remote_dir` 不可见 |
+| 勾「远端 aria2」 | `visibleDirInputs = 1`，只剩 `下载目录（对方机器上的绝对路径…）`，卡片 class `aria2-card remote` |
+| 取消勾选 | 回到 2 个，标签与取值同前 |
+| 语法 | 抽 `<script>` 块 `node --check` 通过 |
+| 测试 | 无后端改动，`pytest` 仍 **250 passed** |
+
+**23.12.6 边界**
+
+- 远端卡片里被藏起来的本机目录值仍会被保存（`_validate_write_paths` 仍会校验它们）——如果用户先在本机模式填了一个
+  白名单外的目录再切远端，保存依旧会被 400 拦下。这是有意保守：切回本机模式就能立刻用上，不必重填。
+- 页面上「远端」与「本机」互斥只是显示层，`conf/aria2.yaml` 两种字段可以并存；后端以 `aria2_remote` 决定用哪套。
