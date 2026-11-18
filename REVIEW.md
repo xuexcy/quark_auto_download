@@ -1720,3 +1720,57 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
   半成品仍在下载目录里，重新勾选时 Aria2 的 `continue=true` 通常会续传（未在真机逐一验证）。
 - 删除仍是「运行中约 1 秒生效」（子进程每 tick 读 `file_override.yaml`），Web 端先本地过滤再重刷一次接口。
 
+### 23.16 2.8.10：「目录」树缩进统一成固定台阶（2026-11-18）
+
+用户反馈（m07146，逐字）：「目录一行和下面的行，缩进不够，下面的行应该再往右边一点点，整体树形结构缩进应该一致」。
+
+#### 23.16.1 实测：改前「差不多但不齐」
+
+在 NAS 页面上量 `getBoundingClientRect()`（1rem = 16px）：
+
+| 元素 | 改前 | 说明 |
+| --- | --- | --- |
+| `.job-tree-head .tree-check` | 53.8px | 标题栏 padding-left .7rem + `.job-tree-caret` .9rem + gap .45rem |
+| 第 1 层 `.tree-row .tree-check` | 57px | 只比标题栏右 3.2px，视觉上「目录」与第 1 层像同级 |
+| 标题栏光标宽 / 行内光标宽 | 14.4px / 16px | `.job-tree-caret` 与 `.tree-caret` 各自写死 |
+| 标题栏 gap / 行 gap | 7.2px / 5.6px | 同上 |
+| 行内勾选框 | 带 UA 默认 margin（约 4px） | `.job-tree-head .tree-check` 被单独 `margin: 0`，两处不同源 |
+
+结论：每层「台阶」只有 .9rem（14.4px），且第 1 层与标题栏几乎重叠，所以看起来「缩进不够、不一致」。
+
+#### 23.16.2 改动（只动 CSS，不改 DOM/JS）
+
+`src/web/static/index.html`：
+
+| 位置 | 改动 |
+| --- | --- |
+| `.job-tree` | 新增 `--tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;` |
+| `.tree-row` | `gap: var(--tree-gap)`；`padding-left: calc(var(--tree-base) + var(--depth) * var(--tree-step))` |
+| `.tree-caret` | `width: var(--tree-caret)`（目录行的 button 与文件行的 span 同宽） |
+| `.job-tree-head` | `gap: var(--tree-gap)` |
+| `.job-tree-caret` | `width: var(--tree-caret)` |
+| `.tree-check` | 统一 `margin: 0`（消掉 UA 默认外边距，标题栏那条单独覆盖不再需要区分） |
+
+`--tree-base: 1.5rem` 让第 1 层相对「目录」正好退一格：标题栏内容起点 = 11.2px(padding) + 16px(光标) + 5.6px(gap) = 32.8px；
+行内容起点 = 5.6px(body padding) + 24px(base) + 16px + 5.6px = 51.2px，差 18.4px = 1.15rem。
+
+#### 23.16.3 验证
+
+本机页面（窗口 756×469，用 `treeRowEl()` 造 4 层假行，避免动真实任务）：
+
+| 层级 | 勾选框左边缘 | 光标左边缘 | 与上一层差 |
+| --- | --- | --- | --- |
+| 标题栏「目录」 | 53.8px | 32.2px | — |
+| 第 1 层（目录） | 72.2px | 50.6px | +18.4px |
+| 第 1 层（文件） | 72.2px | 50.6px | 同层重合 |
+| 第 2 层 | 90.6px | 69.0px | +18.4px |
+| 第 3 层 | 109.0px | 87.4px | +18.4px |
+
+- `node --check`（抽出 `<script>` 块，61643 字符）通过；`pytest` **251 passed**（无 Python 改动）。
+- 代价：每层缩进从 14.4px 增到 18.4px，第 3 层名字右侧少约 12px；窄面板下 `.tree-name` 本来就有 ellipsis。
+
+#### 23.16.4 没动的
+
+- `.tree-panel` / `.tree-head`（第 86–93 行）是 2.4.2 之前的侧边栏版本残留 CSS，当前 DOM 里没有元素用这两个类；本次未清理，避免无关改动。
+- 树的数据结构、勾选逻辑、`--depth` 的写法都没变，只是把「视觉台阶」参数化。
+

@@ -92,29 +92,36 @@
     .tree-head span { font-size: .72rem; color: var(--muted); }
     .tree-head button { padding: .3rem .55rem; font-size: .72rem; }
     .tree-body { max-height: 15rem; overflow: auto; padding: .25rem; }
+    /* 缩进：光标列、间距、勾选框 margin 全部用同一组变量，
+       每深一层加一个 --tree-step；标题栏（「目录」那行）也按一个 --tree-step 缩进，
+       这样「目录」→ 第 1 层 → 第 2 层的缩进台阶完全一样 */
     .tree-row {
-      display: flex; align-items: center; gap: .35rem;
-      padding: .18rem .3rem .18rem calc(.3rem + var(--depth, 0) * .9rem);
+      display: flex; align-items: center; gap: var(--tree-gap, .35rem);
+      padding: .18rem .3rem .18rem calc(var(--tree-base, 1.5rem) + var(--depth, 0) * var(--tree-step, 1.15rem));
       border-radius: 6px; font-size: .8rem; font-family: var(--mono);
     }
     .tree-row:hover { background: color-mix(in srgb, var(--panel-2) 75%, transparent); }
     .tree-row.is-dir { cursor: pointer; }
     .tree-row.inherited { opacity: .55; }
     .tree-caret {
-      flex: 0 0 auto; width: 1rem; height: 1rem; padding: 0; background: transparent;
+      flex: 0 0 auto; width: var(--tree-caret, 1rem); height: 1rem; padding: 0; background: transparent;
       color: var(--muted); font-size: .7rem; line-height: 1; border-radius: 4px; text-align: center;
     }
     .tree-row.is-dir .tree-caret:hover { color: var(--accent); }
     .tree-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .tree-size { flex: 0 0 auto; font-size: .7rem; color: var(--muted); }
-    .tree-check { flex: 0 0 auto; accent-color: var(--accent); }
+    /* 勾选框的 UA 默认 margin 有 3~4px，会让「目录」标题栏（那边 margin:0）与下面各行错开 */
+    .tree-check { flex: 0 0 auto; margin: 0; accent-color: var(--accent); }
     .tree-hint { padding: .45rem .5rem; font-size: .74rem; color: var(--muted); }
     .tree-hint.err { color: #ff8e86; }
     /* 右侧「目录」面板 */
-    .job-tree { margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 0 auto; }
+    .job-tree {
+      --tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;
+      margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 0 auto;
+    }
     .job-tree[hidden] { display: none; }
-    .job-tree-head { display: flex; align-items: center; gap: .45rem; padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; }
-    .job-tree-caret { font-size: .72rem; color: var(--muted); width: .9rem; text-align: center; }
+    .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; }
+    .job-tree-caret { font-size: .72rem; color: var(--muted); width: var(--tree-caret, .9rem); text-align: center; }
     .job-tree-title { font-size: .84rem; font-weight: 600; white-space: nowrap; }
     .job-tree-summary { font-size: .74rem; color: var(--muted); font-family: var(--mono); }
     .job-tree-summary.on { color: var(--accent); }
