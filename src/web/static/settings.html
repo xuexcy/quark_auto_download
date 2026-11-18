@@ -120,6 +120,8 @@
     .aria2-remote { display: flex; align-items: center; gap: .35rem; margin: .35rem 0 0; font-size: .76rem; color: var(--muted); }
     .aria2-remote input { width: auto; margin: 0; }
     .aria2-card.remote { border-color: color-mix(in srgb, var(--accent) 40%, var(--line)); }
+    /* hidden 要压过上面 label { display: block }，否则藏起来的标签仍占一行文字 */
+    .aria2-card label[hidden] { display: none; }
     /* 远端 / 本机两套目录互斥，切换时用 hidden 收起另一组 */
     .aria2-default { display: inline-flex; align-items: center; gap: .3rem; margin: 0; font-size: .78rem; color: var(--muted); white-space: nowrap; }
     .aria2-default input { width: auto; margin: 0; }

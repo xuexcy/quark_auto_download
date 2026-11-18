@@ -1595,3 +1595,34 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
 - 远端卡片里被藏起来的本机目录值仍会被保存（`_validate_write_paths` 仍会校验它们）——如果用户先在本机模式填了一个
   白名单外的目录再切远端，保存依旧会被 400 拦下。这是有意保守：切回本机模式就能立刻用上，不必重填。
 - 页面上「远端」与「本机」互斥只是显示层，`conf/aria2.yaml` 两种字段可以并存；后端以 `aria2_remote` 决定用哪套。
+### 23.13 2.8.7：非远端时那句「对方机器上的绝对路径」不再显示（2026-11-18）
+
+用户反馈（m06718，逐字）：「下载目录（对方机器上的绝对路径；留空 = 用对方的默认目录） 。 当不是远端时，不应该显示这句话」。
+
+#### 23.13.1 根因
+
+- `src/web/static/settings.html:59` 有 `label { display: block; font-size: .8rem; color: var(--muted); margin: .7rem 0 .3rem; }`。
+- 2.8.6 用 `label.hidden = true` / `input.hidden = true` 切换两组目录字段：`<input>` 没有声明 `display`，
+  所以 `hidden` 的 UA 规则 `display: none` 生效；`<label>` 被作者样式强行 `display: block`，`hidden` 失效。
+- 结果：远端那句标签一直占一行文字，只有下面的输入框被藏起来。
+- 2.8.6 的验收脚本只统计「可见的 input 数量」（`visibleDirInputs`），没有统计 label，所以没抓到。
+
+#### 23.13.2 改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/web/static/settings.html` | `.aria2-card` 样式区新增 `.aria2-card label[hidden] { display: none; }`，注释说明为什么要压过 `label { display: block }` |
+| `src/server/web_app.py` | `APP_VERSION = "2.8.7"` |
+
+首页无需改动：同类问题早有 `.file-stall[hidden] { display: none; }`（`src/web/static/index.html:354`），且首页没有 `label {}` 规则。
+
+#### 23.13.3 验证
+
+本机 dev server（8787）实测，逐个 label 读 `hidden` / `getComputedStyle().display` / 高度：
+
+| 场景 | 远端标签 | 临时下载目录标签 | 下载目录标签 |
+| --- | --- | --- | --- |
+| 本机配置（未勾远端） | hidden=true, display=none, h=0 | block, h=18 | block, h=18 |
+| 勾上远端（同一张卡片，class 变 `aria2-card remote`） | block, h=18 | hidden=true, display=none, h=0 | hidden=true, display=none, h=0 |
+
+无后端改动，`pytest` 仍 **250 passed**。
