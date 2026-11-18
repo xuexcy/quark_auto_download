@@ -1659,3 +1659,64 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
 - NAS 2.8.8 真机（任务「凡人修仙」，分享 5ba874e85746）：标题 「目录」、标题栏勾选框存在；
   勾上 → 全部 `.tree-row` 的 `checked=true / disabled=true`、`下载所选` 可用、摘要「本次已勾选 0 文件 / 1 文件夹」；
   取消 → 全部恢复可点、按钮回到禁用；点 `199 4K.mp4` 名字 → 该行选中、按钮可用（用户原先卡住的场景）。
+### 23.15 2.8.9：「文件进度」每一行都能删，包括已完成的（2026-11-18）
+
+用户需求（m06960，逐字）：「所有进度都可以点击删除，比如已经完成的任务，只要是不在进度中的，都可以选择并下载」。
+
+#### 23.15.1 旧行为与问题
+
+2.5.3 引入逐文件控制时，按钮是按状态给的：`done` / `cleanup` 的行「已完成，不用管」，一个按钮都不给。
+理由是「已经下完的文件没什么好操作的」，但漏掉了「从任务里摘掉这条记录」这个动作：
+
+- 记录摘不掉，fid 就一直留在 `selection.json` 与 `share_usage()` 的汇总里，目录树里这个文件永远是
+  「已勾选 · 本任务」，无法重新勾选；
+- 于是「下完之后换个目录重下」「当初只是试下一集，现在想删掉记录」这两种场景都无解，
+  只能整个任务删掉重建（会连带丢掉其它文件的状态）。
+
+#### 23.15.2 语义：删的是「任务里的记录」，不是磁盘上的文件
+
+| 层 | 删除动作 | 已完成（`done` / `cleanup`）时的差异 |
+| --- | --- | --- |
+| `file_override.yaml` | 追加到 `deleted`，写 `deleted_map`（fid → 路径） | 无差异（同样写，子进程重启后也不会再下） |
+| `selection.json` / `jobs.yaml` | 摘掉 fid | 无差异 |
+| Aria2 | `forceRemove` 对应任务 | 已完成时任务已结束，通常是空操作 |
+| 网盘转存副本 | `_drop_file()` 删云端副本 | **跳过**（`state == "done"` 时不删，避免删掉已落盘对应的网盘文件） |
+| 本地文件 | **不动** | **不动**（这就是「删记录不删文件」的核心） |
+
+删除后 `share_usage()`（先收 selection，再用 `pipeline_state` 覆盖，最后跳过 `override.deleted`）不再把它算成占用，
+所以「目录」里这个文件重新可选；但本地文件还在的话，重新勾选后 `initialize()` 会按「本地副本已存在且大小一致」
+直接判 `done`——想真正重下必须先删本地文件（README 注意事项已写明）。
+
+#### 23.15.3 改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/server/jobs_manager.py` | `job_files()` 里 `"can_delete": True`（原 `st not in ("done", "cleanup")`）+ 注释说明语义 |
+| `src/web/static/index.html` | `fileRowFor()` 的删除按钮 title 按状态区分；`doFileAction()` delete 分支按 `wasDone` 选择提示文案（已完成时强调「本地文件保留在磁盘上」） |
+| `tests/pytest/test_file_control.py` | `test_can_flags_per_state` 的 done/cleanup 期望改 `(False, False, True)`；新增 `test_delete_done_file_frees_it_for_reselect` |
+
+后端删除链路本来就和状态无关，因此这是「放开一个前端/接口层的限制」，不是新增逻辑：
+`apply_file_control()`（`src/server/jobs_manager.py:892`）→ 运行中 `pipeline._apply_file_override_once()`
+（`src/server/pipeline.py:198`）→ `_drop_file()`（`src/server/pipeline.py:266`）→ `scheduler.drop_files()`
+（`src/server/scheduler.py:341`，任何状态都能摘）。
+
+#### 23.15.4 验证
+
+- `pytest` **251 passed**。新增用例断言：删 `done` 后 `job_files()` 为空、`selection == {}`、
+  `deleted == {"a/done.mp4"}`、`share_usage("j1") == {}`，随后 `add_job_selection()` 能重新加入
+  （`added == {"files": 1, "dirs": 0}`、返回的 `deleted` 为空 = 标记已被清掉）。
+- 本机真浏览器（端口 8787，假任务 `je374a6bdb5`，手写 4 行状态 done/cleanup/downloading/failed）：
+  - `/api/jobs/{id}/files` 四行 `can_delete` 全为 `true`；页面上 done/cleanup 行只有 ✕，downloading 行 ⏸+✕，failed 行 ▶+✕。
+  - 点 done 行的 ✕ → 行消失、提示「已删除记录：Show/S01E01.mkv（本地文件保留在磁盘上，可在「目录」里重新勾选）」，
+    `counts` 从 4 项变 3 项；再点 cleanup 行的 ✕ 后刷新页面，两条记录都没有回来。
+  - `file_override.yaml` 最终为 `deleted: [Show/S01E01.mkv, Show/S01E02.mkv]`、
+    `deleted_map: {f-clean1: …, f-done1: …}`。
+- 验证用假任务与 `state/`、`log/`、缓存目录已全部清理。
+
+#### 23.15.5 边界
+
+- `done` 状态不删网盘转存副本，配额要等下次清理（`cleanup_files_batch`）或手动删；这是刻意保守的选择。
+- 删记录不会碰本地文件与 Aria2 的 `.aria2` 控制文件；若当初没下完（`failed`/`downloading`），
+  半成品仍在下载目录里，重新勾选时 Aria2 的 `continue=true` 通常会续传（未在真机逐一验证）。
+- 删除仍是「运行中约 1 秒生效」（子进程每 tick 读 `file_override.yaml`），Web 端先本地过滤再重刷一次接口。
+

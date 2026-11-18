@@ -1147,7 +1147,9 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
                 "paused": st == "paused",
                 "can_pause": st in FILE_PAUSABLE_STATES,
                 "can_resume": st in FILE_RESUMABLE_STATES,
-                "can_delete": st not in ("done", "cleanup"),
+                # 任何一行都能删（含已完成）：删掉的是「任务里的这条记录」，
+                # 本地已落盘的文件不动；删完这个文件在目录树里就能重新勾选、重新下载。
+                "can_delete": True,
             }
         )
 

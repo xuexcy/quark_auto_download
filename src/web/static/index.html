@@ -1062,6 +1062,13 @@
       row.querySelector('[data-role="file-pause"]').hidden = !file.can_pause;
       row.querySelector('[data-role="file-resume"]').hidden = !file.can_resume;
       row.querySelector('[data-role="file-del"]').hidden = file.can_delete === false;
+      // 已完成的行只剩「删除」：删的是任务里的记录，磁盘上的文件不动
+      const delBtn = row.querySelector('[data-role="file-del"]');
+      const delTip =
+        state === "done" || state === "cleanup"
+          ? "从任务里删除这条记录（本地已下载的文件保留，之后可在「目录」里重新勾选）"
+          : "从任务里删除这个文件（删除后可重新勾选）";
+      if (delBtn.title !== delTip) delBtn.title = delTip;
       return row;
     }
 
@@ -1903,12 +1910,20 @@
           body: JSON.stringify({ op, paths: [path], fids: fid ? [fid] : [] }),
         });
         if (op === "delete") {
+          const removed = fileState.files.find((f) => String(f.path || "") === path) || {};
+          const wasDone = removed.state === "done" || removed.state === "cleanup";
           // 本地先摘掉，避免等下一次轮询才消失
           fileState.files = fileState.files.filter((f) => String(f.path || "") !== path);
           if (fid) treeState.taken.delete(fid);
           renderFileList();
           treeRefreshAll();
-          setMsg($("jobs-msg"), "已删除：" + path + "（可在目录树里重新勾选）", "ok");
+          setMsg(
+            $("jobs-msg"),
+            wasDone
+              ? "已删除记录：" + path + "（本地文件保留在磁盘上，可在「目录」里重新勾选）"
+              : "已删除：" + path + "（可在「目录」里重新勾选）",
+            "ok"
+          );
         } else {
           const when = res && res.applied === "immediate" ? "" : "（运行中，约 1 秒内生效）";
           setMsg($("jobs-msg"), `已${verb}：${path}${when}`, "ok");

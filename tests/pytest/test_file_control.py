@@ -158,8 +158,9 @@ def test_can_flags_per_state(env):
         ],
     )
     flags = {f["path"]: (f["can_pause"], f["can_resume"], f["can_delete"]) for f in jobs_manager.job_files("j1")["files"]}
-    assert flags["done.mp4"] == (False, False, False)
-    assert flags["cleanup.mp4"] == (False, False, False)
+    # 已完成 / 清理中也能删：删的是「任务里的这条记录」，删完可以在目录树里重新勾选下载
+    assert flags["done.mp4"] == (False, False, True)
+    assert flags["cleanup.mp4"] == (False, False, True)
     assert flags["failed.mp4"] == (False, True, True)
     assert flags["transferred.mp4"] == (True, False, True)
 
@@ -330,3 +331,27 @@ def test_readd_existing_selection_also_clears_marker(env):
     override = jobs_manager.read_file_override("j1")
     assert override["deleted"] == set()
     assert override["deleted_map"] == {}
+
+
+def test_delete_done_file_frees_it_for_reselect(env):
+    """已完成的文件也能删：删掉记录后目录树可以重新勾选，重新勾选会撤掉删除标记。"""
+    add_job(selection={"file_fids": ["f1"]})
+    write_state("j1", [{"path": "a/done.mp4", "fid": "f1", "size": 1000, "state": "done"}])
+
+    result = jobs_manager.apply_file_control("j1", "delete", ["a/done.mp4"], ["f1"])
+    assert result["applied"] == "immediate"
+    assert result["state_files_removed"] == 1
+    assert result["selection_removed"] == 1
+
+    # 进度里消失、勾选里摘掉、删除标记落下
+    assert jobs_manager.job_files("j1")["files"] == []
+    assert jobs_manager.get_job("j1")["selection"] == {}
+    assert jobs_manager.read_file_override("j1")["deleted"] == {"a/done.mp4"}
+    # 目录树不再把它标成「已在任务中」
+    assert jobs_manager.share_usage("j1") == {}
+
+    # 重新勾选同一个 fid：added 计数 +1，删除标记被撤掉（否则子进程会一直过滤它）
+    added = jobs_manager.add_job_selection("j1", {"file_fids": ["f1"]})
+    assert added["added"] == {"files": 1, "dirs": 0}
+    assert jobs_manager.get_job("j1")["selection"] == {"file_fids": ["f1"]}
+    assert jobs_manager.read_file_override("j1")["deleted"] == set()
