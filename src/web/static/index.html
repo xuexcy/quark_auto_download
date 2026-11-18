@@ -280,16 +280,17 @@
       display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; margin: .75rem 0;
       flex-shrink: 0;
     }
-    /* 统计挪进按钮行后：两条各自一行（标签在左、值在右），整块和按钮同高、不换行 */
+    /* 统计挪进按钮行后：两块左右并排（标签在上、值在下），整块随按钮行拉伸，上下与按钮对齐 */
     .job-actions .stats {
-      display: flex; flex-direction: column; align-items: flex-start; justify-content: center;
-      gap: .1rem; margin: 0; flex: 0 1 auto; min-width: 0;
+      display: flex; flex-direction: row; align-items: stretch; justify-content: flex-start;
+      gap: .9rem; margin: 0; flex: 0 1 auto; min-width: 0; align-self: stretch;
     }
     .job-actions .stat {
-      display: flex; align-items: baseline; gap: .45rem; min-width: 0;
-      border: 0; border-radius: 0; background: transparent; padding: 0; line-height: 1.25;
+      display: flex; flex-direction: column; justify-content: center; align-items: flex-start;
+      gap: .08rem; min-width: 0;
+      border: 0; border-radius: 0; background: transparent; padding: 0; line-height: 1.15;
     }
-    .job-actions .stat-label { margin: 0; font-size: .72rem; white-space: nowrap; }
+    .job-actions .stat-label { margin: 0; font-size: .7rem; white-space: nowrap; }
     .job-actions .stat-value { font-size: .8rem; white-space: nowrap; }
     .job-actions, .job-meta { flex-shrink: 0; }
     .stat {
