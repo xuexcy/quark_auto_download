@@ -18,6 +18,30 @@ from file_api import ACTIVE_ARIA2_STATUSES, FileApi
 from scheduler import Job, PipelineScheduler
 
 
+# 下载连续 0 字节多久算「停摆」：超过就在下载行打标记，并（只）记一条告警日志
+ZERO_BYTES_STALL_SEC = 300
+
+
+def track_zero_bytes(task: dict, completed: int, total: int, now: float) -> float:
+    """维护「连续 0 字节」的起点，返回已持续 0 字节的秒数（一旦有字节就清零）。
+
+    起点写进任务快照（zero_since），随 persist_payload 落盘，Web 端据此在下载行打标记。
+    """
+    if completed <= 0 and total > 0:
+        try:
+            zero_since = float(task.get("zero_since") or 0.0)
+        except (TypeError, ValueError):
+            zero_since = 0.0
+        if zero_since <= 0 or zero_since > now:
+            # 首次观测，或时钟回拨导致起点在未来：以本次为准
+            zero_since = now
+            task["zero_since"] = now
+        return max(now - zero_since, 0.0)
+    task.pop("zero_since", None)
+    task.pop("stall_logged", None)
+    return 0.0
+
+
 class DownloadPipeline:
     # 连续查询 aria2 状态失败的上限：超过即认为任务已丢失（不能无限等）
     STATUS_FAIL_LIMIT = 5
@@ -1128,6 +1152,14 @@ class DownloadPipeline:
             task["total"] = total
             task["speed"] = speed
             task["progress"] = round(pct, 1)
+            # 0 字节停摆检测：记下「连续 0 字节」的起点，Web 端据此在下载行打标记
+            zero_secs = track_zero_bytes(task, completed, total, now)
+            if zero_secs >= ZERO_BYTES_STALL_SEC and not task.get("stall_logged"):
+                task["stall_logged"] = True
+                self.log.warning(
+                    f"  ⚠ {job.path} 已连续 {int(zero_secs)} 秒 0 字节："
+                    "直链可能被 CDN 拒绝（412/403）或落盘目录不可写"
+                )
             with self.lock:
                 job.download_task = task
                 # 沿用 Aria2 报的总大小，避免分享接口给 0 时进度条一直不动

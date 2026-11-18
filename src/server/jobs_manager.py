@@ -47,6 +47,9 @@ SECRET_KEYS = {
     "aria2": {"aria2_secret"},
 }
 
+# 下载连续 0 字节多久算「停摆」：超过就在该文件那一行打标记（与 pipeline 的阈值一致）
+ZERO_STALL_SEC = 300
+
 def _python_bin() -> str:
     """任务子进程使用的解释器：优先项目内 venv，保证与 Web 使用同一套依赖。"""
     env = os.getenv("QUARK_AUTO_DL_PYTHON", "").strip()
@@ -1086,6 +1089,10 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
     if not isinstance(raw_files, list):
         raw_files = []
 
+    # 停摆标记只对正在跑的任务有意义：任务停了以后状态文件是死的，别一直挂着红标
+    job_record = get_job(job_id) or {}
+    job_running = str(job_record.get("status") or "") == "running"
+
     # 逐文件控制存在 file_override.yaml 里：删除的过滤掉，暂停的在展示层覆盖成 paused
     override = read_file_override(job_id)
     paused_paths = override["paused"]
@@ -1114,6 +1121,14 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
             # 已落盘/待清理按 100% 展示，避免前端停在 99%
             downloaded = total
         counts[st] = counts.get(st, 0) + 1
+        # 0 字节停摆：pipeline 记下起点（zero_since），这里按「运行中 + 仍是 0 字节」算持续时长
+        try:
+            zero_since = float(item.get("zero_since") or 0.0)
+        except (TypeError, ValueError):
+            zero_since = 0.0
+        stalled_sec = 0
+        if job_running and st == "downloading" and downloaded <= 0 and total > 0 and zero_since > 0:
+            stalled_sec = int(max(time.time() - zero_since, 0))
         files.append(
             {
                 "path": path,
@@ -1125,6 +1140,9 @@ def job_files(job_id: str, offset: int = 0, limit: int = 2000) -> dict:
                 "speed": max(_safe_int(item.get("speed"), 0), 0),
                 "progress": round(100.0 * downloaded / total, 1) if total > 0 else 0.0,
                 "note": note,
+                # 0 字节停摆：前端在该行打「⚠ 0 字节 N 分钟」，超过阈值才置 stalled
+                "stalled_sec": stalled_sec,
+                "stalled": stalled_sec >= ZERO_STALL_SEC,
                 # 逐文件操作按钮的可用性（前端不再重复判断状态机）
                 "paused": st == "paused",
                 "can_pause": st in FILE_PAUSABLE_STATES,

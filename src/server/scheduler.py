@@ -630,6 +630,8 @@ class PipelineScheduler:
                     "total": total,
                     "speed": int(task.get("speed") or 0),
                     "progress": round(100.0 * downloaded / total, 1) if total > 0 else 0.0,
+                    # 0 字节停摆的起点（epoch 秒，pipeline 记录）；Web 端据此在下载行打标记
+                    "zero_since": float(task.get("zero_since") or 0.0),
                 }
             )
         return {

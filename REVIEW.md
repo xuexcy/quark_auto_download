@@ -1503,3 +1503,49 @@ NAS 真机复验：delete → `deleted_map` 正确写入；`selection/add` → `
 - 两个都不填时，本机确实不知道文件落在哪：清理云端副本只能信 aria2 的 `complete`（与远端模式同一风险等级）；
   `totalLength` 与文件大小不符时仍判失败并保留云端副本。
 - 下载目录为空时 `<临时>/<job_id>` 这层暂存不存在，因此「下完再挪」也做不了——最终文件由 aria2 直接写在默认目录里。
+
+---
+
+### 23.11 2.8.5：文件进度给「0 字节停摆」打标记（2026-11-18）
+
+**23.11.1 现象与需求**
+
+NAS 上 `凡人修仙` 任务的三个 4K 文件转存成功、提交下载成功，但进度一直 `0.0% · 速度: 0 KB/s`，
+30 秒后 `✗ 下载失败，准备重试 … Download aborted.`，重试 3 次后判失败。日志里没有任何一行说明
+「为什么一个字节都没下来」，页面上更看不出来。用户要求：**0 字节停摆 5 分钟，在下载行那里做一个标记**。
+
+**23.11.2 实现**
+
+| 位置 | 改动 |
+| --- | --- |
+| `src/server/pipeline.py` | 模块级 `ZERO_BYTES_STALL_SEC = 300` 与 `track_zero_bytes(task, completed, total, now)`：`completedLength` 连续为 0 时写入 `zero_since`，一旦有字节 `pop` 掉并重新计时；时钟回拨（`zero_since > now`）以本次为准 |
+| `src/server/pipeline.py` | `_poll_one_download()` 的 active 分支调 `track_zero_bytes`，连续 ≥300 秒且未告警过时打 `⚠ <文件> 已连续 N 秒 0 字节：直链可能被 CDN 拒绝（412/403）或落盘目录不可写`（`stall_logged` 去重，恢复后清除） |
+| `src/server/scheduler.py` | `persist_payload()` 每文件多一个 `zero_since`（epoch 秒），不额外发 RPC |
+| `src/server/jobs_manager.py` | `ZERO_STALL_SEC = 300`；`job_files()` 只在「任务 running + state=downloading + downloaded=0 + total>0」时算 `stalled_sec = now - zero_since`，输出 `stalled_sec` 与 `stalled` |
+| `src/web/static/index.html` | `.file-stall` 徽标（`.file-row-head` 内、名称与 meta 之间，默认 `hidden`），文本 `⚠ 0 字节 N 分钟`，hover 指向 412/403/23018 与落盘权限；只渲染后端字段 |
+
+**23.11.3 界面**
+
+```
+Show/S01E01 停摆.mkv  [⚠ 0 字节 13 分钟]   下载中 · 0.0% · 0 B/8.00 GB      ⏸ ✕
+Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… · 2.2 MB/s  ⏸ ✕
+```
+
+**23.11.4 验证**
+
+- `tests/pytest/test_stall_marker.py` 11 条：起点只记一次、累加、有字节清零后重新计时、`total<=0` 不计、
+  时钟回拨重置、`persist_payload` 透传 `zero_since`（缺省 0.0）、满 5 分钟才 `stalled`、不到阈值（~60s）、
+  已有字节、任务未 running、`total=0`、暂停行按 paused 展示不标
+- 全仓 **250 passed**，`compileall -q src` OK，`index.html` 脚本块 `node --check` OK
+- 真浏览器（本地预演服务，假数据）：停摆行徽标 112×17、其余 4 行 `hidden`（宽高 0）、行高 37 vs 36、
+  文件列表 `scrollWidth == clientWidth`（686）无横向溢出；截图 `~/Downloads/quark-stall-badge.png`
+
+**23.11.5 边界**
+
+- 只做显示：不会自动暂停/重试，也不会去探测 412（那需要额外下载请求）。
+- 任务被用户暂停后不再判断（`state` 已覆盖成 `paused`）；任务进程退出后 `job_files` 的 `job_running` 判假，
+  红标自动消失，避免状态文件停在 `downloading` 时一直挂着。
+- 阈值两处常量（`pipeline.ZERO_BYTES_STALL_SEC` 决定日志与起点，`jobs_manager.ZERO_STALL_SEC` 决定红标），
+  改的时候要一起改。
+- 「0 字节」判定用 aria2 的 `completedLength`：远端 aria2 报了 completed 但文件其实没落盘（errorCode 16）
+  也能标出来，因为此时 `completedLength` 仍是 0。
