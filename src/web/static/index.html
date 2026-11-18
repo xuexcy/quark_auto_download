@@ -117,10 +117,12 @@
     /* 右侧「目录」面板 */
     .job-tree {
       --tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;
-      margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 0 auto;
+      margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 1 auto;
     }
+    /* 展开后吃掉详情区剩余高度（最多到底部），树体自己滚动；内容少时不撑高（min-height 只是保底一行都不挤） */
+    .job-tree:not(.folded) { flex: 1 1 auto; min-height: 9rem; display: flex; flex-direction: column; }
     .job-tree[hidden] { display: none; }
-    .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; }
+    .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; flex: 0 0 auto; }
     .job-tree-caret { font-size: .72rem; color: var(--muted); width: var(--tree-caret, .9rem); text-align: center; }
     .job-tree-title { font-size: .84rem; font-weight: 600; white-space: nowrap; }
     .job-tree-summary { font-size: .74rem; color: var(--muted); font-family: var(--mono); }
@@ -130,7 +132,7 @@
     /* 标题栏那个「整个目录」勾选框：全局 input 是 100% 宽，这里要收回成原生小方块 */
     .job-tree-head .tree-check { width: auto; height: auto; margin: 0; padding: 0; }
     .job-tree-head .tree-check:disabled { opacity: .45; }
-    .job-tree .tree-body { max-height: min(18rem, 22vh); padding: .2rem .35rem .45rem; }
+    .job-tree .tree-body { flex: 1 1 auto; min-height: 0; max-height: none; padding: .2rem .35rem .45rem; }
     .job-tree.folded .tree-body { display: none; }
     .job-tree .msg { margin: 0 .7rem .55rem; }
     .tree-badge { flex: 0 0 auto; font-size: .68rem; line-height: 1.4; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
@@ -337,10 +339,10 @@
       background: #0b100e; border: 1px solid var(--line);
       border-radius: 8px; padding: .75rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
     }
-    /* 单文件进度：只吃内容高度（最多 32vh / 18rem），剩余高度仍留给日志 */
+    /* 单文件进度：默认只吃内容高度（最多 30vh / 16rem）；目录树展开时最多让到 4rem（约两行） */
     .job-files {
-      flex: 0 0 auto; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
-      display: flex; flex-direction: column; min-height: 0; max-height: min(30vh, 16rem);
+      flex: 0 1 auto; min-height: 4rem; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
+      display: flex; flex-direction: column; max-height: min(30vh, 16rem);
     }
     .job-files[hidden] { display: none; }
     .job-files-head {

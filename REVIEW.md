@@ -1901,3 +1901,47 @@ treeState.folded = Number(job.total_files || 0) > 0;
 
 - 新建任务后目录树也是折叠的，需要点一下 ▸ 再勾选（新增成功的提示文案本来就是「在右侧『目录』勾选文件或目录后点『下载所选』」，没提默认展开）。
 - 「整个目录」勾选框在折叠态也可见可用（在标题栏里），不受影响。
+### 23.20 2.8.14：展开的「目录」树占满详情区（2026-11-18）
+
+#### 23.20.1 需求与旧行为
+
+用户原话（m07530）：「展开后的框太小了，展开后最多可以将底部全部占满」。
+
+2.8.8 之后目录树一直是 `.job-tree { flex: 0 0 auto }` + `.job-tree .tree-body { max-height: min(18rem, 22vh) }`：树体高度上限 22vh，756×469 的窗口里 50 行只露出 4 行；下面「文件进度」(`max-height: min(30vh,16rem)`) 和折叠日志还各占一块，而三者加起来远没填满详情区，底部留白。
+
+#### 23.20.2 改动（只动样式，src/web/static/index.html）
+
+| 选择器 | 改前 | 改后 |
+| --- | --- | --- |
+| `.job-tree` | `flex: 0 0 auto` | `flex: 0 1 auto` |
+| `.job-tree:not(.folded)` | 无 | `flex: 1 1 auto; min-height: 9rem; display: flex; flex-direction: column` |
+| `.job-tree-head` | 无 flex 声明 | `flex: 0 0 auto` |
+| `.job-tree .tree-body` | `max-height: min(18rem, 22vh)` | `flex: 1 1 auto; min-height: 0; max-height: none` |
+| `.job-files` | `flex: 0 0 auto`（`min-height: 0`） | `flex: 0 1 auto; min-height: 4rem` |
+
+展开后目录树成为详情区的弹性块：吃掉 `.detail` 剩余高度（最多到折叠日志上方，日志永远留一条 35px 在底部），树体自己滚动；「文件进度」按需让位，最多压到 4rem（约两行）。折叠回去后两者恢复原高度。
+
+#### 23.20.3 为什么不用更激进的写法
+
+先在 NAS 活页面注入候选样式实测（不落盘）：
+
+- 候选 A：`.job-tree { flex: 0 1 auto; min-height: 0 }` + `:not(.folded) { display: flex; flex-direction: column }` + `.tree-body { flex: 1 1 auto; min-height: 0; max-height: none }`。凡人修仙（50 行）面板 255 / 树体 188 正常，但脱口秀（2 行、内容 54）树体被压到 **22px**、内容被裁 —— 因为没有 min-height 兜底，弹性收缩优先吃掉了它。
+- 候选 B（最终）：在 A 的基础上给 `:not(.folded)` 加 `min-height: 9rem`，并让 `.job-files` 也能收缩（`flex: 0 1 auto; min-height: 4rem`）。脱口秀树体 76 = 内容 76（不裁），文件面板让到 86、列表仍可滚。
+
+关键点：只给树加 `flex: 1 1 auto` 而不给 `.job-files` 收缩能力的话，两者都会抢空间，在矮窗口里会触发 `.main-body` 滚动条；现在两边都设了 min-height，总高恒定落在可视区内（实测 `main-body.scrollHeight == clientHeight == 392`）。
+
+#### 23.20.4 验证（NAS 真机，756×469）
+
+| 场景 | 目录面板 | 树体（内容） | 文件面板 | 折叠日志 | main-body |
+| --- | --- | --- | --- | --- | --- |
+| 改前 · 凡人修仙展开 | 171（y=171 → 342） | 103（1110） | hidden | 35 @y=350 | 392 / 392 |
+| 改后 · 凡人修仙展开 | **255**（y=171 → 426） | **188**（1110） | hidden | 35 @y=434 | 392 / 392 |
+| 改后 · 脱口秀展开 | 144 | 76（= 内容，不裁） | 86（列表 50 / 内容 142） | 35 @y=434 | 392 / 392 |
+
+- 折叠态不变：两个任务折叠时面板仍是 68px（只有标题栏），与 2.8.13 一致。
+- `pytest` 251 passed；`node --check` 通过。
+
+#### 23.20.5 边界
+
+- 窗口很矮（< 360px 高）时，树 `min-height: 9rem` + 文件面板 `min-height: 4rem` 仍可能让 `.main-body` 出滚动条（`overflow: auto` 是 2.4.8 就有意保留的兜底），此时整块可滚，不会裁内容。
+- 展开的树把空间吃满后，「文件进度」只剩两行可见（能滚），这是有意的取舍：展开目录树时用户在做勾选，不是在看进度。
