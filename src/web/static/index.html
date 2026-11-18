@@ -280,6 +280,17 @@
       display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .65rem; margin: .75rem 0;
       flex-shrink: 0;
     }
+    /* 统计挪进按钮行后：两条各自一行（标签在左、值在右），整块和按钮同高、不换行 */
+    .job-actions .stats {
+      display: flex; flex-direction: column; align-items: flex-start; justify-content: center;
+      gap: .1rem; margin: 0; flex: 0 1 auto; min-width: 0;
+    }
+    .job-actions .stat {
+      display: flex; align-items: baseline; gap: .45rem; min-width: 0;
+      border: 0; border-radius: 0; background: transparent; padding: 0; line-height: 1.25;
+    }
+    .job-actions .stat-label { margin: 0; font-size: .72rem; white-space: nowrap; }
+    .job-actions .stat-value { font-size: .8rem; white-space: nowrap; }
     .job-actions, .job-meta { flex-shrink: 0; }
     .stat {
       border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
@@ -288,25 +299,29 @@
     .stat-label { font-size: .72rem; color: var(--muted); margin: 0 0 .35rem; }
     .stat-value { font-family: var(--mono); font-size: .95rem; font-weight: 600; margin: 0; word-break: break-all; }
     .stat-pct { color: var(--muted); font-weight: 500; }
-    /* 始终展开的日志面板（不用 details：浏览器对 details+flex 高度约束不可靠，
-       会导致 pre 随内容撑高、父级 height:auto，从而无法 overflow 滚动且底边对不齐） */
+    /* 日志面板默认折叠（只留标题行，点标题展开、再点折叠；不用 details：
+       浏览器对 details+flex 的高度约束不可靠，会让 pre 撑高父级、失去滚动） */
     .job-log {
       margin-top: .5rem;
       border-top: 1px dashed var(--line);
       padding-top: .5rem;
-      /* 吃掉 detail 剩余高度，下沿贴齐视口底（与侧栏 .sidebar-foot 底边对齐）；
-         保底 10rem，避免被上方目录树/进度面板挤成 0 高度而「看不到日志」 */
+      /* 展开时吃掉 detail 剩余高度，并保底近半屏，避免被上方目录树/进度面板挤小 */
       flex: 1 1 auto;
-      min-height: 10rem;
+      min-height: clamp(14rem, 46vh, 32rem);
       overflow: hidden;
       display: flex;
       flex-direction: column;
     }
+    .job-log.folded { flex: 0 0 auto; min-height: 0; }
+    .job-log.folded pre.log { display: none; }
+    .job-log.folded .job-log-head { margin-bottom: 0; }
     .job-log-head {
       display: flex; align-items: center; gap: .5rem;
       font-size: .82rem; color: var(--accent); font-family: var(--mono);
       flex-shrink: 0; min-width: 0; margin-bottom: .35rem;
+      cursor: pointer; user-select: none;
     }
+    .job-log-caret { flex: 0 0 auto; width: .9rem; text-align: center; }
     .job-log-title { flex: 0 0 auto; white-space: nowrap; }
     .job-log-path {
       flex: 1 1 auto; min-width: 0;
@@ -418,7 +433,7 @@
       .app { height: 100dvh; min-height: 100dvh; }
       .main-body { overflow: auto; }
       /* 窄屏时整块日志保底 14rem（原先只给 pre 设 12rem，会把外层 .job-log 撑破） */
-      .job-log { min-height: 14rem; }
+      .job-log:not(.folded) { min-height: 14rem; }
     }
     .app-ver {
       display: inline-block; margin-left: .35rem; padding: .02rem .38rem;
@@ -480,10 +495,11 @@
             <span class="pause-wrap" data-role="pause-wrap">
               <button class="btn-warn job-action-btn" data-act="pause-menu" type="button">暂停 ▾</button>
             </span>
+            <!-- 统计放在「暂停」之后、「删除」之前（删除靠 margin-left:auto 推到右侧） -->
+            <div class="stats" data-role="stats"></div>
             <button class="btn-danger job-action-btn" data-act="delete" type="button">删除</button>
           </div>
           <div class="job-meta" data-role="meta"></div>
-          <div class="stats" data-role="stats"></div>
           <div class="job-tree" data-role="tree-panel" hidden>
             <div class="job-tree-head" data-role="tree-toggle">
               <span class="job-tree-caret" data-role="tree-caret">▾</span>
@@ -506,8 +522,9 @@
             </div>
             <div class="file-list" data-role="files"></div>
           </div>
-          <div class="job-log" data-role="log-panel">
-            <div class="job-log-head">
+          <div class="job-log folded" data-role="log-panel">
+            <div class="job-log-head" data-role="log-toggle" title="点击展开 / 折叠日志" aria-expanded="false">
+              <span class="job-log-caret" data-role="log-caret">▸</span>
               <span class="job-log-title">任务日志</span>
               <span class="job-log-path" data-role="log-path"></span>
               <button class="btn-ghost" data-act="refresh-log" type="button">刷新日志</button>
@@ -894,6 +911,20 @@
 
     // 记录日志框当前显示的是「哪个任务的哪种状态」，避免 5s 轮询每次都拉 250 行
     const logState = { id: null, status: null };
+    // 日志默认折叠：只显示标题行，点标题展开；折叠时不去拉日志文件
+    let logFolded = true;
+
+    function setLogFolded(folded) {
+      logFolded = Boolean(folded);
+      const panel = $("detail").querySelector('[data-role="log-panel"]');
+      if (!panel) return;
+      panel.classList.toggle("folded", logFolded);
+      const caret = panel.querySelector('[data-role="log-caret"]');
+      if (caret) caret.textContent = logFolded ? "▸" : "▾";
+      const head = panel.querySelector('[data-role="log-toggle"]');
+      if (head) head.setAttribute("aria-expanded", logFolded ? "false" : "true");
+      if (!logFolded) fillJobLog({ scrollBottom: true });
+    }
 
     function jobIsActive(job) {
       return !!job && (job.running || job.pid);
@@ -901,6 +932,7 @@
 
     async function refreshLogIfNeeded({ scrollBottom = false } = {}) {
       if (!selectedId) return;
+      if (logFolded) return;  // 折叠状态不拉日志，展开时一次性加载
       const job = jobCache.get(selectedId) || null;
       const status = String((job && job.status) || "");
       // 只有「换了任务 / 状态变了 / 还在跑」才值得再拉一次日志
@@ -910,6 +942,7 @@
 
     async function fillJobLog({ scrollBottom = false } = {}) {
       if (!selectedId) return;
+      if (logFolded) { logState.id = null; return; }  // 折叠时即便有人调也不发请求
       const jobId = selectedId;
       logState.id = jobId;
       logState.status = String(((jobCache.get(jobId) || {}).status) || "");
@@ -1949,6 +1982,12 @@
         if (!head || ev.target.closest("button[data-act]") || ev.target.closest(".tree-check")) return;
         treeToggleFold();
       });
+      // 日志标题行 = 展开/折叠开关（里面的「刷新日志」按钮不算）
+      $("detail").addEventListener("click", (ev) => {
+        const head = ev.target.closest('[data-role="log-toggle"]');
+        if (!head || ev.target.closest("button[data-act]")) return;
+        setLogFolded(!logFolded);
+      });
       $("detail").addEventListener("click", (ev) => {
         const row = ev.target.closest(".tree-row");
         if (!row || !row.closest('[data-role="tree-body"]')) return;
@@ -2142,7 +2181,9 @@
         if (act === "refresh-log") {
           ev.preventDefault();
           ev.stopPropagation();
-          await fillJobLog({ scrollBottom: true });
+          // 折叠状态下点刷新 = 展开并加载（展开本身会拉一次）
+          if (logFolded) setLogFolded(false);
+          else await fillJobLog({ scrollBottom: true });
           return;
         }
         if (act === "tree-reload") {

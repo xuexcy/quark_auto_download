@@ -1774,3 +1774,53 @@ Show/S01E02 正常.mkv                       下载中 · 37.5% · 3.00 GB/… �
 - `.tree-panel` / `.tree-head`（第 86–93 行）是 2.4.2 之前的侧边栏版本残留 CSS，当前 DOM 里没有元素用这两个类；本次未清理，避免无关改动。
 - 树的数据结构、勾选逻辑、`--depth` 的写法都没变，只是把「视觉台阶」参数化。
 
+
+### 23.17 2.8.11：详情区日志默认折叠 + 统计挪进按钮行（2026-11-18）
+
+用户反馈（m07258，逐字）：「目前日志默认展开，日志应该默认关闭，点击可以展开，再次点击可以折叠」/「日志框目前上下边距只有页面一半，展开后做大一点」/「已有文件数 / 总文件数 和 已有文件大小 / 总文件大小 放在 "开始"、"暂停" 的后面，"删除" 的前面」。
+
+#### 23.17.1 日志折叠
+
+| 位置 | 改动 |
+| --- | --- |
+| 标记 | `.job-log` 初始 `class="job-log folded"`；标题行加 `data-role="log-toggle"`、`aria-expanded="false"`、`<span class="job-log-caret" data-role="log-caret">▸</span>` |
+| CSS | `.job-log.folded { flex: 0 0 auto; min-height: 0 }`、`.job-log.folded pre.log { display: none }`、`.job-log.folded .job-log-head { margin-bottom: 0 }`；`.job-log-head { cursor: pointer; user-select: none }` |
+| JS 状态 | `let logFolded = true;` + `setLogFolded(folded)`：切 `.folded` 类、翻 ▸/▾、同步 `aria-expanded`，展开时调一次 `fillJobLog({ scrollBottom: true })` |
+| 拉日志闸门 | `refreshLogIfNeeded()` 里 `if (logFolded) return;`；`fillJobLog()` 里 `if (logFolded) { logState.id = null; return; }`（折叠时即便有人调也不发请求） |
+| 点击 | `treeBindPanel()` 里新增一个 `[data-role="log-toggle"]` 监听，命中 `button[data-act]` 时跳过（「刷新日志」不算折叠） |
+| 刷新按钮 | 折叠时点「刷新日志」= `setLogFolded(false)`（展开自带一次加载），展开时才是 `fillJobLog({ scrollBottom: true })`，避免同一次点击拉两遍 |
+
+#### 23.17.2 展开高度
+
+改前 `.job-log { flex: 1 1 auto; min-height: 10rem }`（160px）。改成 `min-height: clamp(14rem, 46vh, 32rem)`：
+
+- 469px 高的小窗口：46vh = 216px 小于 14rem = 224px，取 224px（实测正好 224px）；
+- 900px 高的常规窗口：46vh = 414px；
+- 1440px 以上的大屏：被 32rem = 512px 封顶，不会把目录树和文件进度压没。
+
+窄屏媒体查询里原来的 `.job-log { min-height: 14rem }` 改成 `.job-log:not(.folded)`，避免折叠态被撑高。
+
+#### 23.17.3 统计挪进按钮行
+
+- DOM：`<div class="stats" data-role="stats">` 从 `.job-meta` 下方移到 `.job-actions` 内、「暂停」之后、「删除」之前；`patchDetail()` 查的 `[data-role="stats"]` 选择器不变（仍在 `#detail` 里）。
+- CSS：新增 `.job-actions .stats { display:flex; flex-direction:column; align-items:flex-start; gap:.1rem; margin:0 }`、`.job-actions .stat { display:flex; align-items:baseline; gap:.45rem; border:0; background:transparent; padding:0 }`。
+- 为什么纵向两行：先试过一行并排，两个统计的 `nowrap` 文本合计 562px，加上两个 92px 按钮在 756px 窗口就换行（`.job-actions` 是 `flex-wrap: wrap`），「删除」被挤到第二行、垂直居中看起来错位。改纵向后整块 340×34px，与 38px 的按钮同高，一行放得下。
+
+#### 23.17.4 验证（本机 756×469，假任务 jui2811，5 个文件）
+
+| 项 | 结果 |
+| --- | --- |
+| 按钮行 | 开始 x=20 → 暂停 x=119 → 统计 x=218（340×34，两行）→ 删除 x=644（92×38），同一行、行高 38px |
+| 折叠态 | `.job-log` 高 35px、`pre.log` `display:none`、`aria-expanded=false`、光标 ▸ |
+| 展开态 | 高 224px、`pre.log` 184px 且框内可滚动、`aria-expanded=true`、光标 ▾ |
+| 折叠 6 秒（含一次 5s 轮询） | `/api/jobs/*/logs` 请求 0 次 |
+| 点「刷新日志」（折叠时） | 展开 + 拉 1 次 250 行，不会折叠回去、也不会拉两遍 |
+
+- `node --check`（抽出 `<script>` 块）通过；`pytest` **251 passed**（纯前端改动）。
+- 假任务用的 `state/jobs.yaml` 与 `state/jobs/jui2811/pipeline_state.yaml` 已删除，工作区不留测试数据。
+
+#### 23.17.5 边界
+
+- 折叠状态是页面内的内存状态（`logFolded` 默认 true），刷新页面回到折叠，不写 localStorage。
+- 切换任务不重置该状态：在一个任务里展开日志，切到另一个任务仍是展开（各任务日志独立拉取，`logState.id` 随任务变化重拉）。
+- 展开后若窗口很矮，`.main-body` 会整体可滚（`overflow: auto`），日志框自身仍保持框内滚动。
