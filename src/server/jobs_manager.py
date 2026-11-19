@@ -998,6 +998,40 @@ def rename_job(job_id: str, name: str) -> dict:
         return job
 
 
+def update_job_pwd(job_id: str, share_pwd: str) -> dict:
+    """更新任务提取码（MCP 复用同链接任务时，新链接可能换了提取码）。"""
+    with _index_lock():
+        jobs = load_jobs_index()
+        job = next((j for j in jobs if str(j.get("id")) == job_id), None)
+        if not job:
+            raise ValueError(f"任务不存在: {job_id}")
+        job["share_pwd"] = str(share_pwd or "")
+        job["updated_at"] = _now()
+        save_jobs_index(jobs)
+        return job
+
+
+def set_job_aria2_profile(job_id: str, aria2_profile: str) -> dict:
+    """更新任务使用的 Aria2 配置名（空 = 跟随默认配置）。"""
+    profile = str(aria2_profile or "").strip()
+    if profile:
+        try:
+            names = aria2cfg.profile_names(load_section("aria2"))
+        except Exception:
+            names = []
+        if profile not in names:
+            raise ValueError(f"Aria2 配置不存在: {profile}")
+    with _index_lock():
+        jobs = load_jobs_index()
+        job = next((j for j in jobs if str(j.get("id")) == job_id), None)
+        if not job:
+            raise ValueError(f"任务不存在: {job_id}")
+        job["aria2_profile"] = profile
+        job["updated_at"] = _now()
+        save_jobs_index(jobs)
+        return job
+
+
 def delete_job(job_id: str, *, force_stop: bool = True) -> None:
     job = get_job(job_id)
     if not job:

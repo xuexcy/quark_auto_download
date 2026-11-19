@@ -37,6 +37,8 @@ from pydantic import BaseModel, Field
 
 from config_loader import BASE_DIR, load_merged_configs, load_web_settings
 import jobs_manager as jm
+import mcp_server
+import notify
 from log_util import configure_logging, dated_web_log_path
 from quark_api import QuarkClient
 from quark_login import QuarkQrLogin, mask_cookie, validate_cookie
@@ -205,7 +207,45 @@ async def lifespan(_app: FastAPI):
         jm.list_jobs()
     except Exception:
         log.exception("启动时任务状态对账失败")
+    # 任务完成通知（webhook）后台线程
+    try:
+        notify.start_watcher()
+    except Exception:
+        log.exception("完成通知线程启动失败")
+    # MCP（agent 入口）挂载：未配置 mcp_token 时不挂载（见 mcp_server 模块注释）
+    mcp_token = (
+        os.getenv("QUARK_AUTO_DL_MCP_TOKEN", "").strip()
+        or str(WEB_SETTINGS.get("mcp_token") or "").strip()
+    )
+    mcp_cm = None
+    if mcp_token:
+        try:
+            from mcp_server import build_mcp_server
+
+            # path="/"：内部 Route 挂在根，配合 mount("/mcp") 后 URL 即 /mcp；
+            # fastmcp 默认内部路径 /mcp 在 mount 场景下会因 root_path 匹配不上而 404
+            mcp_app = build_mcp_server().http_app(path="/", transport="streamable-http")
+            # fastmcp 的 session manager 需要它自己的 lifespan 来启动 task group：
+            # 在主 lifespan 内嵌套进入子 app 的 lifespan（contextvars 需在同一 context）
+            mcp_cm = mcp_app.router.lifespan_context(mcp_app)
+            await mcp_cm.__aenter__()
+            app.mount("/mcp", mcp_app)
+            log.info("MCP 已挂载在 /mcp（Bearer token 鉴权）")
+        except Exception:
+            mcp_cm = None
+            log.exception("MCP 挂载失败（fastmcp 未安装或配置有误）")
+    else:
+        log.info(
+            "未配置 mcp_token（conf/web.yaml 的 mcp_token 或环境变量 "
+            "QUARK_AUTO_DL_MCP_TOKEN），MCP 入口未启用"
+        )
     yield
+    if mcp_cm is not None:
+        try:
+            await mcp_cm.__aexit__(None, None, None)
+        except Exception:
+            log.exception("MCP lifespan 退出失败")
+    notify.stop_watcher()
 
 
 APP_VERSION = "2.8.20"
@@ -244,6 +284,21 @@ async def _security_guard(request: Request, call_next):
             headers={"WWW-Authenticate": 'Basic realm="Quark Auto Download"'},
             media_type="text/plain; charset=utf-8",
         )
+    # MCP 入口：独立 Bearer token 鉴权（不走 Basic；MCP 客户端不是浏览器）
+    if path.startswith("/mcp"):
+        expected = (
+            os.getenv("QUARK_AUTO_DL_MCP_TOKEN", "").strip()
+            or str(WEB_SETTINGS.get("mcp_token") or "").strip()
+        )
+        got = request.headers.get("authorization", "")
+        scheme, _, param = got.partition(" ")
+        if (
+            not expected
+            or scheme.lower() != "bearer"
+            or not param.strip()
+            or not hmac.compare_digest(param.strip().encode(), expected.encode())
+        ):
+            return JSONResponse({"detail": "MCP token 无效或未配置"}, status_code=401)
     if request.method not in ("GET", "HEAD", "OPTIONS") and not _request_is_same_origin(request):
         return JSONResponse({"detail": "跨站请求已被拒绝"}, status_code=403)
     response = await call_next(request)
