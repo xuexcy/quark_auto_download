@@ -117,12 +117,12 @@
     /* 右侧「目录」面板 */
     .job-tree {
       --tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;
-      margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 1 auto;
+      margin: 1.15rem 0 .35rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 1 auto;
     }
     /* 展开后按内容长：两行就占两行。树体自己有 max-height（超出在框里滚），页面整体还能往下滚 */
     .job-tree:not(.folded) { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
     .job-tree[hidden] { display: none; }
-    .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; flex: 0 0 auto; }
+    .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .7rem .8rem; flex-wrap: wrap; cursor: pointer; flex: 0 0 auto; }
     .job-tree-caret { font-size: .72rem; color: var(--muted); width: var(--tree-caret, .9rem); text-align: center; }
     .job-tree-title { font-size: .84rem; font-weight: 600; white-space: nowrap; }
     .job-tree-summary { font-size: .74rem; color: var(--muted); font-family: var(--mono); }
@@ -132,8 +132,8 @@
     /* 标题栏那个「整个目录」勾选框：全局 input 是 100% 宽，这里要收回成原生小方块 */
     .job-tree-head .tree-check { width: auto; height: auto; margin: 0; padding: 0; }
     .job-tree-head .tree-check:disabled { opacity: .45; }
-    /* 目录树自己封顶（超出在框里滚）；页面整体还能往下滚 */
-    .job-tree .tree-body { flex: 0 1 auto; min-height: 0; max-height: min(40vh, 24rem); overflow: auto; padding: .2rem .35rem .45rem; }
+    /* 目录树最多约一屏（扣掉标题行与页面留白）：文件多时树体自己滚，不再只给 40vh；页面整体也能继续往下滚 */
+    .job-tree .tree-body { flex: 0 1 auto; min-height: 0; max-height: calc(100vh - 3.5rem); overflow: auto; padding: .3rem .45rem .7rem; }
     .job-tree.folded .tree-body { display: none; }
     .job-tree .msg { margin: 0 .7rem .55rem; }
     .job-tree .msg:empty { display: none; }  /* 空提示行不再白占一行高度 */
@@ -223,7 +223,7 @@
     .main-body {
       position: relative;
       flex: 1; min-height: 0; display: flex; flex-direction: column;
-      padding: .65rem 1.25rem 0; overflow: auto;
+      padding: .65rem 1.25rem .9rem; overflow: auto;
     }
     /* 详情区无外层卡片框：高度按内容长，整页（.main-body）可以往下滚；
        目录树 / 文件进度 / 日志各自有 max-height，超出在自己框里滚 */
@@ -310,10 +310,10 @@
     /* 日志面板默认折叠（只留标题行，点标题展开、再点折叠；不用 details：
        浏览器对 details+flex 的高度约束不可靠，会让 pre 撑高父级、失去滚动） */
     .job-log {
-      margin-top: .5rem;
+      margin-top: 1.1rem;
       border-top: 1px dashed var(--line);
-      padding-top: .5rem;
-      /* 展开时高度按日志内容（最多 min(40vh, 26rem)），超出在 pre 里滚；
+      padding-top: .75rem;
+      /* 展开时高度按日志内容（最多约一屏，扣掉标题行），超出在 pre 里滚；
          不再抢占 detail 的剩余高度，页面不够就整体往下滚 */
       flex: 0 0 auto;
       min-height: 0;
@@ -327,7 +327,7 @@
     .job-log-head {
       display: flex; align-items: center; gap: .5rem;
       font-size: .82rem; color: var(--accent); font-family: var(--mono);
-      flex-shrink: 0; min-width: 0; margin-bottom: .35rem;
+      flex-shrink: 0; min-width: 0; margin-bottom: .55rem;
       cursor: pointer; user-select: none;
     }
     .job-log-caret { flex: 0 0 auto; width: .9rem; text-align: center; }
@@ -340,14 +340,14 @@
     .job-log-head button { flex: 0 0 auto; padding: .35rem .65rem; font-size: .78rem; }
     /* 日志内容自己封顶（超出在框里滚），页面上仍可继续往下滚 */
     pre.log {
-      margin: 0; flex: 0 1 auto; min-height: 0; max-height: min(40vh, 26rem);
+      margin: 0; flex: 0 1 auto; min-height: 0; max-height: calc(100vh - 3rem);
       overflow: auto; overscroll-behavior: contain;
       background: #0b100e; border: 1px solid var(--line);
-      border-radius: 8px; padding: .75rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
+      border-radius: 8px; padding: 1rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
     }
     /* 单文件进度：默认按内容长，最多 min(46vh, 26rem)，超出在列表里滚；不再为目录树让高度（页面整体可滚） */
     .job-files {
-      flex: 0 0 auto; min-height: 0; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
+      flex: 0 0 auto; min-height: 0; margin-top: 1.1rem; border-top: 1px dashed var(--line); padding-top: .75rem;
       display: flex; flex-direction: column; max-height: min(46vh, 26rem);
     }
     .job-files[hidden] { display: none; }
@@ -441,7 +441,7 @@
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .app { height: 100dvh; min-height: 100dvh; }
       .main-body { overflow: auto; }
-      /* 窄屏也不再给日志保底高度：日志按内容长（最多 min(40vh, 26rem)），页面整体往下滚 */
+      /* 窄屏也不再给日志保底高度：日志按内容长（最多约一屏），页面整体往下滚 */
     }
     .app-ver {
       display: inline-block; margin-left: .35rem; padding: .02rem .38rem;
