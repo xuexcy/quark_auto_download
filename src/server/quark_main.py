@@ -91,6 +91,9 @@ ARIA2_CONFIG = aria2cfg.options_for(ARIA2_FILE_CONFIG, ARIA2_PROFILE)
 
 # 任务级覆盖（Web 多分享链接）
 JOB_ID = os.getenv("QUARK_AUTO_DL_JOB_ID", "").strip()
+# 下载目录里的子目录名：Web 进程按任务名算好放在环境变量里（任务名唯一），
+# 老任务 / 手动跑 CLI 时没有这个变量，退回 job id
+WORK_DIR = os.getenv("QUARK_AUTO_DL_WORK_DIR", "").strip() or JOB_ID
 if os.getenv("QUARK_AUTO_DL_SHARE_URL", "").strip():
     QUARK_CONFIG = dict(QUARK_CONFIG)
     QUARK_CONFIG["share_url"] = os.environ["QUARK_AUTO_DL_SHARE_URL"].strip()
@@ -205,7 +208,7 @@ def init_clients():
     elif plan["mode"] == "none":
         log.info("未配置下载目录：提交任务时不指定 dir，由 Aria2 用自己的默认目录（本机不校验、不移动）")
     elif plan["mode"] == "temp" and not str(ARIA2_CONFIG.get("download_destination_dir") or "").strip():
-        log.info(f"未配置完成后目录：下载完从 {ARIA2_DOWNLOAD_DIR}/<job_id>/ 挪到 {ARIA2_DOWNLOAD_DIR}/")
+        log.info(f"未配置完成后目录：下载完从 {ARIA2_DOWNLOAD_DIR}/<任务名>/ 挪到 {ARIA2_DOWNLOAD_DIR}/")
     aria2_client = Aria2Client(
         host=ARIA2_HOST,
         secret=ARIA2_SECRET,
@@ -215,7 +218,7 @@ def init_clients():
         poll_interval=POLL_INTERVAL,
         download_timeout=DOWNLOAD_TIMEOUT,
         logger=log,
-        job_id=JOB_ID,
+        work_dir=WORK_DIR,
         remote=ARIA2_REMOTE,
         remote_dir=ARIA2_REMOTE_DIR,
     )
@@ -334,7 +337,7 @@ def main():
         logger=log,
         download_submit_max_retries=DOWNLOAD_SUBMIT_MAX_RETRIES,
         download_submit_retry_interval=DOWNLOAD_SUBMIT_RETRY_INTERVAL,
-        job_id=JOB_ID,
+        work_dir=WORK_DIR,
         remote_download=ARIA2_REMOTE,
     )
 
@@ -342,6 +345,8 @@ def main():
     log.info("夸克网盘自动批量下载脚本启动")
     if JOB_ID:
         log.info(f"任务 ID: {JOB_ID}")
+    if WORK_DIR and WORK_DIR != JOB_ID:
+        log.info(f"下载子目录: {WORK_DIR}（任务名）")
     log.info("═" * 60)
     log.info(f"本次日志文件: {LOG_PATH}")
     log.info(f"分享链接: {SHARE_URL}")

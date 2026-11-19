@@ -34,6 +34,7 @@ from config_loader import (
     resolve_config_path,
 )
 import aria2_profiles as aria2cfg
+from job_paths import work_dir_name
 from log_util import dated_job_log_path, dated_web_log_path
 
 JOBS_INDEX = os.path.join(BASE_DIR, "state", "jobs.yaml")
@@ -1323,6 +1324,9 @@ def start_job(job_id: str) -> dict:
             os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
         )
         env["QUARK_AUTO_DL_JOB_ID"] = job_id
+        # 下载目录里的子目录名用任务名（任务名唯一），子进程直接读这个环境变量，
+        # 保证 Web 进程 pause/清理时算出来的路径与子进程一致
+        env["QUARK_AUTO_DL_WORK_DIR"] = work_dir_name(job.get("name"), job_id)
         env["QUARK_AUTO_DL_SHARE_URL"] = str(job.get("share_url") or "")
         env["QUARK_AUTO_DL_SHARE_PWD"] = str(job.get("share_pwd") or "")
         env["QUARK_AUTO_DL_STATE_FILE"] = job_state_file(job_id)
@@ -1431,7 +1435,8 @@ def _aria2_client_from_config(job_id: str = ""):
         poll_interval=int(aria2.get("poll_interval") or 30),
         download_timeout=int(aria2.get("download_timeout") or 7200),
         logger=logger,
-        job_id=job_id,
+        # 与子进程用同一个子目录名（任务名），pause/清理按路径对齐才找得到
+        work_dir=work_dir_name((job or {}).get("name"), job_id),
         remote=remote,
         remote_dir=str(aria2.get("aria2_remote_dir") or ""),
     )

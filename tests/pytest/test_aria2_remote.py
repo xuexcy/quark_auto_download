@@ -22,7 +22,7 @@ def make_client(
         poll_interval=1,
         download_timeout=10,
         logger=logging.getLogger("test"),
-        job_id="j1",
+        work_dir="j1",
         remote=remote,
     )
     if calls is not None:
@@ -117,7 +117,7 @@ def make_remote_file_api(tmp_path) -> FileApi:
         aria2_max_retries=3,
         download_log_interval=10,
         logger=logging.getLogger("test"),
-        job_id="j1",
+        work_dir="j1",
         remote_download=True,
     )
 

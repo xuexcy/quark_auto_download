@@ -20,10 +20,10 @@ def env(tmp_path, monkeypatch):
     return types.SimpleNamespace(dir=jobs_dir, index=index, root=tmp_path)
 
 
-def add_job(job_id="j1", selection=None, selection_mode="explicit", status="paused"):
+def add_job(job_id="j1", selection=None, selection_mode="explicit", status="paused", name="测试任务"):
     job = {
         "id": job_id,
-        "name": "测试任务",
+        "name": name,
         "share_url": "https://pan.quark.cn/s/abc",
         "selection": selection if selection is not None else {},
         "selection_mode": selection_mode,
@@ -241,6 +241,30 @@ def test_start_job_passes_override_file_env(env, monkeypatch):
     override = captured["env"]["QUARK_AUTO_DL_FILE_OVERRIDE_FILE"]
     assert override == jobs_manager.job_override_file("j1")
     assert override.endswith("file_override.yaml")
+
+
+def test_start_job_passes_task_name_as_work_dir(env, monkeypatch):
+    """下载目录里的子目录名要用任务名（清洗后），子进程直接读这个环境变量。"""
+    add_job(selection={"file_fids": ["f1"]}, name="Show/第01期")
+    captured = {}
+    monkeypatch.setattr(jobs_manager, "probe_aria2_profile", lambda name, timeout=5: {"version": "test"})
+    monkeypatch.setattr(
+        jobs_manager, "refresh_job_runtime", lambda job, persist=True: {"running": False, "pid": None}
+    )
+    monkeypatch.setattr(jobs_manager, "dated_job_log_path", lambda job_id: str(env.root / "job.log"))
+
+    class FakeProc:
+        pid = 424243
+
+    def fake_popen(args, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProc()
+
+    monkeypatch.setattr(jobs_manager.subprocess, "Popen", fake_popen)
+    jobs_manager.start_job("j1")
+
+    assert captured["env"]["QUARK_AUTO_DL_WORK_DIR"] == "Show_第01期"
+    assert captured["env"]["QUARK_AUTO_DL_JOB_ID"] == "j1"
 
 
 def test_readd_after_delete_clears_marker(env):

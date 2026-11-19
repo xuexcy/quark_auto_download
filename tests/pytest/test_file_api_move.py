@@ -16,7 +16,7 @@ def make_file_api(tmp_path) -> FileApi:
         aria2_max_retries=3,
         download_log_interval=10,
         logger=logging.getLogger("test"),
-        job_id="j1",
+        work_dir="j1",
     )
 
 
@@ -92,7 +92,7 @@ def make_file_api_no_destination(tmp_path) -> FileApi:
         aria2_max_retries=3,
         download_log_interval=10,
         logger=logging.getLogger("test"),
-        job_id="j1",
+        work_dir="j1",
     )
 
 

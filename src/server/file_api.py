@@ -91,7 +91,7 @@ class FileApi:
         logger,
         download_submit_max_retries: int = 10,
         download_submit_retry_interval: int = 30,
-        job_id: str = "",
+        work_dir: str = "",
         remote_download: bool = False,
     ):
         self.quark_client = quark_client
@@ -105,17 +105,17 @@ class FileApi:
         self.download_log_interval = download_log_interval
         self.download_submit_max_retries = download_submit_max_retries
         self.download_submit_retry_interval = download_submit_retry_interval
-        # 每个任务独立的下载子目录，避免多任务同名文件互相覆盖/互相认领
-        self.job_id = str(job_id or "").strip()
+        # 每个任务独立的下载子目录（用任务名，任务名唯一），避免多任务同名文件互相覆盖/互相认领
+        self.work_dir = str(work_dir or "").strip()
         self.log = logger
 
     @property
     def download_root(self) -> str:
-        """本任务下载中的暂存目录（<临时或完成目录>/<job_id>）；本机不知道落点时为空串。"""
+        """本任务下载中的暂存目录（<临时或完成目录>/<任务名>）；本机不知道落点时为空串。"""
         if not self.local_verifiable:
             return ""
-        if self.job_id:
-            return os.path.join(self.aria2_download_dir, self.job_id)
+        if self.work_dir:
+            return os.path.join(self.aria2_download_dir, self.work_dir)
         return self.aria2_download_dir
 
     @property
@@ -132,7 +132,7 @@ class FileApi:
         """本地副本所在目录。
 
         配了「完成后目录」（download_destination_dir）就是它；留空表示下载完不移动，
-        文件就留在 <下载临时目录>/<job_id>/<相对路径>，因此本地副本要从这里找。
+        文件就留在 <下载临时目录>/<任务名>/<相对路径>，因此本地副本要从这里找。
         """
         return self.download_destination_dir or self.download_root
 
@@ -482,11 +482,23 @@ class FileApi:
             return []
         if not self._should_prune_download_dir():
             return []
+        root = self.download_root
         try:
-            deleted = prune_empty_local_dirs(self.download_root)
+            deleted = prune_empty_local_dirs(root)
         except Exception as e:
             self.log.error(f"  清理下载临时空文件夹失败: {e}")
             return []
+        # prune_empty_local_dirs 只删 root 里面的空目录，root 自己（任务名那一层）会留下来：
+        # 文件全挪走以后它就是个空壳，顺手一起删掉，免得 aria2 下载目录里堆一串空的「任务名」目录。
+        # 非空会抛 OSError（还有文件/子目录），那就保留 —— 只删真正空的那一个。
+        if self.work_dir and root and os.path.isdir(root):
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+            else:
+                deleted.append(normalize_relative_path(os.path.basename(root)))
+                self.log.info(f"  已删除本任务的空下载目录: {root}")
         if deleted:
             self.log.info(f"  已清理下载临时空文件夹 {len(deleted)} 个")
             for path in deleted[:20]:

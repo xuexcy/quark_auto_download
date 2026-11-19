@@ -52,13 +52,13 @@ def plan_download_dirs(download_dir: str, destination_dir: str, *, remote: bool 
     """决定这次任务怎么用目录（远端一律留空）。
 
     两个目录都可选，组合出三种本机模式：
-    1. 有临时目录：临时目录只当「下载中的暂存区」（提交时带 <job_id>）；下完挪到最终位置——
-       配了完成目录就挪过去，没配就从 `<临时>/<job_id>/` 挪到 `<临时>/` 根下（最终目录里看不到 job_id）
-    2. 没有临时目录、有完成目录：直接下到 `<完成>/<job_id>/`，下完在同一目录内挪一层去掉 job_id
+    1. 有临时目录：临时目录只当「下载中的暂存区」（提交时带 <任务名>）；下完挪到最终位置——
+       配了完成目录就挪过去，没配就从 `<临时>/<任务名>/` 挪到 `<临时>/` 根下（最终目录里看不到任务名那一层）
+    2. 没有临时目录、有完成目录：直接下到 `<完成>/<任务名>/`，下完在同一目录内挪一层去掉任务名
     3. 两个都没有：提交任务时不指定 dir，交给 aria2 自己的默认目录；本机不知道落点，所以不校验、不移动
 
     返回 `{"download_dir", "destination_dir", "mode"}`，mode ∈ temp / dest / none / remote。
-    download_dir 是「暂存根目录」（Aria2Client/FileApi 会再拼 job_id），destination_dir 是最终落点。
+    download_dir 是「暂存根目录」（Aria2Client/FileApi 会再拼任务名子目录），destination_dir 是最终落点。
     """
     temp = str(download_dir or "").strip()
     dest = str(destination_dir or "").strip()
@@ -102,7 +102,7 @@ class Aria2Client:
         poll_interval: int,
         download_timeout: int,
         logger,
-        job_id: str = "",
+        work_dir: str = "",
         remote: bool = False,
         remote_dir: str = "",
     ):
@@ -113,9 +113,10 @@ class Aria2Client:
         # 远端目录：可选。对方 aria2 的默认目录常常不可写（实测 /downloads 只读 → errorCode=16），
         # 填了就用它当 dir；留空则完全交给对方配置。
         self.remote_dir = str(remote_dir or "").strip().rstrip("/")
-        # 下载根目录；若指定 job_id，则该任务独占 <root>/<job_id>，避免多任务同名文件互相覆盖
+        # 下载根目录；若指定 work_dir（任务名子目录），则该任务独占 <root>/<任务名>，
+        # 避免多任务同名文件互相覆盖（任务名唯一，见 job_paths.work_dir_name）
         self._base_download_dir = str(download_dir or "").rstrip("/")
-        self.job_id = str(job_id or "").strip()
+        self.work_dir = str(work_dir or "").strip()
         # 直链下载请求头（Cookie/Referer/UA）：夸克直链校验来源，缺失会 403
         self.download_headers = [str(h) for h in (download_headers or []) if str(h).strip()]
         self.request_timeout = request_timeout
@@ -130,8 +131,8 @@ class Aria2Client:
         # 交给 aria2 自己的默认目录 —— 绝对不能拼出相对路径（会落到 aria2 的 cwd）。
         if not self._base_download_dir:
             return ""
-        if self.job_id:
-            return f"{self._base_download_dir}/{self.job_id}"
+        if self.work_dir:
+            return f"{self._base_download_dir}/{self.work_dir}"
         return self._base_download_dir
 
     def _aria2_call(self, method: str, params: list):

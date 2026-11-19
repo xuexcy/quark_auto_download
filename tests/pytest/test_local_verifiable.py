@@ -16,7 +16,7 @@ def make_api(tmp_path, *, download_dir="", destination_dir="", remote=False) -> 
         aria2_max_retries=3,
         download_log_interval=10,
         logger=logging.getLogger("test"),
-        job_id="j1",
+        work_dir="j1",
         remote_download=remote,
     )
 

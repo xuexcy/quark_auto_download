@@ -10,3 +10,4 @@ state/
 py_venv/
 conf/*.yaml.bak
 *.tmp
+.agent/
