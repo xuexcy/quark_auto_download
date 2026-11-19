@@ -2008,3 +2008,56 @@ treeState.folded = Number(job.total_files || 0) > 0;
 - 详情区里其他块都长起来（进度面板满 + 日志展开）时，`avail` 可能小于 96，此时树体保底 96px，溢出交给 `.main-body` 整体滚动（2.4.8 就保留的兜底）。
 - `fitTreeBody()` 会触发一次强制同步布局（读 `offsetHeight`），只在切任务、折叠、行数变化、日志开关、resize 时跑，5 秒轮询路径上不调用。
 - 面板折叠（`folded`）时直接 `return`，`max-height` 已被清空，展开后重新计算，不会残留上一次的封顶值。
+
+### 23.22 2.8.16：三个面板各自封顶、页面整体往下滚（2026-11-19）
+
+#### 23.22.1 需求
+
+用户 m07828 的反馈（逐字）：「『凡人』任务，文件进度也看不全，需要也设置一个最大高度，现在底部有一个日志，导致页面位置不够，要求页面可以一直往下滑动，也就是目录、文件进度、展开的日志，都要设置一个最大高度」。
+
+这与 2.8.14 / 2.8.15 的方向相反：那两版是「把三块塞进一屏，谁抢到高度谁滚」，用户要的是「每块自己封顶，页面整体往下滚」。
+
+#### 23.22.2 为什么必须先撤掉 fitTreeBody()
+
+2.8.15 的 `fitTreeBody()` 是 JS 算 `.detail` 剩余高度并写 inline `max-height`。它成立的前提是 `.detail` 有固定高度（`flex: 1` + `min-height: 0`）。
+
+2.8.16 把 `.detail` 改成 `flex: 0 0 auto`（按内容长）之后：
+
+- `fitTreeBody()` 量出来的「剩余可用高度」恒定很大 → 内容永远小于它 → 函数什么都不写，纯属空转；
+- 更糟的是：一旦某个瞬间它写了 inline `max-height`，那串 inline 值会**压过** CSS 的 `max-height: min(40vh, 24rem)`（inline 优先级最高），封顶直接失效。
+
+所以整段删除（函数 + 6 处调用 + `window.resize` 监听），回到纯 CSS。
+
+#### 23.22.3 改动（src/web/static/index.html）
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| `.detail` | `flex: 1; min-height: 0` | `flex: 0 0 auto` |
+| `.job-tree .tree-body` | `flex: 1 1 auto; min-height: 0; max-height: none` | `flex: 0 1 auto; min-height: 0; max-height: min(40vh, 24rem); overflow: auto` |
+| `.job-files` | `flex: 0 1 auto; min-height: 4rem; max-height: min(30vh, 16rem)` | `flex: 0 0 auto; min-height: 0; max-height: min(46vh, 26rem)` |
+| `.job-log` | `flex: 1 1 auto; min-height: clamp(14rem, 46vh, 32rem)` | `flex: 0 0 auto; min-height: 0` |
+| `pre.log` | `flex: 1 1 0; min-height: 0; height: 0` | `flex: 0 1 auto; min-height: 0; max-height: min(40vh, 26rem)` |
+| `@media (max-width: 820px)` | `.job-log:not(.folded) { min-height: 14rem }` | 删除 |
+| JS | `fitTreeBody()` + 调用点 | 全部删除 |
+
+`src/server/web_app.py` 的 `APP_VERSION` 改 `2.8.16`。
+
+为什么日志的 `max-height` 写两层（`.job-log` 不封顶、`pre.log` 封顶）：`.job-log` 里还有标题行，封在 `pre.log` 上才能让「标题行 + 日志文本」总共不超过一屏的 40%。
+
+#### 23.22.4 验证（NAS 真机 756×469，`.main-body` clientHeight 392、overflow-y auto）
+
+| 场景 | 目录面板 | 文件面板 | 日志 | main-body |
+| --- | --- | --- | --- | --- |
+| 凡人修仙（1 文件 + 50 行目录）树展开、日志折叠 | 229（树体 188 = 40vh 封顶，内容 1112 框内滚） | 107（列表 70 = 内容，不滚） | 折叠 35 | 392 / 481 可滚 |
+| 同上 + 日志展开 | 229 | 107 | 228（`pre` 188 = 40vh 封顶，内容 7917） | 392 / 674，`scrollTop` 设 9999 实际滚到 282 |
+| 脱口秀（5 文件 + 2 行目录）树展开 | 95（树体 54 = 内容） | 179（列表 142 = 内容） | 228 | 392 / 629 |
+| 默认态（树折叠 + 日志折叠，两个任务） | 折叠 | 179 / 107 | 折叠 35 | 392 / 392 不需要滚 |
+
+`pytest` 251 passed；`node --check`（1 个 script 块 62781 字符）通过。
+
+#### 23.22.5 边界
+
+- 出现两级滚动：面板很高时先在面板内滚，滚到底继续滚页面（浏览器原生行为，没有做 scroll chaining 干预）。
+- 窗口极矮（如 400px）时 40vh ≈ 160px，目录树一屏只看三四行——这是「每块封顶」的代价，换取文件进度与日志不被挤没。
+- `.main-body` 的 `overflow: auto` 是 2.4.8 就有的；这次没有新增滚动容器，只是让 `.detail` 不再抢高度。
+- 目录树展开后仍保留 2.8.15 的「按内容算」特性（两行任务不会撑成一大块），只是封顶从「详情区剩余高度」换成固定的 `min(40vh, 24rem)`。

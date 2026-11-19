@@ -119,7 +119,7 @@
       --tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;
       margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 1 auto;
     }
-    /* 展开后按内容长，装不下才由 fitTreeBody() 用 max-height 封顶（写死 min-height 会把只有两行的任务也撑成一大块） */
+    /* 展开后按内容长：两行就占两行。树体自己有 max-height（超出在框里滚），页面整体还能往下滚 */
     .job-tree:not(.folded) { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
     .job-tree[hidden] { display: none; }
     .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; flex: 0 0 auto; }
@@ -132,7 +132,8 @@
     /* 标题栏那个「整个目录」勾选框：全局 input 是 100% 宽，这里要收回成原生小方块 */
     .job-tree-head .tree-check { width: auto; height: auto; margin: 0; padding: 0; }
     .job-tree-head .tree-check:disabled { opacity: .45; }
-    .job-tree .tree-body { flex: 1 1 auto; min-height: 0; max-height: none; padding: .2rem .35rem .45rem; }
+    /* 目录树自己封顶（超出在框里滚）；页面整体还能往下滚 */
+    .job-tree .tree-body { flex: 0 1 auto; min-height: 0; max-height: min(40vh, 24rem); overflow: auto; padding: .2rem .35rem .45rem; }
     .job-tree.folded .tree-body { display: none; }
     .job-tree .msg { margin: 0 .7rem .55rem; }
     .job-tree .msg:empty { display: none; }  /* 空提示行不再白占一行高度 */
@@ -224,10 +225,11 @@
       flex: 1; min-height: 0; display: flex; flex-direction: column;
       padding: .65rem 1.25rem 0; overflow: auto;
     }
-    /* 详情区无外层卡片框，仅保留内部 stats / log 等分区；列布局把剩余高度交给日志 */
+    /* 详情区无外层卡片框：高度按内容长，整页（.main-body）可以往下滚；
+       目录树 / 文件进度 / 日志各自有 max-height，超出在自己框里滚 */
     .detail {
       margin: 0; padding: 0; background: transparent; border: 0;
-      flex: 1; min-height: 0; display: flex; flex-direction: column;
+      flex: 0 0 auto; display: flex; flex-direction: column;
     }
     .detail[hidden] { display: none; }
     .empty-hint { flex-shrink: 0; }
@@ -311,9 +313,10 @@
       margin-top: .5rem;
       border-top: 1px dashed var(--line);
       padding-top: .5rem;
-      /* 展开时吃掉 detail 剩余高度，并保底近半屏，避免被上方目录树/进度面板挤小 */
-      flex: 1 1 auto;
-      min-height: clamp(14rem, 46vh, 32rem);
+      /* 展开时高度按日志内容（最多 min(40vh, 26rem)），超出在 pre 里滚；
+         不再抢占 detail 的剩余高度，页面不够就整体往下滚 */
+      flex: 0 0 auto;
+      min-height: 0;
       overflow: hidden;
       display: flex;
       flex-direction: column;
@@ -335,17 +338,17 @@
       font-size: .72rem; color: var(--muted);
     }
     .job-log-head button { flex: 0 0 auto; padding: .35rem .65rem; font-size: .78rem; }
-    /* 高度由 flex 链限制；overflow:auto 使滚轮在框内滚动 */
+    /* 日志内容自己封顶（超出在框里滚），页面上仍可继续往下滚 */
     pre.log {
-      margin: 0; flex: 1 1 0; min-height: 0; height: 0;
+      margin: 0; flex: 0 1 auto; min-height: 0; max-height: min(40vh, 26rem);
       overflow: auto; overscroll-behavior: contain;
       background: #0b100e; border: 1px solid var(--line);
       border-radius: 8px; padding: .75rem; font: .72rem/1.45 var(--mono); white-space: pre-wrap; color: #c5d4cb;
     }
-    /* 单文件进度：默认只吃内容高度（最多 30vh / 16rem）；目录树展开时最多让到 4rem（约两行） */
+    /* 单文件进度：默认按内容长，最多 min(46vh, 26rem)，超出在列表里滚；不再为目录树让高度（页面整体可滚） */
     .job-files {
-      flex: 0 1 auto; min-height: 4rem; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
-      display: flex; flex-direction: column; max-height: min(30vh, 16rem);
+      flex: 0 0 auto; min-height: 0; margin-top: .5rem; border-top: 1px dashed var(--line); padding-top: .5rem;
+      display: flex; flex-direction: column; max-height: min(46vh, 26rem);
     }
     .job-files[hidden] { display: none; }
     .job-files-head {
@@ -438,8 +441,7 @@
       .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .app { height: 100dvh; min-height: 100dvh; }
       .main-body { overflow: auto; }
-      /* 窄屏时整块日志保底 14rem（原先只给 pre 设 12rem，会把外层 .job-log 撑破） */
-      .job-log:not(.folded) { min-height: 14rem; }
+      /* 窄屏也不再给日志保底高度：日志按内容长（最多 min(40vh, 26rem)），页面整体往下滚 */
     }
     .app-ver {
       display: inline-block; margin-left: .35rem; padding: .02rem .38rem;
@@ -913,7 +915,6 @@
       if (pathEl && job.log_path && pathEl.textContent !== job.log_path) {
         pathEl.textContent = job.log_path;
       }
-      fitTreeBody();
     }
 
     // 记录日志框当前显示的是「哪个任务的哪种状态」，避免 5s 轮询每次都拉 250 行
@@ -931,7 +932,6 @@
       const head = panel.querySelector('[data-role="log-toggle"]');
       if (head) head.setAttribute("aria-expanded", logFolded ? "false" : "true");
       if (!logFolded) fillJobLog({ scrollBottom: true });
-      fitTreeBody();  // 日志框占了高度，树的封顶要跟着变
     }
 
     function jobIsActive(job) {
@@ -1127,7 +1127,6 @@
       if (!panel || !box || !summaryEl) return;
       if (!selectedId) {
         panel.hidden = true;
-        fitTreeBody();
         return;
       }
       const files = fileState.files;
@@ -1170,7 +1169,6 @@
       if (keyword && matched.length !== files.length) text += ` · 匹配 ${matched.length}`;
       if (matched.length > shown.length) text += ` · 仅显示前 ${FILE_RENDER_LIMIT}（可过滤）`;
       if (summaryEl.textContent !== text) summaryEl.textContent = text;
-      fitTreeBody();  // 「文件进度」占多高会影响树能分到多少
     }
 
     function resetFileState(jobId) {
@@ -1415,30 +1413,6 @@
       return $("detail").querySelector('[data-role="tree-body"]');
     }
 
-    // 目录树展开后的高度：按内容长，装不下才封顶到「详情区里除树之外的内容摆好之后剩下的高度」。
-    // 不用 CSS 写死的 min-height：只有两行的任务也会被撑成一大块（2.8.14 的问题），
-    // 也不交给 flex 自动收缩：树和「文件进度」同时 shrink 时无法表达「树优先、按内容、不被裁”。
-    function fitTreeBody() {
-      const detail = $("detail");
-      const panel = treePanelEl();
-      const body = treeBodyEl();
-      if (!detail || !panel || !body) return;
-      body.style.maxHeight = "";
-      if (panel.hidden || panel.classList.contains("folded")) return;
-      const chrome = panel.offsetHeight - body.offsetHeight;  // 标题行 + 提示行 + 边框
-      let others = 0;
-      for (const el of Array.from(detail.children)) {
-        if (el === panel || el.hidden) continue;
-        const cs = getComputedStyle(el);
-        others += el.offsetHeight + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0);
-      }
-      const ps = getComputedStyle(panel);
-      const panelMargin = (parseFloat(ps.marginTop) || 0) + (parseFloat(ps.marginBottom) || 0);
-      const avail = Math.floor(detail.clientHeight - others - panelMargin - chrome);
-      // 最少留 6 行左右，窗口很矮时不至于被压成一条缝（真装不下就让 .main-body 自己滚）
-      const cap = Math.max(96, avail);
-      if (body.scrollHeight > cap) body.style.maxHeight = cap + "px";
-    }
 
     function setTreeMsg(text, kind = "") {
       const el = $("detail").querySelector('[data-role="tree-msg"]');
@@ -1529,7 +1503,6 @@
       panel.classList.toggle("folded", Boolean(treeState.folded));
       const caret = panel.querySelector('[data-role="tree-caret"]');
       if (caret) caret.textContent = treeState.folded ? "▸" : "▾";
-      fitTreeBody();  // 折叠时清掉 max-height，展开时按内容重新算
     }
 
     function treeInheritedFrom(fid) {
@@ -1680,7 +1653,6 @@
         container.append(row);
         treeRefreshRow(row);
       }
-      fitTreeBody();  // 行数变了，重新按内容封顶
     }
 
     async function treeFetch(pdirFid) {
@@ -2283,7 +2255,6 @@
     (async () => {
       await refreshJobs({ silentLog: false });
       loadAria2Profiles();  // 预填下拉，打开新增表单就不用等接口
-      window.addEventListener("resize", fitTreeBody);  // 窗口高度变了，树的封顶要重算
       setInterval(() => {
         refreshJobs().catch(() => {});
       }, 5000);
