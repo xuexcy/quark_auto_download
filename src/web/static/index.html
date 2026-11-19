@@ -119,8 +119,8 @@
       --tree-caret: 1rem; --tree-gap: .35rem; --tree-step: 1.15rem; --tree-base: 1.5rem;
       margin-top: .9rem; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); flex: 0 1 auto;
     }
-    /* 展开后吃掉详情区剩余高度（最多到底部），树体自己滚动；内容少时不撑高（min-height 只是保底一行都不挤） */
-    .job-tree:not(.folded) { flex: 1 1 auto; min-height: 9rem; display: flex; flex-direction: column; }
+    /* 展开后按内容长，装不下才由 fitTreeBody() 用 max-height 封顶（写死 min-height 会把只有两行的任务也撑成一大块） */
+    .job-tree:not(.folded) { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
     .job-tree[hidden] { display: none; }
     .job-tree-head { display: flex; align-items: center; gap: var(--tree-gap, .45rem); padding: .5rem .7rem; flex-wrap: wrap; cursor: pointer; flex: 0 0 auto; }
     .job-tree-caret { font-size: .72rem; color: var(--muted); width: var(--tree-caret, .9rem); text-align: center; }
@@ -135,6 +135,7 @@
     .job-tree .tree-body { flex: 1 1 auto; min-height: 0; max-height: none; padding: .2rem .35rem .45rem; }
     .job-tree.folded .tree-body { display: none; }
     .job-tree .msg { margin: 0 .7rem .55rem; }
+    .job-tree .msg:empty { display: none; }  /* 空提示行不再白占一行高度 */
     .tree-badge { flex: 0 0 auto; font-size: .68rem; line-height: 1.4; padding: 0 .35rem; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
     .tree-badge.sel { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
     .tree-badge.done { color: #7fd6a2; border-color: color-mix(in srgb, #7fd6a2 40%, var(--line)); }
@@ -290,7 +291,9 @@
     .job-actions .stat {
       display: flex; flex-direction: column; justify-content: center; align-items: flex-start;
       gap: .08rem; min-width: 0;
-      border: 0; border-radius: 0; background: transparent; padding: 0; line-height: 1.15;
+      border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2);
+      padding: .3rem .6rem; line-height: 1.15;
+      box-sizing: border-box; height: 2.4rem;  /* 和「开始 / 暂停 / 删除」同一高度，上下沿对齐 */
     }
     .job-actions .stat-label { margin: 0; font-size: .7rem; white-space: nowrap; }
     .job-actions .stat-value { font-size: .8rem; white-space: nowrap; }
@@ -910,6 +913,7 @@
       if (pathEl && job.log_path && pathEl.textContent !== job.log_path) {
         pathEl.textContent = job.log_path;
       }
+      fitTreeBody();
     }
 
     // 记录日志框当前显示的是「哪个任务的哪种状态」，避免 5s 轮询每次都拉 250 行
@@ -927,6 +931,7 @@
       const head = panel.querySelector('[data-role="log-toggle"]');
       if (head) head.setAttribute("aria-expanded", logFolded ? "false" : "true");
       if (!logFolded) fillJobLog({ scrollBottom: true });
+      fitTreeBody();  // 日志框占了高度，树的封顶要跟着变
     }
 
     function jobIsActive(job) {
@@ -1122,6 +1127,7 @@
       if (!panel || !box || !summaryEl) return;
       if (!selectedId) {
         panel.hidden = true;
+        fitTreeBody();
         return;
       }
       const files = fileState.files;
@@ -1164,6 +1170,7 @@
       if (keyword && matched.length !== files.length) text += ` · 匹配 ${matched.length}`;
       if (matched.length > shown.length) text += ` · 仅显示前 ${FILE_RENDER_LIMIT}（可过滤）`;
       if (summaryEl.textContent !== text) summaryEl.textContent = text;
+      fitTreeBody();  // 「文件进度」占多高会影响树能分到多少
     }
 
     function resetFileState(jobId) {
@@ -1408,6 +1415,31 @@
       return $("detail").querySelector('[data-role="tree-body"]');
     }
 
+    // 目录树展开后的高度：按内容长，装不下才封顶到「详情区里除树之外的内容摆好之后剩下的高度」。
+    // 不用 CSS 写死的 min-height：只有两行的任务也会被撑成一大块（2.8.14 的问题），
+    // 也不交给 flex 自动收缩：树和「文件进度」同时 shrink 时无法表达「树优先、按内容、不被裁”。
+    function fitTreeBody() {
+      const detail = $("detail");
+      const panel = treePanelEl();
+      const body = treeBodyEl();
+      if (!detail || !panel || !body) return;
+      body.style.maxHeight = "";
+      if (panel.hidden || panel.classList.contains("folded")) return;
+      const chrome = panel.offsetHeight - body.offsetHeight;  // 标题行 + 提示行 + 边框
+      let others = 0;
+      for (const el of Array.from(detail.children)) {
+        if (el === panel || el.hidden) continue;
+        const cs = getComputedStyle(el);
+        others += el.offsetHeight + (parseFloat(cs.marginTop) || 0) + (parseFloat(cs.marginBottom) || 0);
+      }
+      const ps = getComputedStyle(panel);
+      const panelMargin = (parseFloat(ps.marginTop) || 0) + (parseFloat(ps.marginBottom) || 0);
+      const avail = Math.floor(detail.clientHeight - others - panelMargin - chrome);
+      // 最少留 6 行左右，窗口很矮时不至于被压成一条缝（真装不下就让 .main-body 自己滚）
+      const cap = Math.max(96, avail);
+      if (body.scrollHeight > cap) body.style.maxHeight = cap + "px";
+    }
+
     function setTreeMsg(text, kind = "") {
       const el = $("detail").querySelector('[data-role="tree-msg"]');
       if (el) setMsg(el, text, kind);
@@ -1497,6 +1529,7 @@
       panel.classList.toggle("folded", Boolean(treeState.folded));
       const caret = panel.querySelector('[data-role="tree-caret"]');
       if (caret) caret.textContent = treeState.folded ? "▸" : "▾";
+      fitTreeBody();  // 折叠时清掉 max-height，展开时按内容重新算
     }
 
     function treeInheritedFrom(fid) {
@@ -1647,6 +1680,7 @@
         container.append(row);
         treeRefreshRow(row);
       }
+      fitTreeBody();  // 行数变了，重新按内容封顶
     }
 
     async function treeFetch(pdirFid) {
@@ -2249,6 +2283,7 @@
     (async () => {
       await refreshJobs({ silentLog: false });
       loadAria2Profiles();  // 预填下拉，打开新增表单就不用等接口
+      window.addEventListener("resize", fitTreeBody);  // 窗口高度变了，树的封顶要重算
       setInterval(() => {
         refreshJobs().catch(() => {});
       }, 5000);

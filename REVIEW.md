@@ -1945,3 +1945,66 @@ treeState.folded = Number(job.total_files || 0) > 0;
 
 - 窗口很矮（< 360px 高）时，树 `min-height: 9rem` + 文件面板 `min-height: 4rem` 仍可能让 `.main-body` 出滚动条（`overflow: auto` 是 2.4.8 就有意保留的兜底），此时整块可滚，不会裁内容。
 - 展开的树把空间吃满后，「文件进度」只剩两行可见（能滚），这是有意的取舍：展开目录树时用户在做勾选，不是在看进度。
+
+### 23.21 2.8.15：目录树展开高度按内容算 + 统计块恢复圆角边框（2026-11-19）
+
+#### 23.21.1 需求
+
+用户原话（m07632）：「目录展开使用了较大的上下高度，比如 nas 上的『脱口秀』任务，本来就只有两行，但是占用了很多，设置一个最大高度，而不是固定高度。另外，『文件进度』也一样，设置一个最大高度。或者看看有没有更好的设计。『已有文件数』和『已有文件大小』及其下面的比例，有圆角四边形框起来，就像『开始』按钮那样」
+
+#### 23.21.2 现象拆解（NAS 真机，756×469，详情区 382）
+
+| 量 | 值 | 说明 |
+| --- | --- | --- |
+| `.job-tree` 展开 | 144 | 正好等于 2.8.14 写的 `min-height: 9rem` —— 被撑出来的，不是内容要的 |
+| `.tree-body` | 76 | 两行 × 22 + padding |
+| `.job-tree .msg:empty` | 18 + 8.8 margin | 空提示行白占 27px |
+| `.detail` 其他块 | actions 38+4、meta 35+8.8、files 86+8、log 35+8 | 合计 222.8 |
+
+结论：2.8.14 用「树当弹性块吃掉剩余高度」解决了 50 行看不全，但同一套规则套到 2 行任务上就是「固定高度」；用户要的是「按内容长、装不下才封顶」，也就是 `max-height` 语义而不是 `min-height` 语义。
+
+#### 23.21.3 为什么不交给纯 CSS
+
+| 尝试 | 结果 |
+| --- | --- |
+| `.job-tree:not(.folded){flex:1 1 auto;min-height:0;max-height:max-content}` + `.job-files{flex:0 1 auto;min-height:0}` | 脱口秀树体 25px（内容 54 被裁），凡人修仙「文件进度」塌成 27px（列表 0） |
+| 同上但 `.job-files{min-height:4rem}` | 脱口秀树体仍只有 25px —— 树和进度面板会**同时** shrink，CSS 无法表达「树优先按内容、装不下才封顶」 |
+| `.job-tree:not(.folded){flex:0 0 auto}`（不带 min-height:0） | 读数全被 `min-height:9rem` 污染（body 103 是被撑出来的假值），也说明旧规则确实在强行撑高 |
+
+`CSS.supports("max-height", "max-content")` 为 true，但 shrink 权重由 flex 分配，与内容高度无关，所以纯 CSS 这条路走不通。
+
+#### 23.21.4 实现（只动 `src/web/static/index.html`）
+
+| 位置 | 改前 | 改后 |
+| --- | --- | --- |
+| `.job-tree:not(.folded)` | `flex: 1 1 auto; min-height: 9rem; display: flex; flex-direction: column` | `flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column` |
+| `.job-tree .msg` | 空提示行常驻（18 + 8.8 margin） | 新增 `.job-tree .msg:empty { display: none }` |
+| `.job-actions .stat` | `border: 0; border-radius: 0; background: transparent; padding: 0` | `border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); padding: .3rem .6rem; box-sizing: border-box; height: 2.4rem` |
+
+新增 `fitTreeBody()`（放在 `treeBodyEl()` 之后）：
+
+- 先 `body.style.maxHeight = ""`，保证每次量到的是「没有封顶」的真实布局；
+- `chrome = panel.offsetHeight - body.offsetHeight`（标题行 + 提示行 + 边框）；
+- `others` = `.detail` 里除树以外、非 `hidden` 子元素的 `offsetHeight + marginTop + marginBottom`；
+- `avail = detail.clientHeight - others - panelMargin - chrome`，`cap = max(96, avail)`；
+- `body.scrollHeight > cap` 时才写 `max-height: cap px`（内容装得下就完全不封顶）。
+
+调用点：`patchDetail()`（切任务）、`applyTreeFold()`（折叠 / 展开，折叠时靠开头的清空把 `max-height` 去掉）、`treeRenderEntries()`（行数变化，含子目录懒加载）、`renderFileList()`（「文件进度」显示与否、行数变化）、`setLogFolded()`（日志展开 / 折叠占了高度）、`window.addEventListener("resize", fitTreeBody)`。
+
+统计块：只加边框/底色时框高被内容撑到 40px，比按钮（38.4）高 2px，`align-items: center` 让它在行里上下各溢 1px。固定 `box-sizing: border-box; height: 2.4rem` 后两块都是 38.4，实测 `.stat` 与「暂停」「删除」`top 87.4 / bottom 125.8` 完全重合；块内仍是「标签在上、值在下」（2.8.12 的左右并排不变）。
+
+#### 23.21.5 验证（NAS 真机，756×469，详情区 382）
+
+| 场景 | 目录面板 | 树体（内容） | 文件面板 | 折叠日志 | main-body |
+| --- | --- | --- | --- | --- | --- |
+| 脱口秀（2 行）· 改前 | 144 | 76（54） | 86 | 35 @y=434 | 392 / 392 |
+| 脱口秀（2 行）· 改后 | 95（head 41 + body 54） | 54（不裁） | 135 | 35 | 392 / 392 |
+| 凡人修仙（50 行）· 改后 | 182 | 141（内容 1112，滚动） | 65（保底 4rem） | 35 | 392 / 392 |
+
+- `pytest` → 251 passed；`node --check`（抽出 `<script>` 块 64280 字符）通过。
+
+#### 23.21.6 边界
+
+- 详情区里其他块都长起来（进度面板满 + 日志展开）时，`avail` 可能小于 96，此时树体保底 96px，溢出交给 `.main-body` 整体滚动（2.4.8 就保留的兜底）。
+- `fitTreeBody()` 会触发一次强制同步布局（读 `offsetHeight`），只在切任务、折叠、行数变化、日志开关、resize 时跑，5 秒轮询路径上不调用。
+- 面板折叠（`folded`）时直接 `return`，`max-height` 已被清空，展开后重新计算，不会残留上一次的封顶值。
