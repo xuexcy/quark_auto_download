@@ -187,11 +187,30 @@ def test_exchange_ticket_walks_web_login_chain(monkeypatch):
     """实测链路：同一个会话按 EXCHANGE_STEPS 走完，ticket 放进 account/info 的 st。"""
     sess = FakeSession(make_jar([("__pus", "p", ".quark.cn")]))
     monkeypatch.setattr(ql.requests, "Session", lambda: sess)
+    # 预热（补 web-grey-id）由 test_exchange_ticket_warms_cookie 覆盖，这里只验证五步链路
+    monkeypatch.setattr(ql, "warm_cookie", lambda cookie, *a, **k: cookie)
     cookie, detail = make_login()._exchange_ticket("TICK")
     assert detail == "ok"
     assert cookie.startswith("__pus=p")
     assert [c[0] for c in sess.calls] == [u for u, _ in ql.EXCHANGE_STEPS]
     assert sess.calls[2][1] == {"st": "TICK", "lw": "scan"}
+
+
+def test_exchange_ticket_warms_cookie(monkeypatch):
+    """拿到 __pus 之后必须再过一遍 warm_cookie（否则直链会被 CDN 回 412）。"""
+    sess = FakeSession(make_jar([("__pus", "p", ".quark.cn")]))
+    monkeypatch.setattr(ql.requests, "Session", lambda: sess)
+    seen = {}
+
+    def fake_warm(cookie, *a, **k):
+        seen["cookie"] = cookie
+        return cookie + "; web-grey-id=g1; web-grey-id.sig=g2"
+
+    monkeypatch.setattr(ql, "warm_cookie", fake_warm)
+    cookie, detail = make_login()._exchange_ticket("TICK")
+    assert detail == "ok"
+    assert seen["cookie"].startswith("__pus=p")
+    assert "web-grey-id=g1" in cookie
 
 
 def test_exchange_ticket_reports_trail_without_pus_cookie(monkeypatch):

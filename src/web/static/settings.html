@@ -83,6 +83,7 @@
     a.btn-ghost:hover, button.btn-ghost:hover { border-color: var(--accent-dim); color: var(--accent); }
     .msg { margin-top: .7rem; min-height: 1.1rem; font-size: .86rem; color: var(--muted); }
     .msg.ok { color: var(--accent); }
+    .msg.warn { color: #ffcf6b; }
     .msg.err { color: #ff8e86; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem; }
     @media (max-width: 560px) { .grid-2 { grid-template-columns: 1fr; } }
@@ -649,8 +650,23 @@
         if (st.status === "confirmed") {
           stopQrPolling();
           const who = st.nickname ? "（" + st.nickname + "）" : "";
-          setQrStatus("登录成功" + who + "，Cookie 已保存", "ok");
-          setMsg($("login-msg"), "Cookie 已保存：" + (st.cookie_masked || ""), "ok");
+          const warn = st.level && st.level !== "green";
+          if (warn) {
+            // 扫码会话缺浏览器指纹字段时，接口能通但直链会被 CDN 回 412
+            setQrStatus(
+              "登录成功" + who + "，但 Cookie 只能调接口、不能下文件：" +
+                (st.message || "直链被拒绝") +
+                "。请改用「手工 Cookie」粘贴浏览器里那份完整 Cookie。",
+              "err"
+            );
+          } else {
+            setQrStatus("登录成功" + who + "，Cookie 已保存", "ok");
+          }
+          setMsg(
+            $("login-msg"),
+            "Cookie 已保存：" + (st.cookie_masked || "") + (warn ? "（直链被 CDN 拒绝，建议换浏览器 Cookie）" : ""),
+            warn ? "err" : "ok"
+          );
           fillConfig(await api("/api/config"));
           return;
         }
@@ -751,7 +767,10 @@
           body: JSON.stringify({ cookie }),
         });
         const who = data.nickname ? "（" + data.nickname + "）" : "";
-        setMsg($("login-msg"), "Cookie 校验通过并已保存" + who, "ok");
+        // level: green=直链能下；yellow=接口通但直链被 CDN 拒绝（任务能建、下载必失败）
+        const level = data.level === "yellow" ? "warn" : "ok";
+        const head = data.level === "yellow" ? "Cookie 已保存，但" : "Cookie 校验通过并已保存";
+        setMsg($("login-msg"), head + who + "：" + (data.message || ""), level);
         $("cookie-input").value = "";
         fillConfig(await api("/api/config"));
       } catch (e) {
@@ -765,7 +784,8 @@
       try {
         const info = await api("/api/quark/cookie/test", { method: "POST", body: "{}" });
         const who = info.nickname ? "（" + info.nickname + "）" : "";
-        setMsg($("login-msg"), (info.message || "") + who, info.ok ? "ok" : "err");
+        const kind = info.level === "green" ? "ok" : info.level === "yellow" ? "warn" : "err";
+        setMsg($("login-msg"), (info.message || "") + who, kind);
       } catch (e) {
         setMsg($("login-msg"), e.message, "err");
       }

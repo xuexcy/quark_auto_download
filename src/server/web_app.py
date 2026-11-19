@@ -41,7 +41,7 @@ import mcp_server
 import notify
 from log_util import configure_logging, dated_web_log_path
 from quark_api import QuarkClient
-from quark_login import QuarkQrLogin, mask_cookie, validate_cookie
+from quark_login import QuarkQrLogin, check_cookie_health, mask_cookie, validate_cookie, warm_cookie
 import supervisor as sup
 
 WEB_DIR = os.path.join(BASE_DIR, "src", "web")
@@ -248,7 +248,7 @@ async def lifespan(_app: FastAPI):
     notify.stop_watcher()
 
 
-APP_VERSION = "2.8.20"
+APP_VERSION = "2.9.0"
 CODE_ROOT = os.path.dirname(os.path.abspath(__file__))
 PROCESS_STARTED_AT = time.strftime("%Y-%m-%d %H:%M:%S")
 PROCESS_START_TS = time.time()
@@ -554,10 +554,22 @@ def api_aria2_test(body: Aria2TestRequest):
 
 
 def _save_quark_cookie(cookie: str) -> str:
-    """写入 conf/quark.yaml，返回掩码后的展示串。"""
+    """写入 conf/quark.yaml，返回掩码后的展示串。
+
+    落盘前先过一遍网页会话补齐 web-grey-id / web-grey-id.sig 这类防风控 Cookie：
+    缺了它们 file/download 照样 200，但直链会被 CDN 回 412（下载必然失败）。
+    """
     text = (cookie or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="Cookie 为空")
+    try:
+        warmed = warm_cookie(text)
+    except Exception:  # noqa: BLE001 - 补 Cookie 失败就用原串，至少先把配置存下来
+        warmed = ""
+    if warmed and warmed != text:
+        logging.getLogger(__name__).info("已补齐防风控 Cookie（web-grey-id 等）后保存")
+    if warmed:
+        text = warmed
     try:
         jm.save_section("quark", {"quark_cookie": text})
     except Exception as e:
@@ -587,29 +599,44 @@ def api_quark_qr_status(session_id: str):
             payload["cookie_masked"] = _save_quark_cookie(cookie)
             _QR_LOGIN.mark_saved(session_id)
             payload["saved"] = True
+            # 扫码会话拿不到浏览器指纹字段，直链可能被 CDN 回 412；
+            # 保存后立刻体检一次，让页面能显示黄灯并提示改用浏览器 Cookie。
+            try:
+                health = check_cookie_health(_quark_cookie())
+            except Exception as e:  # noqa: BLE001 - 体检失败不影响「已保存」这个事实
+                logging.getLogger(__name__).warning("扫码保存后体检失败: %s", e)
+            else:
+                payload["level"] = health.get("level") or "green"
+                payload["message"] = str(health.get("message") or "")
+                payload["cdn_status"] = health.get("cdn_status") or 0
     return payload
 
 
 @app.post("/api/quark/cookie")
 def api_quark_cookie(body: CookieRequest):
-    """手工粘贴 Cookie：先校验再落盘，避免存进去一个死 Cookie。"""
-    info = validate_cookie(body.cookie)
+    """手工粘贴 Cookie：补齐防风控字段 → 校验 → 落盘，返回红/黄/绿判定。"""
+    info = validate_cookie(warm_cookie(body.cookie))
     if not info.get("ok"):
         raise HTTPException(status_code=400, detail=str(info.get("message") or "Cookie 无效"))
     masked = _save_quark_cookie(body.cookie)
+    health = check_cookie_health(_quark_cookie())
     return {
         "ok": True,
+        "level": health.get("level") or "green",
         "cookie_masked": masked,
         "nickname": info.get("nickname") or "",
-        "message": info.get("message") or "Cookie 已保存",
+        "message": str(health.get("message") or info.get("message") or "Cookie 已保存"),
     }
 
 
 @app.post("/api/quark/cookie/test")
 def api_quark_cookie_test():
-    """校验当前配置里的 Cookie 是否还有效。"""
-    info = validate_cookie(_quark_cookie())
-    return info
+    """校验当前配置里的 Cookie：接口是否可用 + 直链是否真能下（红/黄/绿）。
+
+    只看 member 接口会「测试通过但下载全 412」——直链 CDN 另有一层防风控校验，
+    所以这里顺手换一次直链并 Range 读 1 字节，才算真的可用。
+    """
+    return check_cookie_health(_quark_cookie())
 
 
 @app.get("/api/jobs")
@@ -667,9 +694,44 @@ def api_share_tree(body: ShareTreeRequest):
     }
 
 
+def _forget_deleted_for_dirs(job_id: str, job: dict, dir_fids: list[str]) -> int:
+    """勾选整个目录时，撤掉这棵子树里此前的「逐文件删除」标记。
+
+    否则用户「先删掉失败的文件、再重新勾选整个目录」时，子进程枚举出文件后
+    又被 deleted 标记全部过滤，最后一个文件都不剩，任务直接显示「全部文件下载成功」。
+    只清被勾中目录下的文件，其它目录里删过的文件保持原样（用户没说要重下）。
+    """
+    wanted = {str(f).strip() for f in dir_fids if str(f).strip()}
+    share_url = str((job or {}).get("share_url") or "").strip()
+    if not wanted or not share_url:
+        return 0
+    try:
+        client, stoken, share_id, base_fid = _share_context(share_url, str((job or {}).get("share_pwd") or ""))
+        files = client.list_share_files(
+            share_id, stoken, base_fid, "", selected_dir_fids=wanted
+        )
+    except Exception as e:  # noqa: BLE001 - 列不出来就不清，宁可维持旧行为
+        logging.getLogger(__name__).warning("勾选目录时列举文件失败，未撤销删除标记: %s", e)
+        return 0
+    fids = [str(f.get("fid") or "") for f in files if str(f.get("fid") or "").strip()]
+    if not fids:
+        return 0
+    try:
+        removed = jm.forget_deleted_paths(job_id, fids=fids)
+    except OSError as e:
+        logging.getLogger(__name__).warning("勾选目录时撤销删除标记失败: %s", e)
+        return 0
+    if removed:
+        logging.getLogger(__name__).info("勾选目录时撤销了 %d 个删除标记", removed)
+    return removed
+
+
 @app.post("/api/jobs/{job_id}/selection/add")
 def api_add_job_selection(job_id: str, body: JobSelectionAddRequest):
     """追加勾选（可反复调用）：只加新 fid，重复的返回 duplicates 供前端提示。"""
+    job = jm.get_job(job_id) or {}
+    if body.dir_fids:
+        _forget_deleted_for_dirs(job_id, job, list(body.dir_fids))
     try:
         result = jm.add_job_selection(
             job_id,
@@ -764,12 +826,41 @@ def api_pause_job(job_id: str, body: JobPauseRequest | None = None):
     return {"job": job}
 
 
+def _job_download_speed(job: dict, job_id: str) -> dict:
+    """任务所属 Aria2 的总速度（全局 downloadSpeed）。连不上就降级成 ok=False，不影响文件列表。"""
+    if str(job.get("status") or "") not in ("running", "paused"):
+        return {"ok": False, "speed": 0, "message": "任务未运行"}
+    try:
+        stat = jm.aria2_global_stat(job_id, timeout=3)
+    except Exception as e:  # noqa: BLE001 - 速度显示失败不该让进度面板报错
+        return {"ok": False, "speed": 0, "message": str(e)[:200]}
+    try:
+        target = jm.aria2_target(str(job.get("aria2_profile") or ""))
+        name = str(target.get("name") or "")
+    except Exception:  # noqa: BLE001
+        name = ""
+    return {
+        "ok": True,
+        "speed": int(stat.get("downloadSpeed") or 0),
+        "num_active": int(stat.get("numActive") or 0),
+        "num_waiting": int(stat.get("numWaiting") or 0),
+        "aria2": name,
+    }
+
+
 @app.get("/api/jobs/{job_id}/files")
 def api_job_files(job_id: str, offset: int = 0, limit: int = 2000):
-    """单文件下载进度（前端 5s 轮询，只读 pipeline_state，不触发 aria2 查询）。"""
-    if not jm.get_job(job_id):
+    """单文件下载进度（前端 5s 轮询）。
+
+    文件列表只读 pipeline_state；额外的 speed 字段是任务所属 Aria2 的总速度（一次 getGlobalStat，
+    超时 3 秒、失败降级成 ok=False），所以这个接口在网络不好时会慢一点，但不会因 aria2 挂掉而 500。
+    """
+    job = jm.get_job(job_id)
+    if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    return jm.job_files(job_id, offset=offset, limit=limit)
+    data = jm.job_files(job_id, offset=offset, limit=limit)
+    data["speed"] = _job_download_speed(job, job_id)
+    return data
 
 
 @app.post("/api/jobs/{job_id}/files/action")

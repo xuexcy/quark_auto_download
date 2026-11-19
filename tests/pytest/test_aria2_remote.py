@@ -11,7 +11,10 @@ from verify_download import verify_remote_downloads
 
 
 def make_client(
-    remote: bool, calls: list | None = None, download_dir: str = "/dl"
+    remote: bool,
+    calls: list | None = None,
+    download_dir: str = "/dl",
+    remote_dir: str = "",
 ) -> Aria2Client:
     client = Aria2Client(
         host="http://friend:6800/jsonrpc",
@@ -24,6 +27,7 @@ def make_client(
         logger=logging.getLogger("test"),
         work_dir="j1",
         remote=remote,
+        remote_dir=remote_dir,
     )
     if calls is not None:
         def fake(method, params):
@@ -162,3 +166,32 @@ def test_verify_remote_reports_by_pipeline_state():
     assert failed_paths == {"b.mkv", "c.mkv"}
     # 远端报告不引用本机路径
     assert all(item["local_path"] == "(远端 aria2)" for item in report["all_results"])
+
+
+def test_local_extract_uses_download_root_not_task_dir():
+    """提交时 dir=根目录/子目录、out=文件名；还原必须相对「根目录」，否则重启后重复提交。"""
+    client = make_client(False)
+    task = {
+        "gid": "g",
+        "dir": "/dl/j1/Show/S01",
+        "files": [{"path": "/dl/j1/Show/S01/[UPD] a.mkv"}],
+    }
+    assert client._extract_task_filename(task) == "Show/S01/[UPD] a.mkv"
+
+
+def test_local_extract_single_level_file():
+    client = make_client(False)
+    task = {"dir": "/dl/j1", "files": [{"path": "/dl/j1/a.mkv"}]}
+    assert client._extract_task_filename(task) == "a.mkv"
+
+
+def test_remote_extract_uses_remote_dir_when_set():
+    client = make_client(True, remote_dir="/var/tmp/quark")
+    task = {"dir": "/var/tmp/quark/Show", "files": [{"path": "/var/tmp/quark/Show/a.mkv"}]}
+    assert client._extract_task_filename(task) == "Show/a.mkv"
+
+
+def test_remote_extract_without_remote_dir_falls_back_to_basename():
+    client = make_client(True)
+    task = {"dir": "/downloads/Show", "files": [{"path": "/downloads/Show/a.mkv"}]}
+    assert client._extract_task_filename(task) == "a.mkv"

@@ -77,13 +77,20 @@ def test_qr_status_unknown_session(client):
 
 
 def test_manual_cookie_saved_after_validation(client, monkeypatch):
-    # 接口里用的是 web_app 命名空间下的 validate_cookie
+    # 接口里用的是 web_app 命名空间下的 validate_cookie / warm_cookie / check_cookie_health
+    monkeypatch.setattr(web_app, "warm_cookie", lambda cookie, *a, **k: cookie)
     monkeypatch.setattr(web_app, "validate_cookie", lambda cookie: {"ok": True, "nickname": "小红"})
     monkeypatch.setattr(web_app, "_save_quark_cookie", lambda cookie: "掩码")
+    monkeypatch.setattr(
+        web_app,
+        "check_cookie_health",
+        lambda cookie, *a, **k: {"level": "green", "ok": True, "message": "Cookie 有效，直链可下载"},
+    )
     res = client.post("/api/quark/cookie", json={"cookie": "__pus=abc"})
     assert res.status_code == 200
     assert res.json()["nickname"] == "小红"
     assert res.json()["cookie_masked"] == "掩码"
+    assert res.json()["level"] == "green"
 
 
 def test_manual_cookie_rejected_when_invalid(client, monkeypatch):
@@ -98,14 +105,86 @@ def test_manual_cookie_rejected_when_invalid(client, monkeypatch):
 
 
 def test_cookie_test_uses_configured_cookie(client, monkeypatch):
+    # 「测试」现在走 check_cookie_health（接口 + 直链两层），不再只看 member 接口
     monkeypatch.setattr(web_app, "_quark_cookie", lambda: "__pus=cfg")
     seen = []
     monkeypatch.setattr(
         web_app,
-        "validate_cookie",
-        lambda cookie: seen.append(cookie) or {"ok": True, "nickname": "小刚"},
+        "check_cookie_health",
+        lambda cookie, *a, **k: seen.append(cookie)
+        or {"level": "green", "ok": True, "message": "Cookie 有效，直链可下载", "nickname": "小刚"},
     )
     res = client.post("/api/quark/cookie/test", json={})
     assert res.status_code == 200
+    assert res.json()["level"] == "green"
     assert res.json()["ok"] is True
     assert seen == ["__pus=cfg"]
+
+
+def test_qr_save_reports_cookie_health(client, monkeypatch):
+    """扫码保存后要带上体检结果：扫码 Cookie 常常只能调接口、直链 412，页面靠 level 显示黄灯。"""
+    qr = ql.QuarkQrLogin(logger=logging.getLogger("test-qr-health"))
+    monkeypatch.setattr(qr, "_fetch_token", lambda: "tok")
+    monkeypatch.setattr(web_app, "_QR_LOGIN", qr)
+    monkeypatch.setattr(
+        ql.requests,
+        "get",
+        lambda *a, **k: FakeResp({"status": 50004001, "message": "Query result is empty"}),
+    )
+    sid = client.post("/api/quark/login/qr", json={}).json()["session_id"]
+
+    monkeypatch.setattr(
+        ql.requests,
+        "get",
+        lambda *a, **k: FakeResp({"status": 2000000, "data": {"members": {"service_ticket": "T"}}}),
+    )
+    monkeypatch.setattr(qr, "_exchange_ticket", lambda ticket: ("__pus=x; __puus=y", "ok"))
+    monkeypatch.setattr(ql, "validate_cookie", lambda cookie: {"ok": True, "nickname": "小明"})
+    monkeypatch.setattr(web_app, "_save_quark_cookie", lambda cookie: "掩码")
+    monkeypatch.setattr(web_app, "_quark_cookie", lambda: "__pus=x; __puus=y")
+    monkeypatch.setattr(
+        web_app,
+        "check_cookie_health",
+        lambda cookie, *a, **k: {
+            "level": "yellow",
+            "ok": True,
+            "cdn_status": 412,
+            "message": "Cookie 只能调接口，直链被 CDN 拒绝（HTTP 412）",
+        },
+    )
+    done = client.get(f"/api/quark/login/qr/{sid}").json()
+    assert done["saved"] is True
+    assert done["level"] == "yellow"
+    assert done["cdn_status"] == 412
+    assert "412" in done["message"]
+
+
+def test_qr_save_survives_health_failure(client, monkeypatch):
+    """体检本身抛错不该让「已经保存成功」变成 500。"""
+    qr = ql.QuarkQrLogin(logger=logging.getLogger("test-qr-health-fail"))
+    monkeypatch.setattr(qr, "_fetch_token", lambda: "tok")
+    monkeypatch.setattr(web_app, "_QR_LOGIN", qr)
+    monkeypatch.setattr(
+        ql.requests,
+        "get",
+        lambda *a, **k: FakeResp({"status": 50004001, "message": "Query result is empty"}),
+    )
+    sid = client.post("/api/quark/login/qr", json={}).json()["session_id"]
+    monkeypatch.setattr(
+        ql.requests,
+        "get",
+        lambda *a, **k: FakeResp({"status": 2000000, "data": {"members": {"service_ticket": "T"}}}),
+    )
+    monkeypatch.setattr(qr, "_exchange_ticket", lambda ticket: ("__pus=x; __puus=y", "ok"))
+    monkeypatch.setattr(ql, "validate_cookie", lambda cookie: {"ok": True, "nickname": ""})
+    monkeypatch.setattr(web_app, "_save_quark_cookie", lambda cookie: "掩码")
+    monkeypatch.setattr(web_app, "_quark_cookie", lambda: "__pus=x")
+
+    def boom(cookie, *a, **k):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(web_app, "check_cookie_health", boom)
+    res = client.get(f"/api/quark/login/qr/{sid}")
+    assert res.status_code == 200
+    assert res.json()["saved"] is True
+    assert "level" not in res.json()

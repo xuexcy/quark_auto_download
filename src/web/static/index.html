@@ -164,20 +164,20 @@
     }
     .job-item-url {
       flex: 1 1 auto; min-width: 0;
-      font-family: var(--mono); font-size: 2.8rem; font-weight: 600; color: var(--text);
+      font-family: var(--mono); font-size: .95rem; font-weight: 600; color: var(--text);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      line-height: 2.8rem;
+      line-height: 1.3;
     }
     .job-item-meta {
       flex: 0 1 auto; max-width: 55%; min-width: 0;
-      margin: 0; font-size: .95rem; color: var(--muted); font-family: var(--mono);
+      margin: 0; font-size: .74rem; color: var(--muted); font-family: var(--mono);
       display: flex; flex-direction: column; align-items: flex-end; justify-content: center;
       gap: .08rem; overflow: hidden;
     }
-    .job-item-meta .pill { flex-shrink: 0; font-size: .95rem; line-height: 1.2; }
+    .job-item-meta .pill { flex-shrink: 0; font-size: .7rem; line-height: 1.2; }
     .job-item-meta [data-role="item-progress"] {
       min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      font-size: .88rem; line-height: 1.2; text-align: right;
+      font-size: .7rem; line-height: 1.2; text-align: right;
     }
     .main {
       display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden;
@@ -361,6 +361,12 @@
       flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
       font-size: .72rem; color: var(--muted);
     }
+    .job-files-speed {
+      flex: 0 0 auto; white-space: nowrap; font-size: .72rem; color: var(--accent);
+      font-variant-numeric: tabular-nums;
+    }
+    .job-files-speed.muted { color: var(--muted); }
+    .job-files-speed[hidden] { display: none; }
     .job-files-filter {
       flex: 0 0 auto; width: 8rem; border: 1px solid var(--line); background: var(--bg); color: var(--text);
       border-radius: 6px; padding: .22rem .45rem; font: .72rem/1.2 var(--mono); outline: none;
@@ -526,6 +532,7 @@
             <div class="job-files-head">
               <span class="job-files-title">文件进度</span>
               <span class="job-files-summary" data-role="files-summary"></span>
+              <span class="job-files-speed" data-role="files-speed" hidden></span>
               <input class="job-files-filter" data-role="files-filter" type="text" placeholder="过滤文件" aria-label="过滤文件" />
             </div>
             <div class="file-list" data-role="files"></div>
@@ -992,7 +999,7 @@
       failed: "失败",
     };
     const FILE_RENDER_LIMIT = 400; // 超大任务只渲染前 N 行，用过滤框缩小范围
-    const fileState = { id: null, files: [], filter: "", sig: "", loaded: false, lastActive: null, rows: new Map(), total: 0 };
+    const fileState = { id: null, files: [], filter: "", sig: "", loaded: false, lastActive: null, rows: new Map(), total: 0, speed: null };
 
     function fileSignature(data) {
       const files = Array.isArray(data.files) ? data.files : [];
@@ -1004,6 +1011,30 @@
     function formatSpeed(bytesPerSec) {
       const v = Number(bytesPerSec) || 0;
       return v > 0 ? `${formatSize(v)}/s` : "";
+    }
+
+    function formatTotalSpeed(bytesPerSec) {
+      const v = Number(bytesPerSec) || 0;
+      return v > 0 ? "↓ " + formatSize(v) + "/s" : "↓ 0 B/s";
+    }
+
+    function renderFilesSpeed() {
+      const el = $("detail").querySelector('[data-role="files-speed"]');
+      if (!el) return;
+      const info = fileState.speed;
+      if (!info || info.ok !== true) {
+        el.hidden = true;
+        el.textContent = "";
+        el.classList.remove("muted");
+        el.title = (info && info.message) || "";
+        return;
+      }
+      el.hidden = false;
+      const speed = Number(info.speed) || 0;
+      el.textContent = formatTotalSpeed(speed);
+      el.classList.toggle("muted", speed <= 0);
+      const owner = info.aria2 ? "Aria2「" + info.aria2 + "」" : "Aria2";
+      el.title = owner + " 总速度（该 Aria2 上所有任务合计）";
     }
 
     function fileMetaText(file) {
@@ -1183,6 +1214,7 @@
       fileState.files = [];
       fileState.total = 0;
       fileState.sig = "";
+      fileState.speed = null;
       fileState.loaded = false;
       fileState.lastActive = null;
       for (const row of fileState.rows.values()) row.remove();
@@ -1191,6 +1223,11 @@
       if (box) box.textContent = "";
       const summaryEl = $("detail").querySelector('[data-role="files-summary"]');
       if (summaryEl) summaryEl.textContent = "";
+      const speedEl = $("detail").querySelector('[data-role="files-speed"]');
+      if (speedEl) {
+        speedEl.hidden = true;
+        speedEl.textContent = "";
+      }
       const panel = $("detail").querySelector('[data-role="files-panel"]');
       if (panel) panel.hidden = !jobId;
     }
@@ -1203,6 +1240,9 @@
         if (selectedId !== jobId) return; // 期间切换了任务
         const sig = fileSignature(data);
         fileState.loaded = true;
+        fileState.speed = data.speed || null;
+        // 总速度每秒都在变（下载量不变也可能掉到 0），所以要在「状态没变」早退之前刷新
+        renderFilesSpeed();
         if (sig === fileState.sig) return; // 状态没变，不重排 DOM
         fileState.sig = sig;
         fileState.files = Array.isArray(data.files) ? data.files : [];

@@ -37,7 +37,7 @@ notify_webhook_token: "可选，回调请求会带 Authorization: Bearer <token>
 {
   "event": "job_completed",
   "job_id": "xxxx",
-  "name": "MCP-xxxxxxxx",
+  "name": "MCP-Nintendo Switch运动 [版本1.5.0]",
   "status": "completed",
   "total_files": 12,
   "done_files": 12,
@@ -48,6 +48,8 @@ notify_webhook_token: "可选，回调请求会带 Authorization: Bearer <token>
 `status` 为 `completed` 或 `completed_with_failures`（failed_files 非空）。
 失败重试 30s/60s/120s 三次；接收方按 job_id 幂等处理（服务重启后会重发一次）。
 手动暂停等「停了但没下完」的情况不通知。
+
+任务自动命名：MCP-<分享根目录名>（分享详情里的 share.title，即根目录名；压掉换行/连续空白、截到 60 字）。取不到标题（分享要提取码没给、Cookie 失效、网络不通）时回退 MCP-<分享id>；同名冲突再加 -HHMMSS。任务名同时用作下载子目录名，所以清洗过。
 
 依赖：`pip install fastmcp`（requirements 需加 `fastmcp`，已在本机 venv 安装验证）。
 

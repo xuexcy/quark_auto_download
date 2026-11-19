@@ -24,7 +24,8 @@ from config_loader import (
 from file_api import FileApi
 from log_util import configure_logging, dated_job_log_path
 from pipeline import DownloadPipeline
-from quark_api import QuarkClient
+from quark_api import DESKTOP_USER_AGENT, QuarkClient
+from quark_login import warm_cookie
 
 QUARK_CONFIG_PATH = resolve_config_path("QUARK_AUTO_DL_QUARK_CONFIG", "quark")
 ARIA2_CONFIG_PATH = resolve_config_path("QUARK_AUTO_DL_ARIA2_CONFIG", "aria2")
@@ -180,8 +181,17 @@ log = logging.getLogger(__name__)
 def init_clients():
     """初始化 Quark 与 Aria2 客户端。"""
     global ARIA2_DOWNLOAD_DIR, DOWNLOAD_DESTINATION_DIR, DOWNLOAD_DIR_MODE
+    # 先把 Cookie 过一遍网页会话，补齐 web-grey-id / web-grey-id.sig 这类防风控字段：
+    # 缺了它们接口仍 200，但所有直链都会被 CDN 回 412（下载必然失败，且很难看出原因）。
+    quark_ua = QUARK_CLIENT_UA or DESKTOP_USER_AGENT
+    warmed_cookie = warm_cookie(QUARK_COOKIE, quark_ua, timeout=QUARK_REQUEST_TIMEOUT)
+    if warmed_cookie and warmed_cookie != QUARK_COOKIE:
+        log.info(
+            "已补齐防风控 Cookie（web-grey-id / web-grey-id.sig）：%s",
+            "新增" if "web-grey-id" not in QUARK_COOKIE else "更新",
+        )
     quark_client = QuarkClient(
-        cookie=QUARK_COOKIE,
+        cookie=warmed_cookie or QUARK_COOKIE,
         request_timeout=QUARK_REQUEST_TIMEOUT,
         save_to_dir=SAVE_TO_DIR,
         share_url=SHARE_URL,
@@ -449,6 +459,8 @@ def main():
             f"存在未成功下载的文件：校验失败 {failed_count} 个，"
             f"流水线失败列表 {len(failed_files)} 个；详见报告 {VERIFY_REPORT_FILE}"
         )
+    elif not all_files:
+        log.warning("没有可下载的文件：勾选里没有文件（可能都在「文件进度」里被删过，或选中的目录是空的）")
     else:
         log.info(
             "所有文件下载成功（远端 Aria2 口径，未做本地校验）🎉"
@@ -463,15 +475,13 @@ def main():
             job = get_job(JOB_ID)
             if job:
                 # 结束态要如实反映结果：全部成功 → done，有失败 → failed（不要一律 paused 冒充正常）
-                if failed_count or failed_files:
-                    job["status"] = "failed"
-                    job["message"] = (
-                        f"处理结束但有失败：校验失败 {failed_count} 个 / "
-                        f"流水线失败 {len(failed_files)} 个；详见 {VERIFY_REPORT_FILE}"
-                    )
-                else:
-                    job["status"] = "done"
-                    job["message"] = "全部文件下载成功"
+                from job_status import decide_final_status
+
+                final = decide_final_status(
+                    all_files, failed_count, len(failed_files), VERIFY_REPORT_FILE
+                )
+                job["status"] = final["status"]
+                job["message"] = final["message"]
                 job["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 upsert_job(job)
         except Exception as e:

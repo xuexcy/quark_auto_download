@@ -129,6 +129,9 @@ class QuarkClient:
         self.save_to_fid = ""
         self.share_url = share_url
         self.share_pwd = share_pwd
+        # 分享的根目录名（分享标题，如「Nintendo Switch运动 [版本1.5.0]」）：
+        # get_share_token() 顺带取回，MCP 自动命名用它而不是一长串分享 id
+        self.share_title = ""
         self.log = logger
         self.user_agent = str(user_agent or "").strip() or DESKTOP_USER_AGENT
         self.headers = {
@@ -390,9 +393,21 @@ class QuarkClient:
         self.log.info(f"分享信息: {info.get('message', 'ok')}")
         if not _is_ok(info):
             raise RuntimeError(f"获取分享详情失败: {_payload_brief(info)}")
-        fid_list = (info.get("data") or {}).get("share", {}).get("fid_list", [])
+        share = (info.get("data") or {}).get("share") or {}
+        self.share_title = str(share.get("title") or "").strip()
+        fid_list = share.get("fid_list", [])
         root_fid = fid_list[0] if fid_list else "0"
         return stoken, share_id, root_fid
+
+    def get_share_title(self) -> str:
+        """分享的根目录名；取不到返回空串（调用方自己回退）。"""
+        if not self.share_title:
+            try:
+                self.get_share_token()
+            except Exception as e:  # noqa: BLE001 - 命名失败不该挡住下载
+                self.log.warning(f"获取分享标题失败: {e}")
+                return ""
+        return self.share_title
 
     def list_share_files(
         self,

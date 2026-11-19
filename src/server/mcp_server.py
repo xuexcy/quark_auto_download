@@ -28,38 +28,69 @@ logger = logging.getLogger(__name__)
 _AUTO_NAME_PREFIX = "MCP-"
 
 
-def resolve_share_job(share_url: str, name: str = "") -> dict:
+def resolve_share_job(share_url: str, name: str = "", share_pwd: str = "") -> dict:
     """按分享链接找已有任务；找不到就创建。
 
     - 带 name：优先精确匹配同名任务；不存在则用该名字创建（重名会抛 ValueError）
     - 不带 name：先按 share_key 匹配已有任务（同链接复用，勾选是追加语义），
-      都没有就自动起名 `MCP-<分享id>`（冲突时加时间戳后缀）
+      都没有就自动起名 `MCP-<分享根目录名>`（取不到标题时回退分享 id，冲突时加时间戳后缀）
     返回 (job, created)。
     """
     share_url = str(share_url or "").strip()
     name = str(name or "").strip()
+    share_pwd = str(share_pwd or "").strip()
     if name:
         for job in jm.list_jobs():
             if str(job.get("name") or "").strip() == name:
                 return job, False
-        job = jm.add_job(share_url, name=name)
+        job = jm.add_job(share_url, share_pwd=share_pwd, name=name)
         return job, True
     key = jm.share_key(share_url)
     for job in jm.list_jobs():
         if jm.share_key(str(job.get("share_url") or "")) == key:
             return job, False
-    auto = _auto_name(share_url)
+    auto = _auto_name(share_url, share_pwd)
     for job in jm.list_jobs():
         if str(job.get("name") or "").strip() == auto:
             auto = f"{auto}-{time.strftime('%H%M%S')}"
             break
-    job = jm.add_job(share_url, name=auto)
+    job = jm.add_job(share_url, share_pwd=share_pwd, name=auto)
     return job, True
 
 
-def _auto_name(share_url: str) -> str:
+def _auto_name(share_url: str, share_pwd: str = "") -> str:
+    """MCP-<分享根目录名>；拿不到标题（无 Cookie、分享要提取码且没给、网络不通）时回退 MCP-<分享id>。"""
+    title = _share_title(share_url, share_pwd)
+    if title:
+        return f"{_AUTO_NAME_PREFIX}{_trim_name(title)}"
     match = re.search(r"/s/([0-9A-Za-z_-]+)", share_url)
     return f"{_AUTO_NAME_PREFIX}{match.group(1) if match else time.strftime('%Y%m%d%H%M%S')}"
+
+
+def _trim_name(text: str, limit: int = 60) -> str:
+    """任务名清洗：压掉换行/连续空白，超长截断（任务名同时用作下载子目录名）。"""
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    return cleaned[:limit].strip(" .") or ""
+
+
+def _share_title(share_url: str, share_pwd: str = "") -> str:
+    from config_loader import load_merged_configs
+    from quark_api import QuarkClient
+
+    try:
+        config = load_merged_configs()
+        client = QuarkClient(
+            cookie=str(config.get("quark_cookie") or ""),
+            request_timeout=15,
+            save_to_dir="",
+            share_url=share_url,
+            share_pwd=share_pwd,
+            logger=logger,
+        )
+        return client.get_share_title()
+    except Exception as e:  # noqa: BLE001 - 命名是最不重要的一步，失败就回退
+        logger.warning("自动命名取分享标题失败，回退分享 id: %s", e)
+        return ""
 
 
 def add_selection(job_id: str, paths: list[str]) -> dict:
@@ -235,7 +266,7 @@ def build_mcp_server():
         Returns:
             {job_id, name, status, total_files, ...}：任务摘要，status 为 downloading/paused 等
         """
-        job, created = resolve_share_job(share_url, name)
+        job, created = resolve_share_job(share_url, name, share_pwd)
         job_id = str(job.get("id"))
         # 复用已有任务时带上新提取码（分享链接可能换码）；新建时 add_job 已带
         if not created and share_pwd:

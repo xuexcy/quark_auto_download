@@ -1443,8 +1443,21 @@ def _job_paths_from_state(job_id: str) -> set[str]:
     return paths
 
 
-def _aria2_client_from_config(job_id: str = ""):
-    """按任务选中的 Aria2 配置建客户端（多配置时各任务可以连不同的 aria2）。"""
+def aria2_global_stat(job_id: str = "", timeout: int = 3) -> dict:
+    """任务所属 Aria2 的全局统计（前端「文件进度」那一行显示总速度用）。
+
+    失败直接抛异常，由调用方决定怎么降级。
+    """
+    client = _aria2_client_from_config(job_id, request_timeout=timeout)
+    return client.aria2_get_global_stat()
+
+
+def _aria2_client_from_config(job_id: str = "", request_timeout: int | None = None):
+    """按任务选中的 Aria2 配置建客户端（多配置时各任务可以连不同的 aria2）。
+
+    request_timeout 给定时覆盖配置里的值：Web 端 5 秒一次的只读查询不能用 10 秒超时，
+    否则 aria2 卡住会把接口一起拖住。
+    """
     from aria2_api import Aria2Client
     import logging
 
@@ -1464,7 +1477,7 @@ def _aria2_client_from_config(job_id: str = ""):
         secret=str(aria2.get("aria2_secret") or ""),
         # 这里只用于 pause / 清理，按路径对齐任务名；目录留空也无所谓（不再拼 /tmp 兜底）
         download_dir="" if remote else str(aria2.get("aria2_download_dir") or ""),
-        request_timeout=int(aria2.get("request_timeout") or 10),
+        request_timeout=int(request_timeout or aria2.get("request_timeout") or 10),
         download_headers=None,  # 只用于 pause/清理，不提交下载，无需直链请求头
         poll_interval=int(aria2.get("poll_interval") or 30),
         download_timeout=int(aria2.get("download_timeout") or 7200),

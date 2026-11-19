@@ -88,7 +88,15 @@ def describe_task_error(task: dict) -> str:
     if isinstance(files, list) and files and isinstance(files[0], dict):
         path = str(files[0].get("path") or "").strip()
     target = f"；目标路径: {path}" if path else ""
-    return f"{hint}（aria2 errorCode={code}: {message}）{target}"
+    detail = f"{hint}（aria2 errorCode={code}: {message}）{target}"
+    if "412" in message:
+        # 412 = CDN 主动拒绝直链：Cookie 少了 web-grey-id / web-grey-id.sig 这类防风控字段，
+        # 接口照样 200（所以「测试 Cookie 有效」看不出来），换直链也成功，只有真去下载才 412
+        detail += (
+            "；412 = 直链被夸克 CDN 拒绝，通常是 Cookie 缺少防风控字段（web-grey-id / web-grey-id.sig），"
+            "到设置页重新保存 Cookie（会自动补齐）或重新扫码后再试"
+        )
+    return detail
 
 
 class Aria2Client:
@@ -253,20 +261,25 @@ class Aria2Client:
             path = str(first.get("path", "")).strip()
             if path:
                 normalized_path = path.replace("\\", "/").rstrip("/")
-                # tellStatus 会带 dir：用它精确还原相对路径（远端同样适用，
-                # 否则不同子目录的同名文件会撞成一个键）
                 task_dir = str(task.get("dir") or "").replace("\\", "/").rstrip("/")
+                # 提交时 dir = 根目录/<子目录>、out = 文件名，所以 tellStatus 的 dir 是「子目录」，
+                # 直接用 task_dir 剥只剩文件名，和提交时用的完整相对路径对不上 → 重启后
+                # 会把在下的任务当成新任务再提交一遍（重复下载、多个 .1 副本）。
+                # 因此先按「根目录」还原：本机用 download_dir，远端用 remote_dir。
+                base = self.remote_dir if self.remote else self.download_dir
+                normalized_base = str(base or "").replace("\\", "/").rstrip("/")
+                if normalized_base and normalized_path.startswith(f"{normalized_base}/"):
+                    return normalized_path[len(normalized_base) + 1 :]
+                if normalized_base and normalized_path == normalized_base:
+                    return ""
+                # 兜底：老任务 / 换了根目录的任务，按 task_dir 还原（可能只剩文件名）
                 if task_dir and normalized_path.startswith(f"{task_dir}/"):
                     return normalized_path[len(task_dir) + 1 :]
                 if self.remote:
                     # 远端拿不到 dir（老任务/对方省略）：退回文件名，兼容历史任务
                     return normalized_path.rsplit("/", 1)[-1] if normalized_path else ""
-                normalized_download_dir = self.download_dir.replace("\\", "/").rstrip("/")
-                if normalized_path == normalized_download_dir:
-                    return ""
-                if normalized_path.startswith(f"{normalized_download_dir}/"):
-                    return normalized_path[len(normalized_download_dir) + 1 :]
-                # 不在本任务下载目录下的任务（例如别的任务/别的下载器）一律忽略，避免同名串味
+                # 没配根目录（用 aria2 默认目录）且 tellStatus 没给 dir：无从还原，宁可不匹配，
+                # 也不要拿绝对路径去和别人撞键
                 return ""
         bittorrent = task.get("bittorrent", {})
         info = bittorrent.get("info", {}) if isinstance(bittorrent, dict) else {}

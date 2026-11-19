@@ -128,12 +128,87 @@ def _cookie_header_from_jar(jar: Any) -> str:
         value = str(getattr(item, "value", "") or "")
         if value:
             picked[name] = value
-    if not picked:
+    return _join_cookie_pairs(picked)
+
+
+# 直链 CDN 会做一层防风控校验：只有「同一个网页会话访问过 pan.quark.cn」才会下发
+# web-grey-id / web-grey-id.sig 这两条 Cookie。缺了它们，file/download 接口照样 200，
+# 但拿到的直链一律被 CDN 回 412 Precondition Failed（2026-11-19 实测：OpenList 的
+# Cookie 里有这两条 → CDN 200；扫码得到的 7 条 Cookie 没有 → 412）。
+COOKIE_WARM_STEPS: tuple[str, ...] = (
+    "https://pan.quark.cn/",
+    "https://pan.quark.cn/list",
+    "https://drive-pc.quark.cn/",
+)
+
+_COOKIE_PRIORITY = (
+    "__pus",
+    "__puus",
+    "__kp",
+    "__uid",
+    "kps",
+    "sign",
+    "vcode",
+    "web-grey-id",
+    "web-grey-id.sig",
+)
+
+
+def _cookie_pairs(header: str) -> dict[str, str]:
+    """把 Cookie 头解析成 {name: value}（丢弃空名/空值）。"""
+    pairs: dict[str, str] = {}
+    for part in str(header or "").split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name, value = name.strip(), value.strip()
+        if name and value:
+            pairs[name] = value
+    return pairs
+
+
+def _join_cookie_pairs(pairs: dict[str, str]) -> str:
+    """按固定优先级拼回 Cookie 头（__pus/__puus 在最前，防风控两条紧随其后）。"""
+    ordered = [n for n in _COOKIE_PRIORITY if n in pairs]
+    ordered += [n for n in pairs if n not in ordered]
+    return "; ".join(f"{name}={pairs[name]}" for name in ordered)
+
+
+def warm_cookie(cookie: str, user_agent: str = "", timeout: float = 15.0) -> str:
+    """过一遍网页会话，补齐 web-grey-id / web-grey-id.sig 这类防风控 Cookie。
+
+    输入输出都是 Cookie 头字符串。任何异常都退回原串，绝不让主流程因为补 Cookie 失败。
+    """
+    text = str(cookie or "").strip()
+    if not text:
         return ""
-    priority = ["__pus", "__puus", "__kp", "__uid", "kps", "sign", "vcode"]
-    ordered = [n for n in priority if n in picked]
-    ordered += [n for n in picked if n not in ordered]
-    return "; ".join(f"{name}={picked[name]}" for name in ordered)
+    pairs = _cookie_pairs(text)
+    if not pairs:
+        return text
+    session = requests.Session()
+    headers = getattr(session, "headers", None)
+    if headers is not None:
+        headers.update({"User-Agent": str(user_agent or "").strip() or USER_AGENT})
+    for name, value in pairs.items():
+        session.cookies.set(name, value, domain=".quark.cn")
+    for url in COOKIE_WARM_STEPS:
+        try:
+            session.get(
+                url,
+                headers={"Referer": "https://pan.quark.cn/"},
+                timeout=timeout,
+                allow_redirects=True,
+            )
+        except Exception:  # noqa: BLE001 - 补 Cookie 失败不影响主流程
+            continue
+    for item in session.cookies:
+        if "quark.cn" not in str(getattr(item, "domain", "") or ""):
+            continue
+        name = str(getattr(item, "name", "") or "")
+        value = str(getattr(item, "value", "") or "")
+        if name and value and not name.startswith("_UP_"):
+            pairs[name] = value
+    return _join_cookie_pairs(pairs) or text
 
 
 def validate_cookie(cookie: str, timeout: float = 10.0) -> dict[str, Any]:
@@ -169,6 +244,147 @@ def validate_cookie(cookie: str, timeout: float = 10.0) -> dict[str, Any]:
         return {"ok": True, "message": "Cookie 有效", "nickname": nickname}
     message = str(payload.get("message") or payload.get("code") or "未知错误")
     return {"ok": False, "message": f"Cookie 无效: {message}"}
+
+
+# 直链探测：请求带 Range: bytes=0-0 且 stream=True 后立刻 close，只取 1 个字节，
+# 所以样本大小不影响流量；上限只是防着挑到异常条目，目录数/层数用来兜住「文件都埋在子目录里」。
+_CDN_PROBE_MAX_BYTES = 10 * 1024 * 1024 * 1024
+_CDN_PROBE_DIR_LIMIT = 12
+_CDN_PROBE_DEPTH = 3
+
+
+def _pick_probe_file(entries: list[dict]) -> dict | None:
+    """从目录条目里挑最小的、非空的普通文件当直链探测样本。"""
+    best: dict | None = None
+    for item in entries:
+        if not isinstance(item, dict) or item.get("dir"):
+            continue
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0 or size > _CDN_PROBE_MAX_BYTES:
+            continue
+        if best is None or size < int(best.get("size") or 0):
+            best = item
+    return best
+
+
+def _find_probe_file(client) -> dict | None:
+    """在网盘里广度优先找一个普通文件当直链样本（最多 12 个目录、3 层）。"""
+    queue: list[tuple[str, int]] = [("", 0)]
+    oversized: dict | None = None
+    visited = 0
+    while queue and visited < _CDN_PROBE_DIR_LIMIT:
+        fid, depth = queue.pop(0)
+        visited += 1
+        try:
+            entries = client.list_my_dir_entries(fid)
+        except Exception:  # noqa: BLE001 - 单个目录读失败跳过，别让探测整体失败
+            continue
+        best = _pick_probe_file(entries)
+        if best is not None:
+            return best
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            if item.get("dir"):
+                if depth + 1 < _CDN_PROBE_DEPTH:
+                    queue.append((str(item.get("fid") or ""), depth + 1))
+                continue
+            try:
+                size = int(item.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size > 0 and oversized is None:
+                oversized = item
+    return oversized
+
+
+def check_cookie_health(cookie: str, user_agent: str = "", timeout: float = 10.0) -> dict[str, Any]:
+    """设置页「测试」用的红/黄/绿判定。
+
+    green  = Cookie 有效，且换出来的直链真能下（说明防风控 Cookie 齐全）
+    yellow = Cookie 有效（接口通），但直链被 CDN 拒绝或无法探测 —— 此时任务能建、下载必然失败
+    red    = Cookie 无效/网络不通
+
+    之前只看 /1/clouddrive/member 会「测试通过但下载全 412」，这条链路就是补那个盲区。
+    """
+    text = str(cookie or "").strip()
+    if not text:
+        return {"level": "red", "ok": False, "message": "Cookie 为空"}
+    ua = str(user_agent or "").strip() or USER_AGENT
+    warmed = warm_cookie(text, ua, timeout)
+    info = validate_cookie(warmed, timeout)
+    if not info.get("ok"):
+        return {
+            "level": "red",
+            "ok": False,
+            "message": str(info.get("message") or "Cookie 无效"),
+            "nickname": "",
+        }
+    nickname = str(info.get("nickname") or "")
+    detail: dict[str, Any] = {"level": "green", "ok": True, "message": "Cookie 有效，直链可下载", "nickname": nickname}
+    try:
+        # 延迟导入：quark_api 反过来要用本模块的 warm_cookie，顶层导入会成环
+        from quark_api import QuarkClient
+
+        client = QuarkClient(
+            warmed,
+            int(max(timeout, 5)),
+            "",
+            "",
+            "",
+            logging.getLogger(__name__),
+            user_agent=ua,
+        )
+        probe = _find_probe_file(client)
+        if probe is None:
+            detail.update(
+                {
+                    "level": "yellow",
+                    "message": "Cookie 有效，但网盘里找不到可试下载的小文件，直链未验证",
+                }
+            )
+            return detail
+        detail["sample"] = str(probe.get("file_name") or "")
+        urls = client.get_download_urls([str(probe.get("fid") or "")])
+        url = next(iter(urls.values()), "")
+        if not url:
+            detail.update({"level": "yellow", "message": "Cookie 有效，但接口没返回下载直链"})
+            return detail
+        resp = requests.get(
+            url,
+            headers={
+                "Cookie": warmed,
+                "User-Agent": ua,
+                "Referer": "https://pan.quark.cn/",
+                "Range": "bytes=0-0",
+            },
+            timeout=timeout,
+            stream=True,
+        )
+        status = resp.status_code
+        resp.close()
+        detail["cdn_status"] = status
+        if status in (200, 206):
+            detail.update({"level": "green", "message": "Cookie 有效，直链可下载"})
+        elif status in (401, 403, 412):
+            detail.update(
+                {
+                    "level": "yellow",
+                    "message": (
+                        f"接口可用，但直链被 CDN 拒绝（HTTP {status}）："
+                        "Cookie 缺少防风控字段（web-grey-id 等）或账号被风控。"
+                        "到浏览器里复制一份完整 Cookie 重新保存，或重新扫码"
+                    ),
+                }
+            )
+        else:
+            detail.update({"level": "yellow", "message": f"接口可用，但直链返回 HTTP {status}"})
+    except Exception as e:  # noqa: BLE001 - 探测失败一律降级为黄灯，不阻塞保存
+        detail.update({"level": "yellow", "message": f"Cookie 有效，但直链探测失败: {e}"})
+    return detail
 
 
 _SVG_ROOT_RE = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
@@ -412,6 +628,7 @@ class QuarkQrLogin:
         names = {c.name for c in session.cookies}
         cookie = _cookie_header_from_jar(session.cookies)
         if cookie and (names & {"__pus", "__puus"}):
-            return cookie, "ok"
+            # 再补一道防风控 Cookie（web-grey-id 等）：缺了它直链会被 CDN 回 412
+            return warm_cookie(cookie, USER_AGENT, self.timeout), "ok"
         trail = " -> ".join(notes)
         return "", f"未拿到 __pus/__puus（{trail}）；cookies={sorted(names)[:8]}"
